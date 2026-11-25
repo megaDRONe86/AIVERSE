@@ -492,6 +492,13 @@ void GameClient::startMatch(size_t idx, const Json& initialVars) {
     beginMapLoading();
 }
 
+// game.json camera "bounds": the target stays inside the box (equal min and max lock an axis), also while dragging.
+void GameClient::clampCameraToBounds() {
+    if (!camBounded_) return;
+    cam_.target.x = std::clamp(cam_.target.x, camBounds_[0], std::max(camBounds_[0], camBounds_[2]));
+    cam_.target.z = std::clamp(cam_.target.z, camBounds_[1], std::max(camBounds_[1], camBounds_[3]));
+}
+
 void GameClient::fitCamera() {
     if (planet()) { fitPlanetCamera(); return; }
     auto& g = mod().state(*sim_).grid;
@@ -503,7 +510,11 @@ void GameClient::fitCamera() {
     cam_.maxDistance = std::max(40.0f, float(std::max(g.w, g.h)) * 1.3f);
     float aspect = platform::windowHeight() > 0 ? platform::windowWidth() / platform::windowHeight() : 1.6f;
     cam_.distance = small ? std::max(g.w / aspect, float(g.h)) * 1.05f + 4 : 24.0f;
-    render::applyOverheadCamera(render::overheadCameraFrom(manifest_), cam_, float(platform::framebufferHeight())); // game.json "camera" (2D games)
+    const render::CameraOverhead overhead = render::overheadCameraFrom(manifest_);
+    render::applyOverheadCamera(overhead, cam_, float(platform::framebufferHeight())); // game.json "camera" (2D games)
+    camBounded_ = overhead.bounded;
+    for (int i = 0; i < 4; ++i) camBounds_[i] = overhead.bounds[i];
+    clampCameraToBounds();
     if (const char* e = std::getenv("AIVERSE_CAM")) { // testing (close-up screenshots): "x,z,distance[,pitchDeg[,yawDeg]]"
         float v[5] = {c.x, c.z, cam_.distance, cam_.pitch * 57.2958f, cam_.yaw * 57.2958f};
         int n = std::sscanf(e, "%f,%f,%f,%f,%f", &v[0], &v[1], &v[2], &v[3], &v[4]);
@@ -822,7 +833,7 @@ void GameClient::event(const Event& incoming) {
         }
         if (panning_) {
             float3 a, b;
-            if (groundAt(downX_, downY_, a) && groundAt(e.x, e.y, b)) cam_.target += a - b;
+            if (groundAt(downX_, downY_, a) && groundAt(e.x, e.y, b)) { cam_.target += a - b; clampCameraToBounds(); }
             downX_ = e.x; downY_ = e.y;
         }
         if (sendDrag_) {
@@ -1258,6 +1269,7 @@ void GameClient::frame(gfx::Device& dev, double dt) {
         else {
         cam_.target.x = std::clamp(cam_.target.x, 0.0f, float(g.w));
         cam_.target.z = std::clamp(cam_.target.z, 0.0f, float(g.h));
+        clampCameraToBounds();
         }
         if (aiverse::Vec3 sc{}; !planet() && mod().screenView(*sim_, sc, screenSize_)) {
             // map "screen" / map scroller: the camera follows the centre and frames the screen

@@ -186,6 +186,9 @@ private:
     size_t loadingCursor_ = 0;
     std::chrono::steady_clock::time_point loadingStarted_;
     void fitCamera();
+    void clampCameraToBounds();
+    bool camBounded_ = false;
+    float camBounds_[4] = {0, 0, 0, 0};
     float startCamera_[5] = {};
     bool hasStartCamera_ = false;
     // planet maps (ClientPlanet.cpp): orbit camera input, picking through GameView; flat maps never get here

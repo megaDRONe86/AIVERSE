@@ -252,9 +252,20 @@ Key mapCode(const char* code) {
     return Key::Unknown;
 }
 
+// Canvas origin in the page. Mouse-up is listened on the document (a release outside the canvas must still
+// arrive), so its coordinates are page-relative: a canvas that does not start at 0,0 needs the offset removed.
+EM_JS(void, aiverse_web_canvas_origin, (float* out), {
+    var r = Module.canvas.getBoundingClientRect();
+    HEAPF32[out >> 2] = r.left; HEAPF32[(out >> 2) + 1] = r.top;
+});
 EM_BOOL onMouse(int type, const EmscriptenMouseEvent* m, void*) {
     Event e;
     e.x = float(m->targetX); e.y = float(m->targetY);
+    if (type == EMSCRIPTEN_EVENT_MOUSEUP) {
+        float o[2] = {0, 0};
+        aiverse_web_canvas_origin(o);
+        e.x = float(m->clientX) - o[0]; e.y = float(m->clientY) - o[1];
+    }
     e.deltaX = float(m->movementX); e.deltaY = float(m->movementY);
     e.button = m->button == 0 ? 0 : m->button == 2 ? 1 : 2;
     e.mods = modsOf(m->shiftKey, m->ctrlKey, m->altKey, m->metaKey);
