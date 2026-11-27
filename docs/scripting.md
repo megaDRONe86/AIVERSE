@@ -318,6 +318,7 @@ be given by field instead: rect commands (`dig paint_room build_road`) `w, h, ex
 `other, ally`; `bounty` `resource, reward`.
 
 Not available yet: fog reveal from scripts (use a `reveal` effect in an ability).
+View scripts can switch the fog of war off for the local screen with `view.set_fog(false)` (and back with `true`): a debug switch, it changes only what is drawn, never the simulation.
 
 ### Routes and the screen
 

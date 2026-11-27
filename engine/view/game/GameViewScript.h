@@ -105,6 +105,8 @@ public:
     void setScreen(const std::string& screen);
     // The last view.set_camera of this update (fields NaN = unchanged); false when there was none.
     bool takeCameraRequest(ViewCameraRequest& out);
+    // view.set_fog(false): the script asked to draw the match without fog of war (debug switches); reset by load().
+    bool fogDisabled() const;
     std::vector<ViewRequest> takeRequests();
     // view.send(id, args): script commands (kCmdScript) for the host to issue as the local player
     std::vector<Command> takeCommands();

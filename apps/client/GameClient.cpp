@@ -1316,7 +1316,7 @@ void GameClient::frame(gfx::Device& dev, double dt) {
     }
     g_stages.lap(0);   // sim (and everything before it)
     if (sim_) {
-        sceneFromSim(*sim_, scene_, alpha, spectator_ ? 0 : human_);
+        sceneFromSim(*sim_, scene_, alpha, (spectator_ || viewScripts_.fogDisabled()) ? 0 : human_);
         scene_.paintLayers = viewScripts_.paintLayers();
         scene_.entityFx = viewScripts_.entityFx();
         cleanSelection();
@@ -1508,7 +1508,7 @@ void GameClient::frame(gfx::Device& dev, double dt) {
             static bool shadowsSet = false;
             if (!shadowsSet && !geometryShadows) { r3d_.setShadowQuality(render::ShadowQuality::Off); shadowsSet = true; }
         }
-        view_.draw(r3d_, scene_, time_, spectator_ ? nullptr : &gs.vision[human_], gs.grid);
+        view_.draw(r3d_, scene_, time_, (spectator_ || viewScripts_.fogDisabled()) ? nullptr : &gs.vision[human_], gs.grid);
         g_stages.lap(3);   // view
         for (auto& fe : view_.fieldView().takeEffects()) fx_.playEffect(fe.name, fe.pos.x, fe.pos.y + 0.2f, fe.pos.z);   // grid field particles
         natureUpdate(screen_ == Screen::Playing || screen_ == Screen::Over ? float(dt) : 0.0f);
@@ -1604,7 +1604,7 @@ void GameClient::frame(gfx::Device& dev, double dt) {
                 if(!planet()) {
                     auto& gs=mod().state(*sim_);
                     view_.drawPreparedTerrainFog(renderer,gs.grid,
-                        spectator_?nullptr:&gs.vision[human_],time_,published.id);
+                        (spectator_||viewScripts_.fogDisabled())?nullptr:&gs.vision[human_],time_,published.id);
                     view_.drawPreparedSprites(renderer,published.id);
                 }
                 // Renderer3D::beginScene reset the per-camera light list.

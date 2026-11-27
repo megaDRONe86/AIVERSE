@@ -43,6 +43,7 @@ struct ViewScripts::Impl {
     std::string screen = "playing";   // host screen state (view.screen()): playing | paused | over
     ViewCameraRequest cameraRequest{};
     bool cameraRequested = false;
+    bool fogDisabled = false;
     std::vector<ViewDrawBatch> draws;
     size_t drawVerts = 0;
     std::vector<ViewGroundBatch> groundDraws;
@@ -348,6 +349,8 @@ int vCamera(lua_State* L, Vm& vm) {
     return 1;
 }
 // view.set_camera{x =, z =, zoom =, pitch =, yaw =}: any subset; applied by the host after this frame's scripts.
+int vSetFog(lua_State* L, Vm& vm) { viewOf(vm).fogDisabled = !lua_toboolean(L, 1); return 0; }
+
 int vSetCamera(lua_State* L, Vm& vm) {
     if (!lua_istable(L, 1)) return fail(vm, "view.set_camera{x =, z =, zoom =, pitch =, yaw =}");
     auto& im = viewOf(vm);
@@ -812,6 +815,7 @@ void ViewScripts::setMapDragOffset(float dx, float dy) { impl_->dragDx=dx; impl_
 void ViewScripts::setCamera(const ViewCamera& camera) { impl_->camera = camera; }
 void ViewScripts::setVisualPositionReader(std::function<bool(uint64_t,render::float3&)> reader) { impl_->visualPosition=std::move(reader); }
 void ViewScripts::setScreen(const std::string& screen) { impl_->screen = screen.empty() ? "playing" : screen; }
+bool ViewScripts::fogDisabled() const { return impl_->fogDisabled; }
 bool ViewScripts::takeCameraRequest(ViewCameraRequest& out) {
     if (!impl_->cameraRequested) return false;
     out = impl_->cameraRequest;
@@ -833,7 +837,7 @@ bool ViewScripts::load(Simulation& sim, const Json& rules, const Json& map, uint
     im.handlers.clear(); im.frame.clear(); im.requests.clear(); im.commands.clear();
     im.ui.clear(); im.uiLast.clear(); im.uiHandlers.clear(); im.stats.clear(); im.statOf.clear(); im.frameCost = im.frames = im.frameTotal = im.frameMax = 0; im.stateRef = LUA_NOREF; im.stateTick = UINT32_MAX;
     log_.clear();
-    im.paint=std::make_shared<render::PaintLayers>();im.fx=std::make_shared<EntityFxStore>();im.targeting={};im.dragDx=im.dragDy=0;im.cameraRequested=false;
+    im.paint=std::make_shared<render::PaintLayers>();im.fx=std::make_shared<EntityFxStore>();im.targeting={};im.dragDx=im.dragDy=0;im.cameraRequested=false;im.fogDisabled=false;
     const auto files = scriptFiles(rules, map, true);
     if (files.empty() || sim.module().name() != "game") return false;
     Vm& vm = im.vm;
@@ -872,7 +876,7 @@ bool ViewScripts::load(Simulation& sim, const Json& rules, const Json& map, uint
                                      {"send", bind<vSend>}, {"state", bind<vState>}, {"ui_call", bind<vUiCall>},
                                      {"progression_choose", bind<vProgressionChoose>}, {"progression_reroll", bind<vProgressionReroll>},
                                      {"render_texture", bind<vRenderTexture>}, {"paint_layer", bind<vPaintLayer>}, {"targeting", bind<vTargeting>}, {"set_map_drag_offset", bind<vSetMapDragOffset>},
-                                     {"camera", bind<vCamera>}, {"set_camera", bind<vSetCamera>},
+                                     {"camera", bind<vCamera>}, {"set_camera", bind<vSetCamera>}, {"set_fog", bind<vSetFog>},
                                      {"visual_position", bind<vVisualPosition>}, {"to_screen", bind<vToScreen>}, {"draw", bind<vDraw>},
                                      {"draw_ground", bind<vDrawGround>}, {"entity_parent", bind<vEntityParent>}, {"entity_fx", bind<vEntityFx>}, {"animation", bind<vAnimation>}, {"animation_trait", bind<vAnimationTrait>},
                                      {"animation_load", bind<vAnimationLoad>}, {"animation_define", bind<vAnimationDefine>}, {"animation_use", bind<vAnimationUse>}, {"animation_status", bind<vAnimationStatus>}, {nullptr, nullptr}};
