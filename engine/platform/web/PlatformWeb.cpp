@@ -223,12 +223,23 @@ uint8_t modsOf(bool shift, bool ctrl, bool alt, bool meta) {
     return uint8_t((shift ? kModShift : 0) | (ctrl ? kModCtrl : 0) | (alt ? kModAlt : 0) | (meta ? kModSuper : 0));
 }
 
+// Logical window: with AIVERSE_WINDOW_WIDTH=<points> the window is always that many points wide, whatever the
+// size of the canvas on the page, so the UI scales with the canvas instead of reflowing. g_logical = points per CSS px.
+float g_logical = 1.0f;
+double g_cssW = 0, g_cssH = 0;
+
 void updateSize() {
     auto& S = state();
     double cssW = 0, cssH = 0;
     emscripten_get_element_css_size(kCanvas, &cssW, &cssH);
     double dpr = S.cfg.highDpi ? emscripten_get_device_pixel_ratio() : 1.0;
-    S.winW = float(cssW); S.winH = float(cssH); S.scale = float(dpr);
+    g_cssW = cssW; g_cssH = cssH;
+    g_logical = 1.0f;
+    if (const char* w = std::getenv("AIVERSE_WINDOW_WIDTH")) {
+        const double points = std::atof(w);
+        if (points > 0 && cssW > 0) g_logical = float(points / cssW);
+    }
+    S.winW = float(cssW) * g_logical; S.winH = float(cssH) * g_logical; S.scale = float(dpr) / g_logical;
     S.fbW = int(cssW * dpr); S.fbH = int(cssH * dpr);
     emscripten_set_canvas_element_size(kCanvas, S.fbW, S.fbH);
     float in[4] = {};
@@ -266,7 +277,8 @@ EM_BOOL onMouse(int type, const EmscriptenMouseEvent* m, void*) {
         aiverse_web_canvas_origin(o);
         e.x = float(m->clientX) - o[0]; e.y = float(m->clientY) - o[1];
     }
-    e.deltaX = float(m->movementX); e.deltaY = float(m->movementY);
+    e.x *= g_logical; e.y *= g_logical;
+    e.deltaX = float(m->movementX) * g_logical; e.deltaY = float(m->movementY) * g_logical;
     e.button = m->button == 0 ? 0 : m->button == 2 ? 1 : 2;
     e.mods = modsOf(m->shiftKey, m->ctrlKey, m->altKey, m->metaKey);
     if (type == EMSCRIPTEN_EVENT_MOUSEDOWN) e.type = EventType::MouseDown;
@@ -277,7 +289,7 @@ EM_BOOL onMouse(int type, const EmscriptenMouseEvent* m, void*) {
 }
 EM_BOOL onWheel(int, const EmscriptenWheelEvent* w, void*) {
     Event e; e.type = EventType::MouseWheel;
-    e.x = float(w->mouse.targetX); e.y = float(w->mouse.targetY);
+    e.x = float(w->mouse.targetX) * g_logical; e.y = float(w->mouse.targetY) * g_logical;
     float k = w->deltaMode == DOM_DELTA_PIXEL ? 0.01f : 1.0f;
     e.wheelX = float(-w->deltaX) * k; e.wheelY = float(-w->deltaY) * k;
     detail::dispatch(e);
@@ -332,7 +344,7 @@ EM_BOOL onTouch(int type, const EmscriptenTouchEvent* t, void*) {
         e.type = type == EMSCRIPTEN_EVENT_TOUCHSTART ? EventType::TouchBegin
                : type == EMSCRIPTEN_EVENT_TOUCHMOVE ? EventType::TouchMove
                : type == EMSCRIPTEN_EVENT_TOUCHEND ? EventType::TouchEnd : EventType::TouchCancel;
-        e.x = float(p.targetX); e.y = float(p.targetY); e.touchId = p.identifier;
+        e.x = float(p.targetX) * g_logical; e.y = float(p.targetY) * g_logical; e.touchId = p.identifier;
         detail::dispatch(e);
     }
     return EM_TRUE;
@@ -375,7 +387,7 @@ void frame(void*) {
     if(g_contextLost || !g_device) return;
     double cssW = 0, cssH = 0;
     emscripten_get_element_css_size(kCanvas, &cssW, &cssH);
-    if (int(cssW) != int(S.winW) || int(cssH) != int(S.winH)) onResize(0, nullptr, nullptr);
+    if (int(cssW) != int(g_cssW) || int(cssH) != int(g_cssH)) onResize(0, nullptr, nullptr);
     g_device->beginFrame(S.fbW, S.fbH);
     if (S.cb.frame) S.cb.frame(*g_device, dt);
     g_device->endFrame();
