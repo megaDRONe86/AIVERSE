@@ -2021,6 +2021,8 @@ void sceneFromSim(Simulation& sim, GameScene& out, float alpha, uint8_t viewer) 
     out.entityFrames.clear();
     out.roads.clear();
     out.events = sim.events();
+    if (viewer == 0 || viewer != out.fogMemoryViewer || sim.tick() < out.tick || !out.fogRemember) out.fogMemory.clear();   // other viewer / new match
+    out.fogMemoryViewer = viewer;
     out.tick = sim.tick();
     if (++out.facingFrame % 256 == 0)   // forget the facing of units gone from the scene
         for (auto it = out.facingTracks.begin(); it != out.facingTracks.end();)
@@ -2120,6 +2122,13 @@ void sceneFromSim(Simulation& sim, GameScene& out, float alpha, uint8_t viewer) 
             int x = int(t.pos.x.floorInt()), y = int(t.pos.z.floorInt());
             uint8_t v = gs.grid.inside(x, y) ? gs.vision[viewer][size_t(gs.grid.index(x, y))] : 0;
             so.visible = ut.structure && o.player == 0 ? v >= 1 : v == 2;
+            if (out.fogRemember) {
+                if (o.player == 0 && !w.has<Mobile>(e)) so.visible = v >= 1;          // scenery: wherever the map is known
+                else if (ut.structure && o.player != 0) {
+                    if (v == 2) { SceneObject& kept = out.fogMemory[e.packed()]; kept = so; kept.selected = kept.hovered = false; }
+                    else if (auto it = out.fogMemory.find(e.packed()); it != out.fogMemory.end()) so = it->second;   // as last seen
+                }
+            }
         }
         if (so.visible && ut.trap >= 0 && viewer != 0 && o.player != viewer && !sim.allied(o.player, viewer) && w.has<TrapState>(e) &&
             (m->statusFlags(sim, e) & kStInvisible) && !(m->statusFlags(sim, e) & kStRevealed)) so.visible = false;   // hidden trap
@@ -2129,6 +2138,15 @@ void sceneFromSim(Simulation& sim, GameScene& out, float alpha, uint8_t viewer) 
         }
         out.objects.push_back(std::move(so));
     });
+    // remembered structures that are gone: they stay until the viewer sees their spot again
+    for (auto it = out.fogMemory.begin(); it != out.fogMemory.end();) {
+        const SceneObject& kept = it->second;
+        if (w.alive(kept.entity)) { ++it; continue; }
+        int x = int(std::floor(kept.pos.x)), y = int(std::floor(kept.pos.z));
+        if (!gs.grid.inside(x, y) || gs.vision[viewer][size_t(gs.grid.index(x, y))] == 2) { it = out.fogMemory.erase(it); continue; }
+        out.objects.push_back(kept);
+        ++it;
+    }
     // bodies of native modules (kHookScene): drawn as unit types
     if (m->native().has(kHookScene)) {
         std::vector<NativeModule::Body> bodies;

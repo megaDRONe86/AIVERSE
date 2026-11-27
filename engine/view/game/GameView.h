@@ -143,6 +143,11 @@ struct GameScene {
     struct FacingTrack { uint32_t tick = 0; uint32_t seen = 0; render::float3 prev{}, cur{}; };
     std::unordered_map<uint64_t, FacingTrack> facingTracks;
     uint32_t facingFrame = 0;
+    bool fogRemember = false;    // set by the host from the fog look (fogOfWar.remember) before sceneFromSim
+    // View-only memory of enemy structures (fogOfWar.remember): the object as it was drawn when the viewer
+    // last saw it. sceneFromSim shows it while its spot is out of sight, also after the structure is gone.
+    std::unordered_map<uint64_t, SceneObject> fogMemory;
+    uint8_t fogMemoryViewer = 0;
     // events of the last simulation tick (attacks, hits, deaths, spawns) for animations; `tick`
     // tells the view whether they are new
     std::vector<SimEvent> events;

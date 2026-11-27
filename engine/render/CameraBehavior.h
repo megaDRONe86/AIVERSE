@@ -33,6 +33,8 @@ struct CameraOverhead {
     float pitch = 0.95f, yaw = 0, fovY = 0.75f;      // radians
     float zoom = -1, zoomMin = -1, zoomMax = -1;    // in the units above, -1 = keep
     float pixelsPerCell = 0;
+    bool bounded = false;                           // "bounds": [xMin, zMin, xMax, zMax] of the camera target
+    float bounds[4] = {0, 0, 0, 0};
 };
 
 inline CameraOverhead overheadCameraFrom(const Json& manifest) {
@@ -48,6 +50,10 @@ inline CameraOverhead overheadCameraFrom(const Json& manifest) {
     c.zoom = num("zoom", -1); c.zoomMin = num("zoomMin", -1); c.zoomMax = num("zoomMax", -1);
     c.pixelsPerCell = num("pixelsPerCell", 0);
     c.rotate = j.getBool("rotate", !c.ortho);
+    if (const Json& b = j["bounds"]; b.isArray() && b.size() == 4) {
+        c.bounded = true;
+        for (size_t i = 0; i < 4; ++i) c.bounds[i] = float(b[i].fx().toDouble());
+    }
     return c;
 }
 
