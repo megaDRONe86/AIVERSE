@@ -1316,6 +1316,7 @@ void GameClient::frame(gfx::Device& dev, double dt) {
     }
     g_stages.lap(0);   // sim (and everything before it)
     if (sim_) {
+        scene_.fogRemember = view_.fogLook().remember;
         sceneFromSim(*sim_, scene_, alpha, (spectator_ || viewScripts_.fogDisabled()) ? 0 : human_);
         scene_.paintLayers = viewScripts_.paintLayers();
         scene_.entityFx = viewScripts_.entityFx();

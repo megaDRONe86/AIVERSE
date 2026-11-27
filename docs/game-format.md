@@ -2624,6 +2624,9 @@ Visual keys of rules.json `"fogOfWar"` (game.json `"fogOfWar"` overrides key by 
   "fade": 0.3,                    // seconds for a cell to clear / fog over
   "noise": 0.0,                   // 0..1 cloudy moving edges
   "height": 1.3,                  // sheet height above the ground (covers units and low buildings)
+  "remember": false,              // true: enemy structures seen once stay drawn as they were last seen until their
+                                  // spot is in sight again (also when destroyed meanwhile); neutral objects that
+                                  // cannot move (scenery, decals) are drawn wherever the map is explored
   "grid": {"show": "fog", "color": [255, 255, 255], "alpha": 0.15}   // none | fog | all
 }
 ```

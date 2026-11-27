@@ -134,6 +134,7 @@ void apply(VisibilityLook& L, const Json& j) {
     if (j.has("softness")) L.softness = std::clamp(int(j["softness"].integer()), 0, 6);
     if (j.has("fade")) L.fade = std::clamp(float(j["fade"].toDouble()), 0.0f, 5.0f);
     if (j.has("noise")) L.noise = std::clamp(float(j["noise"].toDouble()), 0.0f, 1.0f);
+    if (j.has("remember")) L.remember = j.getBool("remember", false);
     if (j.has("height")) L.height = float(j["height"].toDouble());
     const Json& g = j["grid"];
     if (g.isObject()) {

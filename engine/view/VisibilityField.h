@@ -25,6 +25,7 @@ struct VisibilityLook {
     int softness = 2;                // blur radius in cells (smooth, pattern)
     float fade = 0.3f;               // seconds for a cell to clear or fog over again
     float noise = 0;                 // 0..1: cloudy, moving edges
+    bool remember = false;           // host scene builders: keep enemy structures as last seen, scenery on explored ground
     float height = 1.3f;             // sheet height above the ground (covers units and low buildings)
     float gridColor[3] = {1, 1, 1};
     float gridAlpha = 0;             // cell grid lines (0 = none)
