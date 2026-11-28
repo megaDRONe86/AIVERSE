@@ -5,6 +5,10 @@
 //
 // The public part of Editor is the API windows use; keep it small and stable.
 #pragma once
+#include "engine/render/graph/GraphWatch.h"
+#include "engine/render/graph/GraphGpuProfile.h"
+#include "core/TextureGraphGpuPreview.h"
+#include "engine/fx/AnimatedModelEffectView.h"
 #include "SceneRenderable.h"
 #include <array>
 #include <cmath>
@@ -27,6 +31,7 @@
 #include "engine/world/NereidManifestHost.h"
 #include "TerraWeaveSparsePreview.h"
 #include "core/FileAssoc.h"
+#include "core/TerrainTileSurface.h"
 #include "core/Net.h"
 #include "core/Workspace.h"
 #include "core/FieldOps.h"
@@ -153,6 +158,11 @@ public:
     const render::RetirementDiagnosticRing* gpuRetirementDiagnostics() const {
         return gpuRetirementRing_.get();
     }
+    // Native scene panels may inspect an exact resident graph output only
+    // within an owner-thread scope. No raw handle transport to Studio/MCP.
+    render::texture_graph::NativeGraphImageRead readSceneGraphMaterialImage(
+        size_t type,size_t choice,const view::LiveAppearanceMaterialTarget& target,
+        std::string_view output);
     render::Renderer3D& renderer() { return r3d_; }
     render::GpuResourceRetirement& gpuResourceRetirement() { return gpuResourceRetirement_; }
     const render::GpuResourceRetirement& gpuResourceRetirement() const { return gpuResourceRetirement_; }
@@ -265,6 +275,28 @@ public:
 
     // camera of the Scene window (agents fly it with view_focus)
     render::Camera sceneCam;
+    // Caverns brush hover preview, authored by TerrainWindow on the UI thread.
+    // Consumed by drawEditOverlays3D on the same editor frame.
+    struct CavernsBrushPreview {
+        bool visible=false;
+        render::float3 position{};
+        float radiusMetres=0.0f;
+        bool fill=false;
+    } cavernsBrushPreview;
+    struct CavernsBuildStats {
+        size_t pending=0,prepared=0,inFlight=0;
+        size_t gpuActive=0,gpuStaged=0,gpuRetired=0,gpuRemaining=0;
+        uint64_t gpuPreviewRevision=0,gpuRetryAfterFrame=0;
+        size_t gpuUploadFailures=0,gpuRetainedStrata=0;
+        uint64_t gpuFrameBytes=0,gpuRejectedBytes=0,gpuRejectedPressure=0;
+        uint64_t authorEpoch=0;
+        bool visualCommitConnected=false;
+        std::string diagnostic;
+    } cavernsBuildStats;
+    // Visual-only GPU cave preview. Gameplay colliders/nav remain unchanged.
+    bool cavernsVisualPreviewEnabled=false;
+
+
     void focusScene(float x, float z, float distance = -1);
     // planet maps (world block): the Scene camera is the view's orbit camera; picking returns a body point
     bool planetMap() const { return view_.planetMode(); }
@@ -481,6 +513,10 @@ public:
     std::vector<PlaySample> playHistory;
 
 private:
+    // Unpublished CPU-only generation. Pointer keeps the bridge's async worker
+    // state out of this header and is retired with the Editor lifecycle.
+    class CavernsEditHost;
+    std::unique_ptr<CavernsEditHost> cavernsEditHost_;
     void drawMenuBar();
     void drawWindowItems(const std::string& group);
     void drawTopBarControls();   // breadcrumb, play controls, MCP pill (inside the main menu bar)
@@ -497,6 +533,7 @@ private:
     void buildEditScene(game::GameScene& out) const;
     void drawEditOverlays3D();
     void applyChanges();
+    void updateCavernsAuthoring(); // owner-thread MapDoc / Undo observer
     void pollVisualAssets(double dt); // editor-owned asset watcher, independent of windows
     bool convertVisualModelSource(const std::string& source);
     void pollAgentLink();
@@ -542,8 +579,7 @@ private:
     AuthoredWaterQuery authoredWater_;
     uint64_t authoredWaterRevision_ = ~uint64_t(0);
     const MapDoc* authoredWaterMap_ = nullptr;
-    mutable std::vector<float> surfaceGrid_;
-    mutable int surfaceGridW_=0, surfaceGridH_=0;
+    mutable std::optional<TerrainTileSurface> surfaceHeights_;
     mutable uint64_t surfaceHeightCacheKey_=0;
     TerraWeaveSparsePreview terraWeaveSparsePreview_;
 
@@ -658,6 +694,7 @@ private:
     double spectraPreviewNextBurst_=0;
     std::array<float,8> spectraPreviewParams_{};
     fx::float3 spectraPreviewPosition_{};
+    fx::AnimatedModelEffectView modelEffectView_;
     fx::ParticleSystem gameFx_;
     game::GameFx gameFxBridge_;
     render::TextureCache fxTextures_;          // sprite textures of effects (same loader as sprites)
@@ -668,6 +705,25 @@ private:
     FxPreview fxPreview_;                      // fx_preview: the effect an agent is looking at
     bool fxFrozen_ = false;                    // fx_preview {freeze}: particles hold still for screenshots
     std::unique_ptr<Simulation> sim_;
+    uint64_t graphPlayEpoch_=0;
+    graph_telemetry::History graphPlayHistory_;
+    graph_telemetry::Watch graphWatch_;
+    graph_gpu_profile::Capture graphGpuProfile_;
+    TextureGraphGpuPreview textureGraphGpuPreview_;
+    struct PendingGraphMaterialApply {
+        std::string project,request;
+        size_t type=0,choice=0;
+        view::LiveAppearanceMaterialTarget target;
+    };
+    std::optional<PendingGraphMaterialApply> pendingGraphMaterialApply_;
+    std::string graphMaterialApplyProject_,graphMaterialApplyRequest_,graphMaterialApplyState_="idle",graphMaterialApplyReason_;
+    Json graphMaterialApplyStatus() const;
+    Json graphMaterialOp(const Json& p);
+    void applyQueuedGraphMaterial();
+    uint64_t graphOwnerProjectLifetime_=0;
+    void syncGraphOwnerProjectLifetime();
+    Json graphWatchSample(const std::string& domain,const std::string& entity) const;
+    void captureGraphWatch() noexcept;
     std::vector<game::ComputerPlayer> bots_;
     int human_ = 0;
     std::map<std::string, Entity> playIds_;   // map entity "id" -> live entity of the play-test (play_command names)

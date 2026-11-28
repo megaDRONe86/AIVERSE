@@ -83,7 +83,7 @@ A AIVERSE entrega as próprias mecânicas — e permite que um agente trabalhe n
 | **Multiplayer significa dessincronização sem fim.** Basta um `float` para uma partida entre um iPhone e um Android sair de sincronia. | A simulação é idêntica bit a bit em todo lugar: ponto fixo em vez de ponto flutuante, gerador aleatório próprio, checksums. A CI compara partidas em Linux x64/ARM64, Windows e macOS a cada push. Só comandos trafegam pela rede; há lockstep com rollback e um servidor com matchmaking e veredito por replay. |
 | **GPUs móveis são fracas, mas o jogo precisa ser bonito.** | Todo recurso caro — sombras, partículas, terreno, pós-processamento — tem níveis de qualidade e se adapta à GPU, das antigas Mali e Adreno ao Apple Silicon. |
 | **Lançar em todas as plataformas é um projeto à parte.** Assinaturas, ícones, SDKs de lojas e anúncios. | O `aiversebuild` gera .app, projeto Xcode, Gradle/APK, web e .exe com um único comando. Ícones e telas de abertura são gerados automaticamente. Plugins para App Store, Google Play, RuStore, Yandex Games, Steam, AdMob, AppLovin e outros — o build leva só os que o jogo escolher. |
-| **Todo jogo novo começa do zero.** | Mais de 30 templates jogáveis, kits de gênero com checklists de aceitação e 238 skills para agentes. Um jogo novo começa a partir de um que já funciona. |
+| **Todo jogo novo começa do zero.** | Mais de 30 templates jogáveis, kits de gênero com checklists de aceitação e 303 skills para agentes. Um jogo novo começa a partir de um que já funciona. |
 | **Meta e LiveOps são reescritos em cada projeto.** | `aiverse::meta`: loja, moedas, missões, passes, recompensas diárias, energia, clãs, torneios, baús com garantia — configurados em JSON. |
 
 ---
@@ -227,7 +227,7 @@ Os templates são pacotes do [catálogo](https://chromealex.github.io/AIVERSE/ca
 - Editor com janelas encaixáveis no estilo Unity: cena, inspetor, terreno, efeitos, iluminação, UI, teste de jogo e simulador de dispositivos
 - `aiversemcp` — servidor MCP para agentes — configuração PHYSIS de mapas, validação e Undo/Redo
 - Assistente **Criar um jogo**
-- 238 skills para agentes e kits de gênero com checklists de aceitação
+- 303 skills para agentes e kits de gênero com checklists de aceitação
 - Importadores de assets de jogos clássicos a partir da sua própria cópia
 
 </td>
@@ -260,12 +260,18 @@ Windows: `studio_windows.cmd [project]` compila e abre o `AiverseStudio.exe` (re
 CMake, Node.js; roda no WebView2 Runtime e Vulkan).
 
 `studio_mac.command` compila a interface web e o Studio nativo e o abre. Só o motor:
-`cmake -S . -B build/mac -DCMAKE_BUILD_TYPE=Release && cmake --build build/mac -j 8`. O editor
-anterior em ImGui (`build/mac/AiverseEditor.app`) continua sendo compilado e funciona no Linux e no Windows.
+`cmake -S . -B build/mac -DCMAKE_BUILD_TYPE=Release && cmake --build build/mac -j 8`.
 
-Linux: `cmake --preset linux-release && cmake --build build/linux-release`. Se preferir não compilar, a
-branch `builds` tem o editor e as ferramentas pré-compilados
-([detalhes](docs/pt-BR/overview.md#engine-pré-compilada-branch-builds-e-aiversemcp-sem-compilador)).
+No Linux, o HTML5 Studio usa WebKitGTK 4.1 (2.40 ou mais recente), SQLite, X11 e Vulkan. Com os pacotes de desenvolvimento deles, Node.js, CMake e Ninja instalados, compile a interface web antes de configurar o Studio.
+
+```bash
+(cd apps/studio-web && npm install && npm run build)
+cmake --preset linux-release -DAIVERSE_BUILD_STUDIO_HTML5=ON -DAIVERSE_BUILD_EDITOR=OFF
+cmake --build --preset linux-release --target aiverse_studio
+./build/linux-release/apps/studio-native/AiverseStudio
+```
+
+Para compilar só o motor no Linux, use `cmake --preset linux-release -DAIVERSE_BUILD_STUDIO_HTML5=OFF -DAIVERSE_BUILD_EDITOR=OFF` e `cmake --build --preset linux-release`. A branch `builds` também tem ferramentas pré-compiladas. [Motor e ferramentas pré-compilados](docs/pt-BR/overview.md#engine-pré-compilada-branch-builds-e-aiversemcp-sem-compilador)
 
 **2. Crie um jogo.** No hub, clique em **Criar um jogo** ou crie um projeto a partir de um template. Dá
 para jogar com bots na hora, na janela Game.

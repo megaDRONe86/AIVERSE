@@ -26,6 +26,7 @@
 #include "engine/world/PhysisNatureFxHost.h"
 #include "engine/world/PhysisNatureAudioHost.h"
 #include "engine/world/PhysisNatureGrass.h"
+#include "engine/world/TerraWeaveGrassSpeciesJson.h"
 #include "engine/render/Math3D.h"
 #include <optional>
 #include <algorithm>
@@ -51,6 +52,10 @@ struct PhysisNaturePreviewSettings {
     float radiusMeters = 110;     // presentation region around the camera
     bool grass = true, flames = true, sound = true;
     int grassQuality = 1;         // 0 low, 1 medium, 2 high
+    // Meadow grass (species + clumps): "auto" = the map's "grass": {"meadow": ...}
+    // block, else legacy grass; a preset name ("legacy" = old uniform
+    // blades); or a JSON object text (TerraWeaveGrassSpeciesJson.h).
+    std::string grassMeadow = "auto";
     float shoreSandMeters = 7;    // bare sand band along authored water: no grass, no fuel
     float volume = 0.8f;
 };
@@ -64,6 +69,7 @@ public:
     PhysisNaturePreviewSettings settings;
 
     bool usingLive() const { return usingLive_; }
+    bool hasAuthoredGrid() const { return hasAuthoredGrid_; }
     bool hasPreviewWorld() const { return bool(world_); }
     // Private preview World for read-only diagnostics (heatmap overlay).
     const World* previewWorld() const { return settings.enabled && !usingLive_ ? world_.get() : nullptr; }
@@ -72,11 +78,14 @@ public:
     std::size_t flames() const { return fxHost_.activeFlames(); }
     std::size_t smoke() const { return fxHost_.activeSmoke(); }
     std::size_t voices() const { return audioHost_.voices(); }
+    unsigned grassBladeLimit() const { return grass_.quality().maxBladesPerPatch; }
+    float masterVolume() const { return audio_ ? audio_->masterVolume() : 0.f; }
     std::size_t grassPatches() const { return grass_.residentPatches(); }
     float burningArea() const { return frame_ ? frame_->burningArea : 0; }
     float cellMeters() const { return frame_ ? frame_->cellSize : 0; }
     const world::NaturePresentationFrame* frame() const { return frame_.get(); }
 
+    void invalidateFrame() { frameDirty_ = true; }
     void requestReset() { resetRequested_ = true; }
     // Authored NEREID water (AuthoredWaterQuery::fromDoc): grass and fuel stay
     // out of it. A changed revision rebuilds the preview World and grass.
@@ -142,16 +151,7 @@ public:
         lastTime_ = timeSeconds;
 
         const World* source = prepareSource(ps, doc, live, heightAt);
-        if (!usingLive_ && settings.playing && world_) {
-            accumulator_ += dt * std::clamp(settings.speed, 0.f, 8.f) *
-                            std::clamp(settings.ticksPerSecond, 1.f, 60.f);
-            int steps = 0;
-            while (accumulator_ >= 1.f && steps < 8) {
-                stepPreview();
-                accumulator_ -= 1.f; ++steps; frameDirty_ = true;
-            }
-            if (steps == 8) accumulator_ = 0;
-        }
+        if (settings.playing) advanceElapsed(dt);
         if (!source) return;
 
         // ---- presentation frame (rebuilt per tick or when the camera moved)
@@ -235,6 +235,16 @@ public:
         return world_.get();
     }
 
+    void advanceElapsed(float seconds) {
+        if (usingLive_ || !world_ || !std::isfinite(seconds)) return;
+        const float dt = std::clamp(seconds, 0.f, 0.25f);
+        accumulator_ += dt * std::clamp(settings.speed, 0.f, 8.f) *
+                        std::clamp(settings.ticksPerSecond, 1.f, 60.f);
+        const int steps = std::min(8, int(accumulator_));
+        advance(steps);
+        accumulator_ = steps == 8 ? 0.f : accumulator_ - float(steps);
+    }
+
     // Advance the private preview by N committed ticks (agents/tests).
     int advance(int ticks) {
         if (usingLive_ || !world_) return 0;
@@ -286,6 +296,7 @@ private:
         std::optional<physis::InstallOptions> options;
         try { options = physis::optionsFromMap(map); }
         catch (const std::exception& e) { status_ = std::string("map PHYSIS: ") + e.what(); }
+        hasAuthoredGrid_ = options.has_value();
         physis::Settings grid;
         grid.seed = options ? options->climate.seed : 1;
         grid.baseTemperature = options ? options->climate.baseTemperature : Fixed::fromInt(24);
@@ -355,14 +366,48 @@ private:
             physis::advanceEnvironmentWithDisasters(*world_, physis::FloodMode::ExternalAuthority);
     }
 
+    // Resolves settings.grassMeadow (+ the map's "grass".meadow block) into a
+    // renderer quality. Parse errors fall back to legacy grass with a status.
+    const terraweave::GrassRenderQuality& grassQuality(const MapDoc& doc) {
+        if (grassDocument_ == &doc && grassRevision_ == doc.revision &&
+            grassPreset_ == settings.grassMeadow && grassTier_ == settings.grassQuality)
+            return grass_.quality();
+
+        terraweave::GrassMeadow meadow;
+        try {
+            const auto& preset = settings.grassMeadow;
+            if (preset.empty() || preset == "auto")
+                meadow = terraweave::parseGrassMeadow(doc.data.extra["grass"]["meadow"]);
+            else
+                meadow = terraweave::parseGrassMeadow(preset.front() == '{' ? Json::parse(preset) : Json::string(preset));
+        } catch (const std::exception& e) {
+            status_ = std::string("grass: ") + e.what();
+        }
+        terraweave::GrassRenderQuality q;
+        if (meadow.enabled()) {
+            const auto tier = settings.grassQuality <= 0 ? terraweave::GrassTier::Mobile
+                            : settings.grassQuality == 1 ? terraweave::GrassTier::Medium
+                                                         : terraweave::GrassTier::High;
+            q = terraweave::meadowGrassQuality(tier, std::move(meadow));
+            q.maxBladesPerPatch = settings.grassQuality <= 0 ? 2048 : settings.grassQuality == 1 ? 4608 : 8192;
+        } else {
+            q.maxBladesPerPatch = settings.grassQuality <= 0 ? 1024 : settings.grassQuality == 1 ? 2560 : 4608;
+        }
+        q.maxGpuPatches = 128;
+        q.maxUploadsPerFrame = 6;
+        grass_.setQuality(std::move(q));
+        grassDocument_ = &doc;
+        grassRevision_ = doc.revision;
+        grassPreset_ = settings.grassMeadow;
+        grassTier_ = settings.grassQuality;
+        return grass_.quality();
+    }
+
     void drawGrass(gfx::Device& device, render::Renderer3D& renderer, const MapDoc& doc,
                    float cx, float cz, const HeightAt& heightAt, double timeSeconds) {
         static constexpr std::int64_t kPatchCm = 1200;
-        terraweave::GrassRenderQuality q;
-        q.maxBladesPerPatch = settings.grassQuality <= 0 ? 1024 : settings.grassQuality == 1 ? 2560 : 4608;
-        q.maxGpuPatches = 128;
-        q.maxUploadsPerFrame = 6;
-        if (q.maxBladesPerPatch != grass_.quality().maxBladesPerPatch) grass_.setQuality(q);
+        const auto& q = grassQuality(doc);
+        const bool meadow = q.meadow.enabled();
         const float radius = settings.grassQuality >= 2 ? 66.f : 56.f;
         const std::int64_t mapW = std::int64_t(std::max(1, doc.data.w)) * 100;
         const std::int64_t mapH = std::int64_t(std::max(1, doc.data.h)) * 100;
@@ -386,7 +431,7 @@ private:
                 if (!g.key) g.key = 1;
                 g.seed = g.key * 0x9e3779b97f4a7c15ull;
                 const auto area = (g.bounds.maxX - g.bounds.minX) * (g.bounds.maxZ - g.bounds.minZ) / 10000;
-                g.maximumBlades = std::uint32_t(std::clamp<std::int64_t>(area * 40, 64, 262144));
+                g.maximumBlades = std::uint32_t(std::clamp<std::int64_t>(area * (meadow ? 90 : 40), 64, 262144));
                 patches_.push_back(g);
             }
         const terraweave::GrassSoilHeight ground = [&heightAt](std::int64_t x, std::int64_t z) {
@@ -440,12 +485,17 @@ private:
     std::unique_ptr<World> world_;
     AuthoredWaterQuery water_;
     bool grassFilterDirty_ = true;
+    const MapDoc* grassDocument_ = nullptr;
+    std::uint64_t grassRevision_ = 0;
+    std::string grassPreset_;
+    int grassTier_ = -1;
     float grassFilterSand_ = -1;
     std::shared_ptr<const world::NaturePresentationFrame> frame_;
     std::string builtKey_, status_;
     bool usingLive_ = false, resetRequested_ = false, frameDirty_ = true;
     bool fxReady_ = false, active_ = false, retireSet_ = false, hasStorms_ = false;
     double lastTime_ = -1;
+    bool hasAuthoredGrid_ = false;
     float accumulator_ = 0, frameX_ = 0, frameZ_ = 0;
     terraweave::GrassPatchRenderer grass_;
     std::vector<terraweave::GrassPatch> patches_;

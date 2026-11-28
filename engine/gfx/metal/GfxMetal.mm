@@ -418,6 +418,8 @@ public:
         if(!b || !b->storage || !cmd_ || enc_ || compute_ ||
            gpuIcbEncoder_ || !gpuHealthy_->load() || !data || size==0 ||
            offset>b->size || size>b->size-offset)return false;
+        GpuTransferReservation charge(transientGpuBudget(),size);
+        if(!charge){error_="Metal: GPU transfer budget exhausted";return false;}
         id<MTLBuffer> upload=[device_ newBufferWithBytes:data length:size
                                                options:MTLResourceStorageModeShared];
         if(!upload) {
@@ -432,8 +434,21 @@ public:
         }
         [blit copyFromBuffer:upload sourceOffset:0
                    toBuffer:b->bufs[0] destinationOffset:offset size:size];
-        [blit endEncoding];
+        [blit endEncoding];charge.submitted(gpuSubmissionFence());
         return true;
+    }
+    bool supportsStorageBufferCopy() const override {return true;}
+    bool copyStorageBufferChecked(BufferHandle src,BufferHandle dst,size_t bytes,size_t srcOffset=0,size_t dstOffset=0) override {
+        auto* a=buffers_.get(src.id);auto* b=buffers_.get(dst.id);
+        if(!a||!b||src.id==dst.id||!a->storage||!b->storage||!cmd_||enc_||compute_||gpuIcbEncoder_||
+           !gpuHealthy_->load()||!bytes||((bytes|srcOffset|dstOffset)&3u)||
+           srcOffset>a->size||bytes>a->size-srcOffset||dstOffset>b->size||bytes>b->size-dstOffset)return false;
+        id<MTLBlitCommandEncoder> blit=[cmd_ blitCommandEncoder];
+        if(!blit)return false;
+        // cmd_ uses queue commandBuffer (retained references). Both MTLBuffers
+        // stay alive until this and any earlier referencing command buffers finish.
+        [blit copyFromBuffer:a->bufs[0] sourceOffset:srcOffset toBuffer:b->bufs[0] destinationOffset:dstOffset size:bytes];
+        [blit endEncoding];return true;
     }
     void updateBuffer(BufferHandle h, const void* data, size_t size, size_t offset) override {
         auto* b = buffers_.get(h.id);
@@ -673,15 +688,31 @@ public:
         if (@available(macOS 10.14, iOS 12.0, *)) [compute_ memoryBarrierWithScope:MTLBarrierScopeBuffers|MTLBarrierScopeTextures];
         computeDispatchSucceeded_=true;
     }
+    bool supportsGpuComputeIndirect() const override {return supportsCompute();}
+    bool dispatchGpuIndirect(BufferHandle arguments,size_t offset) override {
+        computeDispatchSucceeded_=false;
+        auto* b=buffers_.get(arguments.id);
+        if(!compute_||!b||b->type!=BufferType::Storage||(offset&3u)||
+           offset>b->size||12u>b->size-offset||!gpuHealthy())return false;
+        id<MTLBuffer> args=current(*b);
+        if(!args)return false;
+        [compute_ dispatchThreadgroupsWithIndirectBuffer:args indirectBufferOffset:offset
+                                     threadsPerThreadgroup:MTLSizeMake(64,1,1)];
+        if (@available(macOS 10.14, iOS 12.0, *))
+            [compute_ memoryBarrierWithScope:MTLBarrierScopeBuffers|MTLBarrierScopeTextures];
+        computeDispatchSucceeded_=true;return true;
+    }
     bool computeDispatchSucceeded() const override { return computeDispatchSucceeded_; }
     void endCompute() override { if(compute_){[compute_ endEncoding];compute_=nil;} }
     bool readBuffer(BufferHandle h,void* data,size_t size) override {
-        auto* b=buffers_.get(h.id);if(cmd_||!b||!data||size>b->size)return false;
+        auto* b=buffers_.get(h.id);if(cmd_||!b||!data||!size||size>b->size)return false;
+        GpuTransferReservation charge(transientGpuBudget(),size);if(!charge)return false;
         id<MTLBuffer> dst=[device_ newBufferWithLength:size options:MTLResourceStorageModeShared];
         if(!dst)return false;
         id<MTLCommandBuffer> cb=[queue_ commandBuffer];id<MTLBlitCommandEncoder> blit=[cb blitCommandEncoder];
+        if(!cb||!blit)return false;
         [blit copyFromBuffer:current(*b) sourceOffset:0 toBuffer:dst destinationOffset:0 size:size];[blit endEncoding];
-        [cb commit];[cb waitUntilCompleted];if(cb.status==MTLCommandBufferStatusError)return false;
+        [cb commit];[cb waitUntilCompleted];if(cb.status!=MTLCommandBufferStatusCompleted)return false;
         memcpy(data,dst.contents,size);return true;
     }
     struct BufferRead {std::vector<uint8_t> bytes;BufferReadFn callback;std::atomic<bool> ready{false};};
@@ -715,18 +746,28 @@ public:
         const MTLPixelFormat pixelFormat = t->tex.pixelFormat;
         const bool isBGRA = pixelFormat == MTLPixelFormatBGRA8Unorm ||
                             pixelFormat == MTLPixelFormatBGRA8Unorm_sRGB;
-        const bool isRGBA = pixelFormat == MTLPixelFormatRGBA8Unorm ||
-                            pixelFormat == MTLPixelFormatRGBA8Unorm_sRGB;
-        const bool isHalf = pixelFormat == MTLPixelFormatRGBA16Float;
-        if ((!isBGRA && !isRGBA && !isHalf) ||
-            (isHalf ? t->fmt != PixelFormat::RGBA16F :
-             t->fmt != PixelFormat::RGBA8 && t->fmt != PixelFormat::RGBA8_sRGB))
-            return false;
+        bool compatible = false;
+        switch (t->fmt) {
+            case PixelFormat::R8: compatible = pixelFormat == MTLPixelFormatR8Unorm; break;
+            case PixelFormat::RG8: compatible = pixelFormat == MTLPixelFormatRG8Unorm; break;
+            case PixelFormat::R16F: compatible = pixelFormat == MTLPixelFormatR16Float; break;
+            case PixelFormat::RG16F: compatible = pixelFormat == MTLPixelFormatRG16Float; break;
+            case PixelFormat::R32F: compatible = pixelFormat == MTLPixelFormatR32Float; break;
+            case PixelFormat::RG32F: compatible = pixelFormat == MTLPixelFormatRG32Float; break;
+            case PixelFormat::RGBA16F: compatible = pixelFormat == MTLPixelFormatRGBA16Float; break;
+            case PixelFormat::RGBA32F: compatible = pixelFormat == MTLPixelFormatRGBA32Float; break;
+            case PixelFormat::RGBA8:
+            case PixelFormat::RGBA8_sRGB:
+                compatible = isBGRA || pixelFormat == MTLPixelFormatRGBA8Unorm || pixelFormat == MTLPixelFormatRGBA8Unorm_sRGB;
+                break;
+            default: break;
+        }
+        if (!compatible) return false;
         const size_t width = size_t(std::max<NSUInteger>(1,
                               t->tex.width >> request.mipLevel));
         const size_t height = size_t(std::max<NSUInteger>(1,
                                t->tex.height >> request.mipLevel));
-        const size_t bpp = isHalf ? 8u : 4u;
+        const size_t bpp = uncompressedTexturePixelBytes(t->fmt);
         // Align bytesPerRow for the Metal texture-to-buffer blit.
         if (width > SIZE_MAX / bpp) return false;
         const size_t packedRow = width*bpp;
@@ -735,6 +776,8 @@ public:
         if (height == 0 || gpuRow > (size_t(256)<<20)/height)
             return false;
         const size_t gpuBytes = gpuRow*height;
+        GpuTransferReservation charge(transientGpuBudget(),gpuBytes);
+        if(!charge){error_="Metal: GPU transfer budget exhausted";return false;}
         id<MTLBuffer> target = [device_ newBufferWithLength:gpuBytes
                                                 options:MTLResourceStorageModeShared];
         if (!target) { error_ = "Metal: texture readback staging buffer allocation failed"; return false; }
@@ -746,7 +789,7 @@ public:
                      sourceSize:MTLSizeMake(width,height,1)
                        toBuffer:target destinationOffset:0
          destinationBytesPerRow:gpuRow destinationBytesPerImage:gpuBytes];
-        [blit endEncoding];
+        [blit endEncoding];charge.submitted(gpuSubmissionFence());
         auto read = std::make_shared<TextureRead>();
         read->callback = std::move(callback);
         read->result.format = t->fmt;
@@ -777,13 +820,16 @@ public:
     }
     bool readBufferAsync(BufferHandle h,size_t size,BufferReadFn callback) override {
         auto* b=buffers_.get(h.id);
-        if(!cmd_||enc_||compute_||!b||!size||size>b->size||size>65536||!callback||bufferReads_.size()>=32)return false;
+        if(!cmd_||enc_||compute_||gpuIcbEncoder_||!gpuHealthy_->load()||!b||!size||size>b->size||size>65536||!callback||bufferReads_.size()>=32)return false;
+        GpuTransferReservation charge(transientGpuBudget(),size);
+        if(!charge){error_="Metal: GPU transfer budget exhausted";return false;}
         id<MTLBuffer> dst=[device_ newBufferWithLength:size options:MTLResourceStorageModeShared];if(!dst)return false;
         auto read=std::make_shared<BufferRead>();read->bytes.resize(size);read->callback=std::move(callback);
         id<MTLBlitCommandEncoder> blit=[cmd_ blitCommandEncoder];
-        [blit copyFromBuffer:current(*b) sourceOffset:0 toBuffer:dst destinationOffset:0 size:size];[blit endEncoding];
+        if(!blit)return false;
+        [blit copyFromBuffer:current(*b) sourceOffset:0 toBuffer:dst destinationOffset:0 size:size];[blit endEncoding];charge.submitted(gpuSubmissionFence());
         [cmd_ addCompletedHandler:^(id<MTLCommandBuffer> cb){
-            if(cb.status==MTLCommandBufferStatusError)read->bytes.clear();else memcpy(read->bytes.data(),dst.contents,size);
+            if(cb.status!=MTLCommandBufferStatusCompleted)read->bytes.clear();else memcpy(read->bytes.data(),dst.contents,size);
             read->ready.store(true,std::memory_order_release);
         }];
         bufferReads_.push_back(std::move(read));return true;
@@ -794,6 +840,8 @@ public:
         if(!cmd_||enc_||compute_||gpuIcbEncoder_||!gpuHealthy_->load()||!b||!size||offset>b->size||
            size>b->size-offset||size>65536||!callback||
            bufferReads_.size()>=32)return false;
+        GpuTransferReservation charge(transientGpuBudget(),size);
+        if(!charge){error_="Metal: GPU transfer budget exhausted";return false;}
         id<MTLBuffer> dst=[device_ newBufferWithLength:size
                              options:MTLResourceStorageModeShared];
         if(!dst)return false;
@@ -804,7 +852,7 @@ public:
         if(!blit)return false;
         [blit copyFromBuffer:current(*b) sourceOffset:offset
                   toBuffer:dst destinationOffset:0 size:size];
-        [blit endEncoding];
+        [blit endEncoding];charge.submitted(gpuSubmissionFence());
         [cmd_ addCompletedHandler:^(id<MTLCommandBuffer> cb){
             if(cb.status!=MTLCommandBufferStatusCompleted)read->bytes.clear();
             else memcpy(read->bytes.data(),dst.contents,size);
@@ -950,6 +998,8 @@ public:
             ((w * kFloatBytes + 255u) / 256u) * 256u;
         const NSUInteger allocation = rowBytes * hgt;
         if (allocation > 64u * 1024u * 1024u) return false;
+        GpuTransferReservation charge(transientGpuBudget(),allocation);
+        if(!charge){error_="Metal: GPU transfer budget exhausted";return false;}
         id<MTLBuffer> dst =
             [device_ newBufferWithLength:allocation
                                  options:MTLResourceStorageModeShared];
@@ -967,7 +1017,7 @@ public:
                     toBuffer:dst destinationOffset:0
         destinationBytesPerRow:rowBytes
       destinationBytesPerImage:allocation];
-        [blit endEncoding];
+        [blit endEncoding];charge.submitted(gpuSubmissionFence());
         [cmd_ addCompletedHandler:^(id<MTLCommandBuffer> completed) {
             if (completed.status != MTLCommandBufferStatusCompleted) {
                 read->bytes.clear();
@@ -1022,6 +1072,8 @@ public:
         const NSUInteger rowBytes=((w*4u+255u)/256u)*256u;
         const NSUInteger length=rowBytes*hgt;
         if (length > 64u*1024u*1024u) return false;
+        GpuTransferReservation charge(transientGpuBudget(),length);
+        if(!charge){error_="Metal: GPU transfer budget exhausted";return false;}
         id<MTLBuffer> dst=[device_ newBufferWithLength:length
                                options:MTLResourceStorageModeShared];
         if (!dst) return false;
@@ -1038,7 +1090,7 @@ public:
                      toBuffer:dst destinationOffset:0
          destinationBytesPerRow:rowBytes
        destinationBytesPerImage:length];
-        [blit endEncoding];
+        [blit endEncoding];charge.submitted(gpuSubmissionFence());
         [cmd_ addCompletedHandler:^(id<MTLCommandBuffer> completed) {
             if (completed.status != MTLCommandBufferStatusCompleted)
                 read->bytes.clear();
@@ -1563,7 +1615,7 @@ public:
         MTLRenderPipelineDescriptor* pd = [MTLRenderPipelineDescriptor new];
         pd.vertexFunction = s->vs;
         pd.fragmentFunction = s->fs; // depth-only shaders without fs_main get nil (no fragment stage)
-        pd.vertexDescriptor = vd;
+        pd.vertexDescriptor = d.attrCount>0 ? vd : nil;
         pd.rasterSampleCount = NSUInteger(std::max(1, d.sampleCount));
         // Metal requires opt-in at pipeline creation for pipeline states
         // referenced by indirect render commands. Without this the driver may
@@ -1581,7 +1633,7 @@ public:
         auto nativeColor = [&](PixelFormat format) {
             return format == PixelFormat::RGBA16F ? MTLPixelFormatRGBA16Float :
                    format == PixelFormat::RGBA8_sRGB ? MTLPixelFormatBGRA8Unorm_sRGB :
-                   layer_.pixelFormat;
+                   MTLPixelFormatBGRA8Unorm;
         };
         const int slots = d.depthOnly ? 0 : d.colorAttachmentCount;
         for (int colorSlot = 0; colorSlot < slots; ++colorSlot) {
@@ -1618,10 +1670,10 @@ public:
         } else if (d.blend != BlendMode::Opaque) {
             ca.blendingEnabled = YES;
             ca.rgbBlendOperation = ca.alphaBlendOperation = MTLBlendOperationAdd;
-            ca.sourceRGBBlendFactor = d.blend == BlendMode::Premultiplied ? MTLBlendFactorOne : MTLBlendFactorSourceAlpha;
-            ca.destinationRGBBlendFactor = d.blend == BlendMode::Additive ? MTLBlendFactorOne : MTLBlendFactorOneMinusSourceAlpha;
+            ca.sourceRGBBlendFactor = (d.blend == BlendMode::Premultiplied || d.blend == BlendMode::AdditiveUnweighted) ? MTLBlendFactorOne : MTLBlendFactorSourceAlpha;
+            ca.destinationRGBBlendFactor = (d.blend == BlendMode::Additive || d.blend == BlendMode::AdditiveUnweighted) ? MTLBlendFactorOne : MTLBlendFactorOneMinusSourceAlpha;
             ca.sourceAlphaBlendFactor = MTLBlendFactorOne;
-            ca.destinationAlphaBlendFactor = d.blend == BlendMode::Additive ? MTLBlendFactorOne : MTLBlendFactorOneMinusSourceAlpha;
+            ca.destinationAlphaBlendFactor = (d.blend == BlendMode::Additive || d.blend == BlendMode::AdditiveUnweighted) ? MTLBlendFactorOne : MTLBlendFactorOneMinusSourceAlpha;
         }
         }
         shaderAssets_->prepare(pd);
@@ -1853,12 +1905,18 @@ public:
 
     // ---------- frame ----------
     // ---------- capture (tools) ----------
+    TaggedCaptureFn taggedCapture_;
     CaptureFn capture_;              // requested, waiting for a readable drawable
     int captureDelay_ = 0;
     struct Captured { int w = 0, h = 0; std::vector<uint8_t> px; std::atomic<bool> ready{false}; CaptureFn fn; };
     std::shared_ptr<Captured> captured_;
     std::vector<std::shared_ptr<Captured>> capturedTextures_;
+    void captureNextFrameTagged(TaggedCaptureFn fn) override {
+        captureNextFrame([](int,int,std::vector<uint8_t>){});
+        taggedCapture_=std::move(fn);
+    }
     void captureNextFrame(CaptureFn fn) override {
+        taggedCapture_={};
         capture_ = std::move(fn);
         layer_.framebufferOnly = NO; // drawables acquired from now on can be blitted
         captureDelay_ = drawable_ && !drawable_.texture.framebufferOnly ? 0 : 1;
@@ -1921,6 +1979,44 @@ public:
         screenReadable_ = readable;
         if (!capture_ && !captured_) layer_.framebufferOnly = readable ? NO : YES;
     }
+    bool supportsStorageBufferTextureCopy() const override {
+        return supportsCompute() && gpuHealthy();
+    }
+    bool supportsHdrTextureMipGeneration(PixelFormat f) const override {
+        return f==PixelFormat::RGBA16F&&supportsStorageBufferTextureCopy()&&supports(f);
+    }
+    bool copyStorageBufferToTexture2D(BufferHandle from,TextureHandle to,
+                                     const BufferTextureCopy2D& copy) override {
+        auto* source=buffers_.get(from.id);
+        const auto* dst=textures_.get(to.id);
+        const auto format=dst&&dst->tex?dst->tex.pixelFormat:MTLPixelFormatInvalid;
+        const size_t bpp=format==MTLPixelFormatRGBA16Float?8u:format==MTLPixelFormatRGBA32Float?16u:4u;
+        if(!cmd_||enc_||compute_||gpuIcbEncoder_||!supportsStorageBufferTextureCopy()||
+           !source||!source->storage||!dst||!dst->tex||dst->storage||
+           dst->dimension!=TextureDimension::Texture2D||
+           dst->tex.textureType!=MTLTextureType2D||dst->tex.sampleCount!=1||
+           (copy.generateMipmaps?(!dst->mips||dst->tex.mipmapLevelCount!=NSUInteger(maxTextureMipLevels(copy.width,copy.height,1))):dst->tex.mipmapLevelCount!=1)||
+           dst->tex.framebufferOnly||
+           (dst->tex.usage&MTLTextureUsageRenderTarget)||
+           (format!=MTLPixelFormatRGBA8Unorm&&format!=MTLPixelFormatRGBA8Unorm_sRGB&&format!=MTLPixelFormatRGBA16Float&&format!=MTLPixelFormatRGBA32Float)||
+           (bpp!=4&&copy.generateMipmaps&&!supportsHdrTextureMipGeneration(dst->fmt))||
+           !validBufferTextureCopy2D(copy,source->size,int(dst->tex.width),int(dst->tex.height),bpp)) {
+            error_="Metal: rejected storage buffer to RGBA texture copy";return false;
+        }
+        id<MTLBuffer> src=current(*source);
+        if(!src){error_="Metal: copy source unavailable";return false;}
+        id<MTLBlitCommandEncoder> blit=[cmd_ blitCommandEncoder];
+        if(!blit){error_="Metal: texture copy encoder unavailable";return false;}
+        [blit copyFromBuffer:src sourceOffset:NSUInteger(copy.sourceOffset)
+            sourceBytesPerRow:NSUInteger(copy.rowPitchBytes) sourceBytesPerImage:0
+            sourceSize:MTLSizeMake(NSUInteger(copy.width),NSUInteger(copy.height),1)
+            toTexture:dst->tex destinationSlice:0 destinationLevel:0
+            destinationOrigin:MTLOriginMake(0,0,0)];
+        if(copy.generateMipmaps)[blit generateMipmapsForTexture:dst->tex];
+        [blit endEncoding];
+        return true;
+    }
+
     bool copyColor(TextureHandle from, TextureHandle to) override {
         auto* dst = textures_.get(to.id);
         if (!cmd_ || enc_ || !dst) return false;
@@ -1957,6 +2053,7 @@ public:
         // arbitrary offscreen viewport widths, not just the test's 128 px.
         const size_t pitch = ((w * 4u + 255u) / 256u) * 256u;
         if (hgt > SIZE_MAX / pitch) return false;
+        GpuTransferReservation charge(transientGpuBudget(),pitch*hgt);if(!charge)return false;
         id<MTLBuffer> buffer = [device_ newBufferWithLength:pitch * hgt
                             options:MTLResourceStorageModeShared];
         if (!buffer) return false;
@@ -1992,9 +2089,17 @@ public:
         return true;
     }
 
-    void beginFrame(int w, int h) override {
+    void beginFrame(int w, int h) override { beginFrameInternal(w,h,true); }
+    bool supportsOffscreenFrames() const override { return true; }
+    bool beginOffscreenFrame() override {
+        if(cmd_ || !gpuHealthy()) return false;
+        beginFrameInternal(fbW_>0?fbW_:64,fbH_>0?fbH_:64,false);
+        return cmd_ != nil;
+    }
+    void beginFrameInternal(int w,int h,bool present) {
         fbW_ = w; fbH_ = h;
         dispatch_semaphore_wait(frameSemaphore_, DISPATCH_TIME_FOREVER);
+        (void)transientGpuBudget();
         deliverBufferReads();
         deliverDepthReads();
         deliverColorReads();
@@ -2006,7 +2111,7 @@ public:
         // BEFORE commandBuffer creation; beginning in the fixture callback
         // would be too late for the already-created command buffer.
         maybeStartGpuTrace();
-        if (modelCounterEnabled_) {
+        if (present && modelCounterEnabled_) {
             std::fill(std::begin(modelCounterMarked_), std::end(modelCounterMarked_), false);
             modelCounterCurrent_ = nil;
             if (@available(macOS 11.0, iOS 14.0, *)) {
@@ -2027,15 +2132,15 @@ public:
         gpuEncodedIcbCursor_[frame_ % kFramesInFlight] = 0;
         uniformPage_=uniformOffset_=0;
         gpuIcbInstanceUploadedBytes_ = 0;
-        layer_.drawableSize = CGSizeMake(w, h);
+        if(present) layer_.drawableSize = CGSizeMake(w, h);
         // Opt-in late drawable acquisition (AIVERSE_METAL_LATE_DRAWABLE=1): the
         // drawable is taken at the first screen pass, after offscreen passes and
         // the game's CPU work. Default stays here: on the owner's Mac it showed no
         // gain and one run measured ~8 ms vs ~4 ms frames (2026-11-21, unresolved).
         drawable_ = nil;
-        drawablePending_ = true;
-        if (!lateDrawable_) acquireDrawable();
-        if (!depth_ || int(depth_.width) != w || int(depth_.height) != h) {
+        drawablePending_ = present;
+        if (present && !lateDrawable_) acquireDrawable();
+        if (present && (!depth_ || int(depth_.width) != w || int(depth_.height) != h)) {
             MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
                 width:NSUInteger(w) height:NSUInteger(h) mipmapped:NO];
             td.usage = MTLTextureUsageRenderTarget;
@@ -2043,6 +2148,12 @@ public:
             depth_ = [device_ newTextureWithDescriptor:td];
         }
         cmd_ = [queue_ commandBuffer];
+        if(!cmd_){
+            dispatch_semaphore_signal(frameSemaphore_);
+            drawable_=nil;drawablePending_=false;
+            gpuHealthy_->store(false);
+            return;
+        }
         __block dispatch_semaphore_t sem = frameSemaphore_;
         [cmd_ addCompletedHandler:^(id<MTLCommandBuffer>) { dispatch_semaphore_signal(sem); }];
         const uint64_t gpuToken = frame_;
@@ -2068,7 +2179,7 @@ public:
                 std::fprintf(stderr, "[metal] command buffer failed: %s\\n", description);
             }
             if(completed.status==MTLCommandBufferStatusCompleted) {
-                timing->store((completed.GPUEndTime-completed.GPUStartTime)*1000);
+                if(present) timing->store((completed.GPUEndTime-completed.GPUStartTime)*1000);
                 // Only a completed queue submission may release quarantined
                 // geometry spans. One Metal queue orders all model uploads
                 // and draws; atomically publish the highest completed frame.
@@ -2099,16 +2210,29 @@ public:
     id<MTLCounterSet> timestampCounterSet_ = nil;
     // 1 = explicit blit-command samples, 2 = blit stage-boundary samples
     int timestampScopeMode_ = 0;
+    // A real command is required for stage-boundary sampling on tile GPUs.
+    // This private marker buffer is never read by scene/graph work.
+    id<MTLBuffer> timestampScopeMarker_ = nil;
+    size_t timestampScopeInvalidLogged_ = 0;
 
     bool encodeGpuScopeTimestamp(id<MTLCounterSampleBuffer> samples,
                                  NSUInteger index) {
         if (@available(macOS 11.0, iOS 14.0, *)) {
         if (!cmd_ || enc_ || compute_ || gpuIcbEncoder_ || !samples)
             return false;
+        if (!timestampScopeMarker_) {
+            timestampScopeMarker_=[device_ newBufferWithLength:256 options:MTLResourceStorageModePrivate];
+            if (!timestampScopeMarker_) return false;
+            timestampScopeMarker_.label=@"AIVERSE GPU scope marker";
+        }
         if (timestampScopeMode_ == 1) {
             id<MTLBlitCommandEncoder> blit = [cmd_ blitCommandEncoder];
             if (!blit) return false;
+            // Sample after the opening marker and before the closing marker.
+            // A non-empty encoder avoids a driver-elided marker pass.
+            if(index==0)[blit fillBuffer:timestampScopeMarker_ range:NSMakeRange(0,256) value:0];
             [blit sampleCountersInBuffer:samples atSampleIndex:index withBarrier:YES];
+            if(index!=0)[blit fillBuffer:timestampScopeMarker_ range:NSMakeRange(0,256) value:1];
             [blit endEncoding];
             return true;
         }
@@ -2116,10 +2240,13 @@ public:
             MTLBlitPassDescriptor* descriptor=[MTLBlitPassDescriptor blitPassDescriptor];
             auto* attachment=descriptor.sampleBufferAttachments[0];
             attachment.sampleBuffer=samples;
-            attachment.startOfEncoderSampleIndex=index;
-            attachment.endOfEncoderSampleIndex=MTLCounterDontSample;
+            // Measure between the end of the opening marker and the start
+            // of the closing marker, excluding both marker fills.
+            attachment.startOfEncoderSampleIndex=index==0?MTLCounterDontSample:index;
+            attachment.endOfEncoderSampleIndex=index==0?index:MTLCounterDontSample;
             id<MTLBlitCommandEncoder> blit=[cmd_ blitCommandEncoderWithDescriptor:descriptor];
             if (!blit) return false;
+            [blit fillBuffer:timestampScopeMarker_ range:NSMakeRange(0,256) value:uint8_t(index)];
             [blit endEncoding];
             return true;
         }
@@ -2194,13 +2321,18 @@ public:
                     status!=MTLCommandBufferStatusError) {++i;continue;}
                 bool valid=false;
                 double elapsedMs=0.0;
+                uint64_t first=0,last=0,cpuFinal=0,gpuFinal=0;
+                size_t resolvedBytes=0;
                 if (t.ended && status==MTLCommandBufferStatusCompleted) {
                     NSData* data=[t.sample resolveCounterRange:NSMakeRange(0,2)];
+                    resolvedBytes=data?size_t(data.length):0;
                     if (data && data.length>=sizeof(MTLCounterResultTimestamp)*2) {
                         const auto* samples=
                             static_cast<const MTLCounterResultTimestamp*>(data.bytes);
                         MTLTimestamp cpuEnd=0,gpuEnd=0;
                         [device_ sampleTimestamps:&cpuEnd gpuTimestamp:&gpuEnd];
+                        first=samples[0].timestamp;last=samples[1].timestamp;
+                        cpuFinal=cpuEnd;gpuFinal=gpuEnd;
                         if (samples[0].timestamp>0 && samples[1].timestamp>samples[0].timestamp &&
                             samples[0].timestamp!=MTLCounterErrorValue &&
                             samples[1].timestamp!=MTLCounterErrorValue &&
@@ -2216,6 +2348,18 @@ public:
                                 elapsedMs>0.0 && elapsedMs<=250.0;
                         }
                     }
+                }
+                // Bounded diagnostic: preserve actual counter values for
+                // hardware acceptance, without inventing CPU fallback data.
+                if(!valid && timestampScopeInvalidLogged_<8 &&
+                   (std::getenv("AIVERSE_TEXTURE_GRAPH_REQUIRE_GPU_TIMINGS") ||
+                    std::getenv("AIVERSE_METAL_SCOPE_DIAGNOSTICS"))) {
+                    ++timestampScopeInvalidLogged_;
+                    std::fprintf(stderr,"[metal-scope] invalid mode=%d status=%lu ended=%d bytes=%zu samples=%llu,%llu cpu=%llu,%llu gpu=%llu,%llu ms=%.9g\n",
+                        timestampScopeMode_,(unsigned long)status,int(t.ended),resolvedBytes,
+                        (unsigned long long)first,(unsigned long long)last,
+                        (unsigned long long)t.cpuStart,(unsigned long long)cpuFinal,
+                        (unsigned long long)t.gpuStart,(unsigned long long)gpuFinal,elapsedMs);
                 }
                 result.push_back({t.tag,valid?elapsedMs:0.0,valid});
                 scopedCommands_.erase(scopedCommands_.begin()+i);
@@ -2303,22 +2447,32 @@ public:
         if (gpuScopeActive_) endGpuScope();
         if (capture_ && drawable_ && captureDelay_-- <= 0 && !drawable_.texture.framebufferOnly) {
             // copy the finished frame into a shared buffer before presenting it
-            const NSUInteger w = drawable_.texture.width, h = drawable_.texture.height, row = w * 4;
+            const NSUInteger w = drawable_.texture.width, h = drawable_.texture.height, row = (w * 4 + 255) & ~NSUInteger(255);
             id<MTLBuffer> buf = [device_ newBufferWithLength:row * h options:MTLResourceStorageModeShared];
-            id<MTLBlitCommandEncoder> blit = [cmd_ blitCommandEncoder];
+            id<MTLBlitCommandEncoder> blit = buf ? [cmd_ blitCommandEncoder] : nil;
+            if(blit){
             [blit copyFromTexture:drawable_.texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
                        sourceSize:MTLSizeMake(w, h, 1) toBuffer:buf destinationOffset:0 destinationBytesPerRow:row destinationBytesPerImage:row * h];
             [blit endEncoding];
+            }
             auto c = std::make_shared<Captured>();
             c->w = int(w); c->h = int(h); c->fn = std::move(capture_);
             capture_ = nullptr;
+            if(taggedCapture_){
+                auto tagged=std::move(taggedCapture_);
+                const uint64_t serial=frame_;
+                c->fn=[tagged=std::move(tagged),serial](int w,int h,std::vector<uint8_t> pixels){tagged(serial,w,h,std::move(pixels));};
+            }
             captured_ = c;
-            [cmd_ addCompletedHandler:^(id<MTLCommandBuffer>) {
+            if(!blit){c->w=0;c->h=0;c->ready=true;}
+            else [cmd_ addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+                if(completed.status!=MTLCommandBufferStatusCompleted||!buf){c->w=0;c->h=0;c->ready=true;return;}
                 const uint8_t* src = static_cast<const uint8_t*>(buf.contents);
-                c->px.resize(size_t(row * h));
-                for (size_t i = 0; i < size_t(w * h); ++i) { // BGRA -> RGBA
-                    c->px[i * 4 + 0] = src[i * 4 + 2]; c->px[i * 4 + 1] = src[i * 4 + 1];
-                    c->px[i * 4 + 2] = src[i * 4 + 0]; c->px[i * 4 + 3] = 255;
+                c->px.resize(size_t(w * h * 4));
+                for (size_t i = 0; i < size_t(w * h); ++i) { // BGRA -> RGBA, strip row padding
+                    const size_t j=(i/size_t(w))*size_t(row)+(i%size_t(w))*4;
+                    c->px[i * 4 + 0] = src[j + 2]; c->px[i * 4 + 1] = src[j + 1];
+                    c->px[i * 4 + 2] = src[j + 0]; c->px[i * 4 + 3] = 255;
                 }
                 c->ready = true; // read on the main thread in the next beginFrame (after the semaphore)
             }];

@@ -1,0 +1,47 @@
+/* Native independent FX swapchain paints over this placeholder rectangle.
+ * The parent scroll pane defines clipping and visibility; never place DOM
+ * controls inside this rectangle because the native view is above WebView.
+ */
+.spectra-native__surface {
+  width:100%;
+  min-height:260px;
+  height:clamp(260px,38vh,460px);
+  border:1px solid var(--au-line-strong);
+  border-radius:var(--au-radius-md);
+  background:var(--au-canvas);
+  position:relative;
+  overflow:hidden;
+  flex:none;
+}
+.spectra-native__surface-hint {
+  display:flex;align-items:center;justify-content:center;text-align:center;
+  padding:var(--au-space-4);color:var(--au-text-muted);
+  font-size:var(--au-font-sm);height:100%;width:100%;
+}
+@container (max-width:570px) {
+  .spectra-native__surface {min-height:190px;height:220px;}
+}
+
+.asset-native-surface {flex:0 0 auto;width:100%;height:clamp(110px,20vh,210px);min-width:0;background:var(--au-canvas);}
+.graph-workbench {display:flex;flex:1;min-width:0;min-height:0;overflow:hidden;container-type:inline-size;}
+.graph-workbench>.graph-canvas-scroll {flex:1;min-width:0;}
+.graph-workbench>.asset-native-surface {width:clamp(120px,35%,320px);height:100%;}
+@container (max-width:340px) {
+  .graph-workbench:has(.asset-native-surface) { flex-wrap:wrap;overflow:auto; }
+  .graph-workbench>.asset-native-surface {width:100%;height:120px;}
+}
+.character-viewport{position:relative;overflow:hidden;touch-action:none;flex:none}
+
+.spectra-native__stage {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(90px, 24%);
+  align-items: center;
+  gap: var(--au-space-2);
+}
+.spectra-native__stage > .spectra-native__toolbar {
+  flex-direction: column;
+  align-items: stretch;
+}
+@container (max-width: 260px) {
+  .spectra-native__stage { grid-template-columns: minmax(0, 1fr); }
+}

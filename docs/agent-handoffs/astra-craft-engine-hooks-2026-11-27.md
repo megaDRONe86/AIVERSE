@@ -35,3 +35,17 @@ save, replay or network format changed; the simulation is not touched, checksum 
 
 `camera.bounds` in game.json; `view.set_fog`; `fogOfWar.remember`; web `AIVERSE_WINDOW_WIDTH` and the canvas-relative mouse fix. No
 breaking changes.
+
+## 2026-11-28: fork synced with upstream main
+
+Upstream `chromealex/AIVERSE` `main` (60 commits) was merged into the fork (merge commit 8f59635a). The four
+additions above are kept. Conflicts and how they were resolved:
+
+- `engine/platform/PlatformWeb.cpp`: the fork's version (logical window size, `AIVERSE_WINDOW_WIDTH`, canvas-relative mouse);
+- `engine/render/CameraBehavior.h`: both sides (upstream `designAspect`, the fork's `bounded` / `bounds`);
+- `engine/client/GameClient.cpp`: upstream's design-aspect camera code plus `clampCameraToBounds`, and the fog
+  switch in the `view_.draw` call.
+
+Evidence: Linux release build of `aiverse_client aiverse_headless aiversebuild` and the web build pass; Astra Craft
+headless matches (seeds 1-8) end with a winner without script errors; the client was checked on screenshots under
+Xvfb. `./run-tests.sh` and the Mac quick gate were NOT run.

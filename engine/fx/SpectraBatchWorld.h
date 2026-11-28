@@ -36,7 +36,7 @@ public:
     // removed). Ids are never reused, so a later identical define gets a new id.
     bool releaseEffect(int effect);
     int defineGraph(const Json& graph,
-                    const Json& overrides = Json::object());
+                    const Json& overrides = Json::object(),const fx::SdfResourceReader& sdfReader = {});
     fx::FxHandle play(int effect, fx::float3 position,
                       fx::float3 direction = {0,1,0}, float scale = 1,
                       fx::float4 tint = {1,1,1,1});
@@ -60,13 +60,16 @@ public:
     // EXACTLY ONCE per presentation frame, after all emitters registered
     // their births/moves. draw() EXACTLY ONCE during the scene render pass.
     // Never call update()/draw() independently from each GraphRuntime.
+    void setSceneCollisionRegistry(std::shared_ptr<const fx::SceneCollisionRegistry> registry,uint32_t maxQueries=8192) {
+        particles_.setSceneCollisionRegistry(std::move(registry),maxQueries);
+    }
     void setView(const fx::SpectraFxView& view);
     template<class Camera>
     void setView(const Camera& camera,const render::mat4& projection,int width,int height) {
         return setView(fx::SpectraFxView::fromCamera(camera,projection,width,height));
     }
     void update(float dt);
-    void draw(const fx::FxFog& fog = {});
+    void draw(const fx::FxFog& fog = {},render::Renderer3D* renderer=nullptr);
     void collectLights(std::vector<fx::FxPointLight>& lights, int maxLights = 32) const;
 
     // Clear the entire match/scene, including all connected graph instances.

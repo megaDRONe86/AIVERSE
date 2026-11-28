@@ -1,0 +1,193 @@
+{
+  "schema": 1,
+  "id": "studio-entity-debugger",
+  "owner": "Studio hosted game / entity-debugger",
+  "changed_paths": [
+    "apps/editor/core/WorldInspect.cpp",
+    "apps/studio-native/StudioHost.cpp",
+    "apps/studio-native/StudioRuntimeInspect.h",
+    "apps/studio-web/src/panels/generated/RuntimePanel.css",
+    "apps/studio-web/src/panels/generated/RuntimePanel.tsx",
+    "apps/studio-web/src/types.ts",
+    "skills/editor/studio-ui/SKILL.md",
+    "tools/studio/test_entity_debugger.py",
+    "apps/editor/core/StudioPlayTools.h",
+    "apps/editor/core/Workspace.cpp",
+    "apps/studio-native/StudioHost.h",
+    "apps/studio-native/StudioSession.cpp",
+    "apps/studio-native/tests/StudioSessionTests.cpp",
+    "docs/editor-native-ecs-inspector.md",
+    "CMakeLists.txt",
+    "apps/editor/core/StudioPlayTools.cpp"
+  ],
+  "traits": {
+    "editable": false,
+    "simulation": false,
+    "visible": true,
+    "runtime": true
+  },
+  "checks": {
+    "implementation": {
+      "status": "pass",
+      "note": "Runtime enumeration and inspection resolved a reference within its live epoch in a paused local map. The native inspector and runtime edit readback agreed. The web suite includes the Entity Debugger panel tests.",
+      "evidence": [
+        "docs/evidence/studio-play-ad676e70c/runtime.png",
+        "docs/evidence/studio-play-ad676e70c/studio-undo.log.txt",
+        "docs/evidence/feature-gate-e0b95cf24-web.json"
+      ]
+    },
+    "architecture": {
+      "status": "pass",
+      "note": "The inspector operates on references in the active native simulation. Select and inspect use the current session epoch. Reading after a guarded change returned the new value from the same entity.",
+      "evidence": [
+        "docs/evidence/studio-actor-g1/verified-native-results.json",
+        "apps/studio-native/StudioGameSurface.cpp",
+        "docs/evidence/studio-play-ad676e70c/studio-undo.log.txt"
+      ]
+    },
+    "native_api": {
+      "status": "pass",
+      "note": "Runtime enumeration and inspection resolved a reference within its live epoch in a paused local map. The native inspector and runtime edit readback agreed. The web suite includes the Entity Debugger panel tests.",
+      "evidence": [
+        "docs/evidence/studio-play-ad676e70c/runtime.png",
+        "docs/evidence/studio-play-ad676e70c/studio-undo.log.txt",
+        "docs/evidence/feature-gate-e0b95cf24-web.json"
+      ]
+    },
+    "skill": {
+      "status": "pass",
+      "note": "The Studio UI skill documents this panel and its native ownership. Its documented web suite, type checks and production build ran, and the strict skill catalog audit found zero errors.",
+      "evidence": [
+        "skills/editor/studio-ui/SKILL.md",
+        "docs/evidence/integration-acceptance-d5608fb7f.json"
+      ]
+    },
+    "mcp": {
+      "status": "pass",
+      "note": "The native Runtime panel listed real entities and inspected an emitter at its actual epoch and tick. The same real match returned its paged entities and detail over authenticated MCP.",
+      "evidence": [
+        "docs/evidence/studio-play-ad676e70c/runtime.png",
+        "docs/evidence/studio-play-ad676e70c/studio-undo.log.txt"
+      ]
+    },
+    "studio": {
+      "status": "pass",
+      "note": "The native Runtime panel listed real entities and inspected an emitter at its actual epoch and tick. The same real match returned its paged entities and detail over authenticated MCP.",
+      "evidence": [
+        "docs/evidence/studio-play-ad676e70c/runtime.png",
+        "docs/evidence/studio-play-ad676e70c/studio-undo.log.txt"
+      ]
+    },
+    "inspector": {
+      "status": "pass",
+      "note": "The native Runtime panel listed real entities and inspected an emitter at its actual epoch and tick. The same real match returned its paged entities and detail over authenticated MCP.",
+      "evidence": [
+        "docs/evidence/studio-play-ad676e70c/runtime.png",
+        "docs/evidence/studio-play-ad676e70c/studio-undo.log.txt"
+      ]
+    },
+    "persistence": {
+      "status": "not_applicable",
+      "note": "This read-only inspector projects the active hosted simulation. It owns no persistent scene data.",
+      "evidence": []
+    },
+    "graphs": {
+      "status": "not_applicable",
+      "note": "The inspector reads existing simulation state and has no authorable node graph.",
+      "evidence": []
+    },
+    "performance": {
+      "status": "pass",
+      "note": "A 100-row request against six live entities took 3 ms p95, and inspecting a chosen entity took 1 ms p95. These are explicit operator requests. Measurements include the real WKWebView bridge at 1 ms clock resolution; the whole Studio host used 256540 KiB resident after sampling.",
+      "evidence": [
+        "docs/agent-handoffs/feature-gate-operator-acceptance-2026-11-25.md",
+        "docs/evidence/studio-building-budget/operator-measurements.json"
+      ]
+    },
+    "platforms": {
+      "status": "not_run",
+      "note": "Merged-tree acceptance pending. See the owner handoff for implementation scope and prior verification.",
+      "evidence": [
+        "docs/handoff/studio-html5/s3-entity-debugger-2026-11-24.md"
+      ]
+    },
+    "dependencies": {
+      "status": "pass",
+      "note": "The declared feature policy lists no prerequisite manifests. The integrated report resolved the dependency order and roadmap without policy errors.",
+      "evidence": [
+        "docs/agents/feature-policy.json",
+        "docs/evidence/integration-1209eaa44-policy.log.txt"
+      ]
+    },
+    "headless": {
+      "status": "pass",
+      "note": "The standalone MCP registry advertised the typed schema and rejected calls requiring a connected local Studio. Both native registries listed the feature tools.",
+      "evidence": [
+        "docs/evidence/integration-ad5786f5a-headless.log.txt",
+        "docs/evidence/integration-ad5786f5a-graphs.log.txt",
+        "docs/evidence/integration-ad5786f5a-linux.log.txt"
+      ]
+    },
+    "examples": {
+      "status": "pass",
+      "note": "The native Runtime panel listed real entities and inspected an emitter at its actual epoch and tick. The same real match returned its paged entities and detail over authenticated MCP.",
+      "evidence": [
+        "docs/evidence/studio-play-ad676e70c/runtime.png",
+        "docs/evidence/studio-play-ad676e70c/studio-undo.log.txt"
+      ]
+    },
+    "tests": {
+      "status": "pass",
+      "note": "Runtime enumeration and inspection resolved a reference within its live epoch in a paused local map. The native inspector and runtime edit readback agreed. The web suite includes the Entity Debugger panel tests.",
+      "evidence": [
+        "docs/evidence/studio-play-ad676e70c/runtime.png",
+        "docs/evidence/studio-play-ad676e70c/studio-undo.log.txt",
+        "docs/evidence/feature-gate-e0b95cf24-web.json"
+      ]
+    },
+    "handoff": {
+      "status": "pass",
+      "note": "The owner handoff records the implementation, verification scope and follow-up work.",
+      "evidence": [
+        "docs/handoff/studio-html5/s3-entity-debugger-2026-11-24.md"
+      ]
+    },
+    "documentation": {
+      "status": "pass",
+      "note": "The owner handoff describes the supported Studio workflow, bridge contract and limits.",
+      "evidence": [
+        "docs/handoff/studio-html5/s3-entity-debugger-2026-11-24.md"
+      ]
+    },
+    "publishing": {
+      "status": "pass",
+      "note": "Prepared the bilingual Studio diary with real native editor captures. The site checker accepted 59 entries and the local builder generated both languages. The release-site contract documents the native editor tool exception for a separate browser demo. Public deployment follows main integration.",
+      "evidence": [
+        "docs/devlog/entries/2026-11-25-studio-local-play-inspection.json",
+        "docs/agents/contracts/release-site.md"
+      ]
+    }
+  },
+  "integrations": {
+    "skills": [
+      "studio-ui"
+    ],
+    "mcp_tools": [
+      "studio_runtime_entities",
+      "studio_runtime_inspect"
+    ],
+    "studio_methods": [
+      "studio.gameEntities",
+      "studio.gameInspect"
+    ],
+    "studio_panels": [
+      "runtime"
+    ]
+  },
+  "test_reports": [
+    "docs/evidence/feature-gate-e0b95cf24-studio-contracts.json",
+    "docs/evidence/feature-gate-e0b95cf24-web.json",
+    "docs/evidence/studio-0e16ebead-typecheck.json",
+    "docs/evidence/studio-4b1ee09f7-skill-audit.json"
+  ]
+}

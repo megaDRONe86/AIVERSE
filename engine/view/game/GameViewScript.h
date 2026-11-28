@@ -19,9 +19,10 @@ struct lua_State;
 #include "ScriptSound.h"
 #include "EntityFx.h"
 
-namespace aiverse { class Simulation; }
+namespace aiverse { class Simulation; struct SimEvent; }
 
 namespace aiverse::game {
+Json animationRuntimeStatus(const EntityFxStore* store);
 
 class GameCore;
 
@@ -49,10 +50,16 @@ struct ViewCamera {
 struct ViewCameraRequest { float x, z, zoom, pitch, yaw; };
 
 struct ViewRequest {
-    enum Kind : uint8_t { Notice, Effect, Sound } kind = Notice;
+    enum Kind : uint8_t { Notice, Effect, Sound, StartFx, MoveFx, AttachFx, StopFx, KillFx, ShakeCamera } kind = Notice;
     std::string text;          // notice text / effect or sound name
     float x = 0, z = 0, y = 0.5f;
     bool positioned = false;
+    float duration = 2.5f;
+    std::string style;
+    int64_t handle = 0;
+    Entity entity;
+    render::float3 direction{0, 1, 0};
+    Json shake;
 };
 
 // In-match UI from view scripts (G2): ui.set / ui.open / ui.close become requests for the host's data
@@ -88,6 +95,10 @@ public:
     void detach();
     // Per frame: dispatches the collected events and on_frame(dt).
     void update(Simulation& sim, float dt);
+    // Queue an input event for the next frame's view.on('order', fn) handlers.
+    void queueLocalOrder(const SimEvent& event);
+    void setSelection(const std::vector<Entity>& selected);
+    bool takeSelectionRequest(std::vector<Entity>& selected);
     void setTargeting(const ViewTargeting& target);
     // view.set_map_drag_offset(dx, dy): window points added to a map-drag pointer before its ground pick and its release
     // tap (e.g. aim above a finger); the client resets it when a map-drag starts.

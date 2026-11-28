@@ -83,7 +83,7 @@ AIVERSE ofrece las mecánicas en sí y hace que un agente pueda trabajar en el j
 | **El multijugador implica desincronizaciones sin fin.** Basta un `float` para que una partida entre un iPhone y un Android se desvíe. | La simulación es idéntica bit a bit en todas partes: punto fijo en lugar de flotantes, generador aleatorio propio, sumas de verificación. La CI compara partidas en Linux x64/ARM64, Windows y macOS en cada push. Por la red solo viajan comandos; hay lockstep con rollback y un servidor con emparejamiento y veredictos basados en repeticiones. |
 | **Las GPU móviles son débiles, pero el juego debe verse bien.** | Cada función costosa —sombras, partículas, terreno, posprocesado— tiene niveles de calidad y se adapta a la GPU, desde viejas Mali y Adreno hasta Apple Silicon. |
 | **Publicar en todas las plataformas es un proyecto en sí mismo.** Firmas, iconos, SDK de tiendas y anuncios. | `aiversebuild` genera con un solo comando un .app, un proyecto de Xcode, Gradle/APK, web y .exe. Los iconos y pantallas de carga se generan solos. Plugins para App Store, Google Play, RuStore, Yandex Games, Steam, AdMob, AppLovin y más; cada build incluye solo los que el juego elige. |
-| **Cada juego nuevo empieza de cero.** | Más de 30 plantillas jugables, kits de género con listas de aceptación y 238 habilidades para agentes. Un juego nuevo parte de uno que ya funciona. |
+| **Cada juego nuevo empieza de cero.** | Más de 30 plantillas jugables, kits de género con listas de aceptación y 303 habilidades para agentes. Un juego nuevo parte de uno que ya funciona. |
 | **La meta y el LiveOps se reescriben en cada proyecto.** | `aiverse::meta`: tienda, monedas, misiones, pases, recompensas diarias, energía, clanes, torneos, cofres con garantía, todo configurado en JSON. |
 
 ---
@@ -227,7 +227,7 @@ Las plantillas son paquetes del [catálogo](https://chromealex.github.io/AIVERSE
 - Editor acoplable al estilo de Unity: escena, inspector, terreno, efectos, iluminación, UI, prueba de juego y simulador de dispositivos
 - `aiversemcp`: servidor MCP para agentes — configuración PHYSIS de mapas, validación y Undo/Redo
 - Asistente **Crear un juego**
-- 238 habilidades para agentes y kits de género con listas de aceptación
+- 303 habilidades para agentes y kits de género con listas de aceptación
 - Importadores de recursos de juegos clásicos desde tu propia copia
 
 </td>
@@ -260,12 +260,18 @@ Windows: `studio_windows.cmd [project]` compila y abre `AiverseStudio.exe` (requ
 CMake, Node.js; funciona con WebView2 Runtime y Vulkan).
 
 `studio_mac.command` compila la interfaz web y el Studio nativo y lo abre. Solo el motor:
-`cmake -S . -B build/mac -DCMAKE_BUILD_TYPE=Release && cmake --build build/mac -j 8`. El editor
-anterior en ImGui (`build/mac/AiverseEditor.app`) se sigue compilando y funciona en Linux y Windows.
+`cmake -S . -B build/mac -DCMAKE_BUILD_TYPE=Release && cmake --build build/mac -j 8`.
 
-Linux: `cmake --preset linux-release && cmake --build build/linux-release`. Si prefieres no compilar, la
-rama `builds` tiene el editor y las herramientas precompilados
-([detalles](docs/es/overview.md#motor-precompilado-rama-builds-y-aiversemcp-sin-compilador)).
+En Linux, HTML5 Studio usa WebKitGTK 4.1 (2.40 o posterior), SQLite, X11 y Vulkan. Con sus paquetes de desarrollo, Node.js, CMake y Ninja instalados, compila la interfaz web antes de configurar Studio.
+
+```bash
+(cd apps/studio-web && npm install && npm run build)
+cmake --preset linux-release -DAIVERSE_BUILD_STUDIO_HTML5=ON -DAIVERSE_BUILD_EDITOR=OFF
+cmake --build --preset linux-release --target aiverse_studio
+./build/linux-release/apps/studio-native/AiverseStudio
+```
+
+Para compilar solo el motor en Linux, usa `cmake --preset linux-release -DAIVERSE_BUILD_STUDIO_HTML5=OFF -DAIVERSE_BUILD_EDITOR=OFF` y `cmake --build --preset linux-release`. La rama `builds` también tiene herramientas precompiladas. [Motor y herramientas precompilados](docs/es/overview.md#motor-precompilado-rama-builds-y-aiversemcp-sin-compilador)
 
 **2. Crea un juego.** En el centro de proyectos, pulsa **Crear un juego** o crea un proyecto desde una
 plantilla. Puedes jugarlo con bots enseguida en la ventana Game.

@@ -111,7 +111,7 @@ def showcase_html(frame, systems, ctx):
         '<figcaption><div class="wrap"><div>'
         f'<p class="eyebrow">{ctx.T["showcaseEyebrow"]}</p>'
         f'<h2 id="showcase-title">{esc(title)}</h2><p>{esc(ctx.loc(frame, "caption"))}</p></div>'
-        f'<div class="meta"><span>{esc(ctx.loc(systems[frame["system"]], "name"))} · {ctx.fmt_date(frame["date"])}</span>{more}</div>'
+        f'<div class="meta"><span class="meta-pair"><span>{esc(ctx.loc(systems[frame["system"]], "name"))}</span><span>{ctx.fmt_date(frame["date"])}</span></span>{more}</div>'
         '</div></figcaption></figure>\n</section>'
     )
 
@@ -145,7 +145,7 @@ def systems_html(systems, ctx):
         sid = esc(s['id'])
         link = f'<a class="sys-link" href="system-{sid}.html">{ctx.T["cardMore"]}</a>'
         badge = version_badge(s, ctx)
-        head = f'<div class="sys-head"><h3><a href="system-{sid}.html">{esc(s["name"])}</a></h3>{badge}</div>'
+        head = f'<div class="sys-head"><h3><a href="system-{sid}.html">{esc(ctx.loc(s, "name"))}</a></h3>{badge}</div>'
         text = f'<p class="sys-tag">{esc(ctx.loc(s, "tagline"))}</p><p>{esc(ctx.loc(s, "essence"))}</p>'
         if s.get('cover'):
             c = s['cover']
@@ -154,7 +154,7 @@ def systems_html(systems, ctx):
                          f'<div class="sys-body">{head}{text}{link}</div></article>')
         else:
             cards.append(f'<article class="sys-card sys-pending" id="sys-{sid}">'
-                         f'<div class="sys-placeholder" aria-hidden="true">{MARK_LIGHT}<span>{esc(s["name"])}</span></div>'
+                         f'<div class="sys-placeholder" aria-hidden="true">{MARK_LIGHT}<span>{esc(ctx.loc(s, "name"))}</span></div>'
                          f'<div class="sys-body">{head}{text}<p class="sys-wait">{ctx.T["coverPending"]}</p>{link}</div></article>')
     return '\n'.join(cards)
 
@@ -221,7 +221,7 @@ def include_card(s, it, ctx):
             f'<h3>{name}</h3><p>{text}</p><span class="inc-more">{ctx.T["incMore"]}</span></a>')
 
 
-def blog_posts(entries, ctx, names=None):
+def blog_posts(entries, ctx):
     """Fully expanded posts on a vertical date rail; names: system id -> name to tag each post with its topic."""
     status = {'done': ctx.T['stDone'], 'in-progress': ctx.T['stProgress'], 'experimental': ctx.T['stExperimental']}
     posts = []
@@ -240,15 +240,13 @@ def blog_posts(entries, ctx, names=None):
         facts = f'<div><dt>{ctx.T["blogVerified"]}</dt><dd>{esc(e["verified"])}</dd></div>'
         if e.get('limits'):
             facts += f'<div><dt>{ctx.T["blogLimits"]}</dt><dd>{esc(e["limits"])}</dd></div>'
-        src = esc(e['branch'] or '') + (f' · {esc(e["commit"])}' if e.get('commit') else '')
-        topic = (f'<a class="entry-sys" href="devblog-{esc(e["system"])}.html">{esc(names[e["system"]])}</a>'
-                 if names else '')
+        src = ''.join(f'<span>{esc(v)}</span>' for v in (e.get('branch'), e.get('commit')) if v)
         links = ''.join(f'<a href="{esc(l["href"])}">{esc(l["title"])}</a>' for l in e.get('links') or [])
         posts.append(f'<li class="blog-post" id="{esc(e["id"])}" data-sys="{esc(e["system"])}">'
                      f'<time class="blog-date mono" datetime="{esc(e["date"])}">{ctx.fmt_date(e["date"])}</time>'
                      f'<span class="blog-dot" aria-hidden="true"></span><article class="blog-card">'
-                     f'<div class="entry-meta">{topic}<span class="st st-{esc(e["status"])}">{esc(status.get(e["status"], e["status"]))}</span>'
-                     f'{f"<span>{src}</span>" if src else ""}</div>'
+                     f'<div class="entry-meta"><span class="st st-{esc(e["status"])}">{esc(status.get(e["status"], e["status"]))}</span>'
+                     f'{src}</div>'
                      f'<h2>{esc(e["title"])}</h2><p class="summary">{esc(e["summary"])}</p>'
                      f'{gal}{body}'
                      f'<dl class="facts-list">{facts}</dl>{f"<div class=entry-links>{links}</div>" if links else ""}</article></li>')
@@ -259,35 +257,11 @@ LIGHTBOX = ('<div class="lightbox" id="lightbox" role="dialog" aria-modal="true"
             '<img id="lb-img" alt=""><p id="lb-cap"></p></div>')
 
 
-def blog_page(entries, systems, ctx):
-    """The engine blog: everything outside the flagship systems, newest first, filterable by topic."""
-    names = {s['id']: s['name'] for s in systems}
-    topics = [s for s in systems if any(e['system'] == s['id'] for e in entries)]
-    chips = [f'<button class="filter" type="button" data-sys="" aria-pressed="true">{ctx.T["rmAll"]}</button>']
-    chips += [f'<button class="filter" type="button" data-sys="{esc(s["id"])}" aria-pressed="false">{esc(s["name"])}</button>'
-              for s in topics]
-    empty = f'<p class="blog-empty">{ctx.T["blogEmpty"]}</p>' if not entries else ''
-    return (f'<section class="dl-hero"><div><p class="eyebrow">{ctx.T["navBlog"]}</p><h1>{ctx.T["blogHubTitle"]}</h1>'
-            f'<p>{ctx.T["blogHubLead"]}</p></div>'
-            f'<div class="dl-stats"><div><strong>{len(entries)}</strong><span>{ctx.T["blogPosts"]}</span></div>'
-            f'<div><strong>{len(topics)}</strong><span>{ctx.T["blogTopics"]}</span></div></div></section>'
-            f'<div class="dl-filters blog-filters" role="group" aria-label="{ctx.T["rmFilter"]}">{"".join(chips)}</div>'
-            f'{empty}{blog_posts(entries, ctx, names)}<div class="blog-end"></div>{LIGHTBOX}')
-
-
-BLOG_JS = """<script>
-(function(){var b=document.querySelectorAll('.blog-filters .filter');function set(id){b.forEach(function(x){x.setAttribute('aria-pressed',String(x.dataset.sys===id));});
-document.querySelectorAll('.blog-post').forEach(function(p){p.hidden=!!id&&p.dataset.sys!==id;});history.replaceState(null,'',id?'#topic='+id:location.pathname);}
-b.forEach(function(x){x.addEventListener('click',function(){set(x.dataset.sys);});});
-var m=location.hash.match(/^#topic=(.+)$/);if(m&&document.querySelector('.blog-filters [data-sys="'+m[1]+'"]'))set(m[1]);})();
-</script>"""
-
-
 def devblog_page(s, mine, ctx, flagship):
     """All stages of one system, newest first, fully expanded: the system's own development diary."""
     sid = esc(s['id'])
     name = esc(s['name'])
-    sys_href = f'system-{sid}.html' if flagship else f'blog.html#topic={sid}'
+    sys_href = f'system-{sid}.html' if flagship else f'devlog.html#system={sid}'
     first = ctx.fmt_date(mine[-1]['date']) if mine else ''
     last = ctx.fmt_date(mine[0]['date']) if mine else ''
     return (f'<section class="dl-hero"><div><p class="crumbs"><a href="./#systems">{ctx.T["crumbSystems"]}</a> / '
@@ -314,11 +288,11 @@ def feature_page(s, it, body_html, ctx):
     sib = ''.join(f'<a class="chip{" chip-ink" if o is it else ""}" href="{sib_href(o)}">{esc(ctx.loc(o, "name"))}</a>'
                   for o in s['includes'])
     return (f'<section class="sp-hero fp-hero"><p class="crumbs"><a href="./#systems">{ctx.T["crumbSystems"]}</a> / '
-            f'<a href="system-{sid}.html">{esc(s["name"])}</a> / {esc(ctx.loc(it, "name"))}</p>'
+            f'<a href="system-{sid}.html">{esc(ctx.loc(s, "name"))}</a> / {esc(ctx.loc(it, "name"))}</p>'
             f'<h1>{esc(ctx.loc(it, "name"))}</h1><p class="sp-lead">{esc(ctx.loc(it, "text"))}</p></section>'
             f'{gal}<article class="doc fp-body">{body_html}</article>'
-            f'<section class="sp-sec sp-others"><p class="eyebrow">{ctx.T["incOther"].format(s=esc(s["name"]))}</p>'
-            f'<div class="chips">{sib}</div><p><a class="btn btn-line" href="system-{sid}.html">← {esc(s["name"])}</a></p></section>'
+            f'<section class="sp-sec sp-others"><p class="eyebrow">{ctx.T["incOther"].format(s=esc(ctx.loc(s, "name")))}</p>'
+            f'<div class="chips">{sib}</div><p><a class="btn btn-line" href="system-{sid}.html">← {esc(ctx.loc(s, "name"))}</a></p></section>'
             '<div class="lightbox" id="lightbox" role="dialog" aria-modal="true"><button type="button" id="lb-close" aria-label="×">×</button>'
             '<img id="lb-img" alt=""><p id="lb-cap"></p></div>')
 
@@ -345,7 +319,7 @@ def system_page(s, flagships, entries, ctx, repo_blob, doc_pages):
         buttons.append(f'<a class="btn btn-ink" href="{esc(href)}">{ctx.T["article"]}</a>')
     core = bool(s.get('core'))
     if mine or not core:
-        buttons.append(f'<a class="btn btn-line" href="{f"devblog-{sid}.html" if mine else f"devlog.html#system={sid}"}">{ctx.T["blogTitle"]} · {len(mine)}</a>')
+        buttons.append(f'<a class="btn btn-line" href="{f"devblog-{sid}.html" if mine else f"devlog.html#system={sid}"}">{ctx.T["blogTitle"]} ({len(mine)})</a>')
     badge = '' if core else version_badge(s, ctx)
     since = f'<p class="sp-since mono">{ctx.T["since"]} {ctx.fmt_date(s["started"])}</p>' if s.get('started') else ''
     hero = (f'<section class="sp-hero"><p class="crumbs"><a href="./#{"core" if core else "systems"}">{ctx.T["crumbSystems"]}</a> / {esc(ctx.loc(s, "name"))}</p>'
@@ -358,7 +332,7 @@ def system_page(s, flagships, entries, ctx, repo_blob, doc_pages):
     elif core:
         cover = ''
     else:
-        cover = (f'<div class="sp-cover sp-pending"><div class="sys-placeholder">{MARK_LIGHT}<span>{esc(s["name"])}</span></div>'
+        cover = (f'<div class="sp-cover sp-pending"><div class="sys-placeholder">{MARK_LIGHT}<span>{esc(ctx.loc(s, "name"))}</span></div>'
                  f'<p><strong>{ctx.T["pendingTitle"]}</strong> {esc(ctx.loc(s, "coverBrief"))}</p></div>')
     inc = ''.join(include_card(s, i, ctx) for i in s['includes'])
     ena = ''.join(f'<li>{esc(x)}</li>' for x in (ctx.loc(s, 'enables') or []))
@@ -408,10 +382,10 @@ def roadmap_lines(flagships, ctx):
         for i, it in enumerate(rm):
             x = 3 + 94 * i / max(n - 1, 1)
             title = ctx.loc(it, 'title')
-            cls = 'done' if it['status'] == 'done' else ('cur' if i == now else 'plan')
+            cls = 'done' if it['status'] == 'done' else ('cur' if it['status'] == 'in-progress' else 'plan')
             lab = ''
             if i == now:
-                lab = f'<span class="ln-l ln-cur">{esc(short(title, 40))}</span>'
+                lab = f'<span class="ln-l ln-{cls}">{esc(short(title, 40))}</span>'
             elif it['status'] != 'done' and i == now + 1:
                 lab = f'<span class="ln-l ln-plan">{esc(short(title, 30))}</span>'
             elif i == 0:
@@ -421,7 +395,7 @@ def roadmap_lines(flagships, ctx):
         done = sum(1 for it in rm if it['status'] == 'done')
         now_m = f'<span class="ln-now-m">{esc(ctx.loc(rm[now], "title"))}</span>' if now < n else ''
         rows.append(f'<a class="ln" href="roadmap.html#{esc(s["id"])}" style="--c:{col};--x:{xn:.2f}%">'
-                    f'<span class="ln-n">{esc(s["name"])}<small>{esc(ctx.T["rmProgress"].format(d=done, n=n))}</small>'
+                    f'<span class="ln-n">{esc(ctx.loc(s, "name"))}<small>{esc(ctx.T["rmProgress"].format(d=done, n=n))}</small>'
                     f'{now_m}</span>'
                     f'<span class="ln-track"><span class="ln-rail"></span>{"".join(sts)}</span></a>')
     return (f'<section id="roadmap" class="section wrap ln-sec"><div class="ln-head"><div><p class="eyebrow">{ctx.T["navRoadmap"]}</p>'
@@ -435,7 +409,7 @@ def roadmap_lines(flagships, ctx):
 def roadmap_page(flagships, ctx):
     """Now / next / later: one row per system, done items folded, the current one highlighted."""
     chips = [f'<button class="filter" type="button" data-sys="" aria-pressed="true">{ctx.T["rmAll"]}</button>']
-    chips += [f'<button class="filter" type="button" data-sys="{esc(s["id"])}" aria-pressed="false">{esc(s["name"])}</button>'
+    chips += [f'<button class="filter" type="button" data-sys="{esc(s["id"])}" aria-pressed="false">{esc(ctx.loc(s, "name"))}</button>'
               for s in flagships]
 
     def item(it, cls):
@@ -458,10 +432,12 @@ def roadmap_page(flagships, ctx):
                 f'<ul class="nn-done">{"".join(item(it, "") for it in older)}</ul></details>') if older else ''
         dash = '<span class="nn-none">—</span>'
         cur_html = f'<ul class="nn-cur">{"".join(item(it, "") for it in cur)}</ul>' if cur else dash
+        href = (f'system-{esc(s["id"])}.html' if s.get('flagship') or s.get('core')
+                else f'devlog.html#system={esc(s["id"])}')
         rows.append(
             f'<section class="nn-row" id="{esc(s["id"])}" data-sys="{esc(s["id"])}" style="--c:{line_color(s, flagships)}">'
             f'<div class="nn-sys"><span class="nn-ring" style="--p:{pct}"><i>{len(done)}/{len(rm)}</i></span>'
-            f'<span><a class="nn-name" href="system-{esc(s["id"])}.html">{esc(s["name"])}</a>'
+            f'<span><a class="nn-name" href="{href}">{esc(ctx.loc(s, "name"))}</a>'
             f'<span class="nn-last">{ctx.T["nnLast"]} {esc(last)}</span></span></div>'
             f'<div class="nn-col" data-label="{ctx.T["nnDone"]}"><ul class="nn-done">{"".join(item(it, "") for it in recent)}</ul>{more}</div>'
             f'<div class="nn-col" data-label="{ctx.T["rmNow"]}">'
@@ -743,7 +719,7 @@ def gallery_page(entries, systems, ctx):
                      f'<a class="gal-img" href="{src}" data-cap="{cap}"><img src="{src}" alt="{cap}" loading="lazy"></a>'
                      f'<figcaption><span class="gal-cap">{cap}</span>'
                      f'<a class="gal-meta mono" href="devblog-{esc(e["system"])}.html#{esc(e["id"])}">'
-                     f'{esc(names.get(e["system"], e["system"]))} · {ctx.fmt_date(e["date"])}</a></figcaption></figure>')
+                     f'<span>{esc(names.get(e["system"], e["system"]))}</span><span>{ctx.fmt_date(e["date"])}</span></a></figcaption></figure>')
     return (f'<section class="dl-hero"><div><p class="eyebrow">{ctx.T["navGallery"]}</p><h1>{ctx.T["galTitle"]}</h1>'
             f'<p>{ctx.T["galLead"]}</p></div>'
             f'<div class="dl-stats"><div><strong>{len(shots)}</strong><span>{ctx.T["galShots"]}</span></div>'
@@ -764,7 +740,7 @@ RELEASES_JS = """<script>
 (function(){var cfg=window.REL_CFG;if(!cfg)return;
 function mb(n){return (n/1048576).toFixed(0)+' MB';}
 function btn(p){var a=document.createElement('a');a.className='btn btn-ink btn-sm rel-pkg';a.href=p.url;
-a.textContent=(cfg.os[p.platform]||p.platform)+' · '+mb(p.size);a.title='sha256 '+p.sha256+' · '+p.commit;return a;}
+a.textContent=(cfg.os[p.platform]||p.platform)+', '+mb(p.size);a.title='sha256 '+p.sha256+', '+p.commit;return a;}
 fetch(cfg.index,{cache:'no-store'}).then(function(r){if(!r.ok)throw 0;return r.json();}).then(function(d){
 var pk=d.packages||[],known={},other=[];
 document.querySelectorAll('.rel-dl').forEach(function(el){known[el.dataset.version]=el;});
@@ -774,7 +750,7 @@ if(!el.dataset.filled){l.textContent='';el.dataset.filled='1';}l.appendChild(btn
 document.querySelectorAll('.rel-dl:not([data-filled])').forEach(function(el){var s=document.createElement('span');
 s.className='rel-dl-none';s.textContent=cfg.none;el.querySelector('.rel-dl-list').prepend(s);});
 if(other.length){var box=document.querySelector('.rel-other'),list=box.querySelector('.rel-other-list'),g={};
-other.forEach(function(p){var k=p.version+' · '+p.commit;(g[k]=g[k]||[]).push(p);});
+other.forEach(function(p){var k=p.version+' ('+p.commit+')';(g[k]=g[k]||[]).push(p);});
 Object.keys(g).forEach(function(k){var row=document.createElement('div');row.className='rel-other-row';
 var c=document.createElement('code');c.textContent=k;row.appendChild(c);g[k].forEach(function(p){row.appendChild(btn(p));});list.appendChild(row);});
 box.hidden=false;}}).catch(function(){}).then(function(){document.querySelectorAll('.rel-dl .aiv-loader').forEach(function(e){e.remove();});});})();
@@ -828,7 +804,7 @@ var cmd=(p.kind==='content'?'add '+p.id+' --project <project>':p.kind==='templat
 var pre=el('div','cat-cmd'),code=el('code',null,'python3 tools/pkg/aiverse_pkg.py '+cmd),cp=el('button','cat-copy',T.copy);cp.type='button';
 cp.onclick=function(){navigator.clipboard&&navigator.clipboard.writeText(code.textContent).then(function(){cp.textContent=T.copied;setTimeout(function(){cp.textContent=T.copy;},1500);});};
 pre.appendChild(code);pre.appendChild(cp);body.appendChild(pre);
-var act=el('div','cat-actions'),dl=el('a','btn btn-ink btn-sm',T.download+' · '+mb(v.size));dl.href=v.url;dl.title='sha256 '+v.sha256;act.appendChild(dl);
+var act=el('div','cat-actions'),dl=el('a','btn btn-ink btn-sm',T.download+' '+mb(v.size));dl.href=v.url;dl.title='sha256 '+v.sha256;act.appendChild(dl);
 if(p.readme){var r=el('a','btn btn-line btn-sm',T.readme);r.href=p.readme;act.appendChild(r);}
 a.item=0;a.link=function(){return location.origin+location.pathname+'#pkg-'+p.id+(a.classList.contains('is-open')&&a.item?'/'+a.item:'');};
 if(p.viewer){var v3=el('button','btn btn-accent btn-sm cat-3d',T.view3d);v3.type='button';

@@ -1,3 +1,5 @@
+#include "apps/editor/core/ProjectAssetWriteLock.h"
+#include "apps/studio-native/StudioMaterialPublicationJournal.h"
 #include "apps/studio-native/StudioAssetCatalog.h"
 #include "apps/studio-native/StudioContentDirectory.h"
 #if defined(AIVERSE_WINSQLITE)
@@ -49,7 +51,8 @@ bool isSidecar(const fs::path& p){
     return p.extension()==".meta" ||
        name.find(".aiverse-meta-update")!=std::string::npos ||
        name.find(".aiverse-tmp")!=std::string::npos ||
-       name.find(".aiverse-backup-")!=std::string::npos;
+       name.find(".aiverse-backup-")!=std::string::npos ||
+       name.starts_with(".aiverse-save-");
 }
 void writeMeta(const fs::path& path,const Json& doc) {
     const auto tmp=fs::path(path.string()+".aiverse-tmp");
@@ -95,7 +98,7 @@ std::string studioImporterForPath(const fs::path& path,bool directory) {
     if(ext==".png"||ext==".jpg"||ext==".jpeg"||ext==".tga"||
        ext==".dds"||ext==".ktx"||ext==".ktx2"||ext==".webp"||
        ext==".hdr"||ext==".exr")return "texture";
-    if(ext==".glb"||ext==".gltf"||ext==".fbx"||ext==".obj"||ext==".usd")return "model";
+    if(ext==".bsp"||ext==".glb"||ext==".gltf"||ext==".fbx"||ext==".obj"||ext==".usd")return "model";
     if(ext==".wav"||ext==".ogg"||ext==".mp3"||ext==".flac")return "audio";
     return "data";
 }
@@ -121,6 +124,7 @@ Json studioDefaultSettings(const std::string& importer) {
 }
 StudioAssetCatalog::StudioAssetCatalog(const fs::path& project):project_(project) {
     (void)studioContentRoot(project_);
+    project_=fs::canonical(project_); // Use the same root as the document journal for metadata history.
     const fs::path cache=project_/".aiverse-cache";
     std::error_code ec;
     const auto cacheStatus=fs::symlink_status(cache,ec);
@@ -186,6 +190,14 @@ StudioAssetEntry StudioAssetCatalog::inspect(const fs::path& source,bool directo
         if(!json["settings"].isObject())throw std::runtime_error("Invalid importer settings: "+e.path);
         e.guid=guid;e.settings=json["settings"];
     } else {
+        // Preserve recoverable identities instead of silently assigning a new GUID.
+        if(!directory&&e.path.starts_with("GeneratedBuildingMaterials/")){
+            const auto pendingPublications=StudioMaterialPublicationJournal::inspect(project_);
+            for(const auto& publication:pendingPublications.items())
+                for(const auto& asset:publication["assets"].items())
+                    if(asset.getStr("path")==e.path&&asset.getBool("recoverable"))
+                        throw std::runtime_error("Missing recoverable metadata; use Material Library recovery before indexing: "+e.path);
+        }
         e.guid=generateGuid();e.settings=studioDefaultSettings(e.importer);
         Json json=Json::object();
         json.set("schemaVersion",Json::number(int64_t(1)));
@@ -201,7 +213,8 @@ StudioAssetEntry StudioAssetCatalog::inspect(const fs::path& source,bool directo
     }
     return e;
 }
-void StudioAssetCatalog::rebuild() {
+void StudioAssetCatalog::rebuild(bool createMissing) {
+    editor::ProjectAssetWriteLock projectLock(project_);
     const fs::path root=studioContentRoot(project_);
     std::vector<StudioAssetEntry> scanned;
     std::error_code ec;
@@ -215,6 +228,12 @@ void StudioAssetCatalog::rebuild() {
         if(fs::is_symlink(stat)){it.disable_recursion_pending();continue;}
         if(isSidecar(it->path())){it.disable_recursion_pending();continue;}
         if(!fs::is_regular_file(stat) && !fs::is_directory(stat))continue;
+        if(!createMissing){
+            const auto sidecar=fs::symlink_status(studioMetaPath(it->path()),ec);
+            if(ec==std::errc::no_such_file_or_directory){ec.clear();continue;}
+            if(ec)throw std::runtime_error("Cannot inspect existing metadata: "+ec.message());
+            if(!fs::exists(sidecar))continue;
+        }
         if(scanned.size()>=20000)throw std::runtime_error("Too many indexed content assets");
         scanned.push_back(inspect(it->path(),fs::is_directory(stat)));
     }
@@ -316,7 +335,8 @@ void validateMetaSetting(const std::string& importer,
 }
 }
 StudioAssetEntry StudioAssetCatalog::patchSettings(const std::string& guid,
-              const std::string& key,const Json& value){
+              const std::string& key,const Json& value,editor::ProjectHistory* history,
+              std::vector<editor::ProjectFileEdit>* staged){
     if(!studioValidGuid(guid))throw std::runtime_error("Invalid GUID");
     const auto existing=byGuid(guid);
     if(!existing)throw std::runtime_error("Asset was not found; refresh Assets");
@@ -333,7 +353,8 @@ StudioAssetEntry StudioAssetCatalog::patchSettings(const std::string& guid,
     const auto status=fs::symlink_status(meta);
     if(!fs::is_regular_file(status)||fs::is_symlink(status))
         throw std::runtime_error("Refusing to edit invalid asset .meta");
-    Json document=Json::parseFile(meta.string());
+    const auto before=editor::readProjectFileBytes(meta);
+    Json document=Json::parse(before);
     if(document.getStr("guid")!=guid||document.getStr("importer")!=existing->importer)
         throw std::runtime_error("Asset metadata changed since the last index refresh");
     Json settings=document["settings"];
@@ -345,20 +366,67 @@ StudioAssetEntry StudioAssetCatalog::patchSettings(const std::string& guid,
         platforms.set(name,value);
         settings.set("platformFormats",std::move(platforms));
     }else settings.set(key,value);
+    const bool unchanged=settings.dump()==document["settings"].dump();
     document.set("settings",std::move(settings));
-    const auto tmp=fs::path(meta.string()+".aiverse-meta-update");
-    {
-        std::ofstream stream(tmp,std::ios::binary|std::ios::trunc);
-        if(!stream)throw std::runtime_error("Cannot write new metadata");
-        stream<<document.dump(2)<<"\n";
-        if(!stream){fs::remove(tmp);throw std::runtime_error("Cannot complete metadata write");}
+    const auto after=unchanged?before:document.dump(2)+"\n";
+    std::vector<editor::ProjectFileEdit> plan={{meta,before,after}};
+    const std::string label="Asset: "+existing->path+" / "+key;
+    auto updated=staged?validateMetadataEdit(plan.front()):applyMetadataEdit(plan.front());
+    if(staged){updated.settings=Json::parse(after)["settings"];*staged=plan;}
+    if(history)history->record(std::move(plan),label);
+    return updated;
+}
+StudioAssetEntry StudioAssetCatalog::validateMetadataEdit(const editor::ProjectFileEdit& edit) {
+    // The sidecar is authoritative. A fresh existing-only scan catches
+    // duplicated GUIDs and stale index rows without generating new sidecars.
+    const auto before=Json::parse(edit.before),after=Json::parse(edit.after);
+    const auto guid=before.getStr("guid");
+    if(!studioValidGuid(guid)||after.getStr("guid")!=guid||
+       !before["settings"].isObject()||!after["settings"].isObject())
+        throw std::runtime_error("Invalid asset metadata history identity");
+    auto oldIdentity=before,newIdentity=after;
+    oldIdentity.erase("settings");newIdentity.erase("settings");
+    if(oldIdentity.dump()!=newIdentity.dump())
+        throw std::runtime_error("Asset metadata history cannot change identity");
+    rebuild(false);
+    const auto current=byGuid(guid);
+    if(!current||current->directory||current->importer!=before.getStr("importer"))
+        throw std::runtime_error("Asset identity changed; refresh Assets");
+    const auto root=studioContentRoot(project_);
+    const auto physical=root/fs::path(current->path);
+    const auto meta=studioMetaPath(physical);
+    if(meta.lexically_normal()!=edit.path.lexically_normal())
+        throw std::runtime_error("Asset path changed; refresh Assets");
+    fs::path path=root;
+    for(const auto& part:fs::path(current->path)){
+        path/=part;
+        if(fs::is_symlink(fs::symlink_status(path)))
+            throw std::runtime_error("Asset path has a symlink");
     }
-    std::error_code ec;
-    fs::rename(tmp,meta,ec); // atomic replacement on supported host filesystems
-    if(ec){fs::remove(tmp);throw std::runtime_error("Cannot update .meta: "+ec.message());}
-    rebuild();
-    const auto updated=byGuid(guid);
-    if(!updated)throw std::runtime_error("Metadata saved but asset index is stale");
-    return *updated;
+    if(!fs::is_regular_file(fs::symlink_status(physical)))
+        throw std::runtime_error("Asset no longer exists");
+    return *current;
+}
+StudioAssetEntry StudioAssetCatalog::applyMetadataEdit(const editor::ProjectFileEdit& edit){
+    const auto current=validateMetadataEdit(edit);
+    const auto after=Json::parse(edit.after);
+    const auto guid=current.guid;
+    const std::vector<editor::ProjectFileEdit> plan={edit};
+    const auto reverse=editor::reverseProjectFileEdits(plan);
+    editor::applyProjectFileEdits(project_,plan);
+    try {
+        rebuild(false);
+        const auto updated=byGuid(guid);
+        if(!updated||updated->path!=current.path||updated->settings.dump()!=after["settings"].dump())
+            throw std::runtime_error("Asset index does not match saved metadata");
+        return *updated;
+    }catch(const std::exception& failure){
+        const std::string reason=failure.what();
+        try{editor::applyProjectFileEdits(project_,reverse);rebuild(false);}
+        catch(const std::exception& rollback){
+            throw std::runtime_error(reason+"; metadata rollback/index recovery failed: "+rollback.what());
+        }
+        throw std::runtime_error(reason);
+    }
 }
 } // namespace aiverse::studio

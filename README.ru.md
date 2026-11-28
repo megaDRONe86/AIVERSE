@@ -81,7 +81,7 @@ MCP-сервер, через которые с проектом работает
 | **Мультиплеер = вечные рассинхроны.** Достаточно одного `float`, чтобы матч на iPhone и Android разошёлся. | Симуляция побитово одинакова везде: fixed-point вместо float, свой RNG, контрольные суммы. CI на каждом push сверяет матчи на Linux x64/ARM64, Windows и macOS. По сети идут только команды, есть lockstep с откатами, сервер с матчмейкингом и вердиктом по реплею. |
 | **Мобильные GPU слабые, а игра должна быть красивой.** | Каждая дорогая функция — тени, частицы, рельеф, постэффекты — имеет уровни качества и сама подстраивается под GPU: от старых Mali и Adreno до Apple Silicon. |
 | **Выпустить игру на все платформы — отдельный проект.** Подписи, иконки, SDK сторов и рекламы. | `aiversebuild` одной командой делает .app, проект Xcode, Gradle/APK, web и .exe. Иконки и заставки генерируются. Плагины App Store, Google Play, RuStore, Yandex Games, Steam, AdMob, AppLovin и других — в билд попадают только выбранные. |
-| **Каждая новая игра начинается с нуля.** | 30+ играбельных шаблонов, жанровые наборы с чек-листами приёмки, 238 навыков для агентов. Новая игра начинается с работающей. |
+| **Каждая новая игра начинается с нуля.** | 30+ играбельных шаблонов, жанровые наборы с чек-листами приёмки, 303 навыков для агентов. Новая игра начинается с работающей. |
 | **Мета и LiveOps переписываются в каждом проекте.** | `aiverse::meta`: магазин, валюты, задания, пассы, ежедневные награды, энергия, кланы, турниры, сундуки с pity — настраивается JSON-ом. |
 
 ---
@@ -225,7 +225,7 @@ python3 tools/importers/port/aiverse_port.py /path/to/UnityProject --out /path/t
 - Редактор с окнами, как в Unity: сцена, инспектор, рельеф, эффекты, свет, UI, тестовая игра и симулятор устройств
 - `aiversemcp` — MCP-сервер для агентов — настройка PHYSIS на карте, проверка и Undo/Redo
 - Мастер «Сделать игру»
-- 238 навыков для агентов и жанровые наборы с чек-листами приёмки
+- 303 навыков для агентов и жанровые наборы с чек-листами приёмки
 - Импорт ресурсов старых игр из вашей собственной копии
 
 </td>
@@ -258,12 +258,18 @@ Windows: `studio_windows.cmd [project]` собирает и открывает `
 CMake, Node.js; работает на WebView2 Runtime и Vulkan).
 
 `studio_mac.command` собирает веб-интерфейс и нативную Studio и открывает её. Только движок:
-`cmake -S . -B build/mac -DCMAKE_BUILD_TYPE=Release && cmake --build build/mac -j 8`. Прежний
-редактор на ImGui (`build/mac/AiverseEditor.app`) по-прежнему собирается и работает на Linux и Windows.
+`cmake -S . -B build/mac -DCMAKE_BUILD_TYPE=Release && cmake --build build/mac -j 8`.
 
-Linux: `cmake --preset linux-release && cmake --build build/linux-release`. Если компилировать не хочется,
-в ветке `builds` есть готовые сборки редактора и инструментов
-([подробнее](docs/ru/overview.md#готовые-сборки-движка-ветка-builds-и-aiversemcp-без-компилятора)).
+В Linux HTML5 Studio использует WebKitGTK 4.1 (2.40 или новее), SQLite, X11 и Vulkan. Установите их пакеты для разработки, Node.js, CMake и Ninja и соберите веб-интерфейс до настройки Studio.
+
+```bash
+(cd apps/studio-web && npm install && npm run build)
+cmake --preset linux-release -DAIVERSE_BUILD_STUDIO_HTML5=ON -DAIVERSE_BUILD_EDITOR=OFF
+cmake --build --preset linux-release --target aiverse_studio
+./build/linux-release/apps/studio-native/AiverseStudio
+```
+
+Только движок под Linux: `cmake --preset linux-release -DAIVERSE_BUILD_STUDIO_HTML5=OFF -DAIVERSE_BUILD_EDITOR=OFF` и `cmake --build --preset linux-release`. В ветке `builds` есть и готовые инструменты. [Готовые сборки движка и инструментов](docs/ru/overview.md#готовые-сборки-движка-ветка-builds-и-aiversemcp-без-компилятора)
 
 **2. Сделать игру.** В хабе нажмите **«Сделать игру»** или создайте проект из шаблона. Игру можно
 сразу запустить с ботами в окне Game.

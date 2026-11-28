@@ -1,9 +1,12 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
-#include <optional>
+#include "engine/sim/RecurringWork.h"
 #include <span>
 namespace aiverse::lib::runtime {
+using sim::RecurringWorkPlan;
+using sim::planRecurringWork;
+using sim::nextRecurringIndex;
 struct WorkItem {std::uint64_t id=0,total=0,completed=0;};
 struct WorkCursor {std::size_t next=0;};
 struct WorkResult {std::size_t operations=0;bool valid=true,blocked=false;};

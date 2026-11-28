@@ -286,7 +286,10 @@ BufferHandle VulkanDevice::createBuffer(const BufferDesc& d) {
         }
         std::memcpy(staged, d.data, d.size);
         VkBufferCopy c{off, 0, d.size};
-        vkCmdCopyBuffer(transferCmd(), src, v.buffer, 1, &c);
+        auto cb=transferCmd();vkCmdCopyBuffer(cb, src, v.buffer, 1, &c);
+        auto barrier=vkStruct<VkMemoryBarrier>(VK_STRUCTURE_TYPE_MEMORY_BARRIER);
+        barrier.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;
+        vkCmdPipelineBarrier(cb,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,1,&barrier,0,nullptr,0,nullptr);
     }
     b.versions.push_back(v);
     return {buffers_.add(std::move(b))};
@@ -389,6 +392,47 @@ bool VulkanDevice::updateSharedBufferChecked(BufferHandle h, const void* data,
     return updateBufferChecked(h, data, size, offset);
 }
 
+// Checked storage writes never rename a GPU-owned buffer. Main-command
+// ordering and explicit barriers cover compute, indirect, and vertex reads.
+bool VulkanDevice::updateStorageBufferChecked(BufferHandle h,const void* data,size_t size,size_t offset){
+    auto* b=buffers_.get(h.id);
+    if(!healthy_||!recording_||inPass_||activeComputeId_||!b||b->type!=BufferType::Storage||
+       b->host||!data||!size||((size|offset)&3u)||offset>b->size||size>b->size-offset)return false;
+    GpuTransferReservation charge(transientGpuBudget(),size);if(!charge)return false;
+    VkBuffer src=VK_NULL_HANDLE;Allocation alloc{};
+    if(!createBufferObject(size,VK_BUFFER_USAGE_TRANSFER_SRC_BIT,true,src,alloc))return false;
+    const VkBuffer dst=resolveBuffer(h.id,serial_);
+    if(!dst||!alloc.mapped){vkDestroyBuffer(device_,src,nullptr);memory_.release(alloc);return false;}
+    std::memcpy(alloc.mapped,data,size);
+    VkCommandBuffer cb=slots_[size_t(slot_)].main;
+    auto before=vkStruct<VkMemoryBarrier>(VK_STRUCTURE_TYPE_MEMORY_BARRIER);
+    before.srcAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;
+    before.dstAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(cb,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,1,&before,0,nullptr,0,nullptr);
+    VkBufferCopy region{0,offset,size};vkCmdCopyBuffer(cb,src,dst,1,&region);
+    auto after=vkStruct<VkMemoryBarrier>(VK_STRUCTURE_TYPE_MEMORY_BARRIER);
+    after.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;after.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;
+    vkCmdPipelineBarrier(cb,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,1,&after,0,nullptr,0,nullptr);
+    deferDestroy([this,src,alloc]() mutable{vkDestroyBuffer(device_,src,nullptr);memory_.release(alloc);});
+    charge.submitted(gpuSubmissionFence());return true;
+}
+bool VulkanDevice::copyStorageBufferChecked(BufferHandle source,BufferHandle target,size_t bytes,size_t so,size_t to){
+    auto* a=buffers_.get(source.id);auto* b=buffers_.get(target.id);
+    if(!healthy_||!recording_||inPass_||activeComputeId_||!a||!b||a==b||a->host||b->host||
+       a->type!=BufferType::Storage||b->type!=BufferType::Storage||!bytes||((bytes|so|to)&3u)||
+       so>a->size||bytes>a->size-so||to>b->size||bytes>b->size-to)return false;
+    auto src=resolveBuffer(source.id,serial_),dst=resolveBuffer(target.id,serial_);if(!src||!dst)return false;
+    VkCommandBuffer cb=slots_[size_t(slot_)].main;
+    auto before=vkStruct<VkMemoryBarrier>(VK_STRUCTURE_TYPE_MEMORY_BARRIER);
+    before.srcAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;
+    before.dstAccessMask=VK_ACCESS_TRANSFER_READ_BIT|VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(cb,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,1,&before,0,nullptr,0,nullptr);
+    VkBufferCopy region{so,to,bytes};vkCmdCopyBuffer(cb,src,dst,1,&region);
+    auto after=vkStruct<VkMemoryBarrier>(VK_STRUCTURE_TYPE_MEMORY_BARRIER);
+    after.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;after.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;
+    vkCmdPipelineBarrier(cb,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,1,&after,0,nullptr,0,nullptr);
+    return true;
+}
 bool VulkanDevice::updateBufferChecked(BufferHandle h, const void* data,
                                        size_t size, size_t offset) {
     VBuffer* b = buffers_.get(h.id);
@@ -729,7 +773,7 @@ TextureHandle VulkanDevice::createTexture(const TextureDesc& d) {
     else if (d.levelCount > 0 && d.levelData) t.levels = d.levelCount;
     else if (d.mipLevels > 0) t.levels = d.mipLevels;
     else if (d.mipmaps && !t.depth && !d.renderTarget &&
-             d.format != PixelFormat::RGBA16F && d.format != PixelFormat::RGBA32F) {
+             d.format != PixelFormat::RGBA32F && (d.format!=PixelFormat::RGBA16F||supportsHdrTextureMipGeneration(d.format))) {
         VkFormatProperties fp;
         vkGetPhysicalDeviceFormatProperties(gpu_, t.vkFormat, &fp);
         const auto need = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT |
@@ -809,6 +853,53 @@ TextureHandle VulkanDevice::createTexture(const TextureDesc& d) {
     return {textures_.add(t)};
 }
 
+// GPU storage writes -> transfer read -> sampled image. Keep the ordinary
+// texture's shader-readable layout contract; no CPU staging or mapping.
+bool VulkanDevice::supportsHdrTextureMipGeneration(PixelFormat f) const {
+    if(f!=PixelFormat::RGBA16F||!supportsStorageBufferTextureCopy()||!supports(f))return false;
+    VkFormatProperties fp{};vkGetPhysicalDeviceFormatProperties(gpu_,VK_FORMAT_R16G16B16A16_SFLOAT,&fp);
+    constexpr auto need=VK_FORMAT_FEATURE_BLIT_SRC_BIT|VK_FORMAT_FEATURE_BLIT_DST_BIT|VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+    return (fp.optimalTilingFeatures&need)==need;
+}
+bool VulkanDevice::copyStorageBufferToTexture2D(BufferHandle from,TextureHandle to,
+        const BufferTextureCopy2D& copy) {
+    const auto* src=buffers_.get(from.id);
+    auto* dst=textures_.get(to.id);
+    const size_t bpp=dst&&dst->format==PixelFormat::RGBA16F?8u:dst&&dst->format==PixelFormat::RGBA32F?16u:4u;
+    if(!recording_||inPass_||activeComputeId_||!supportsStorageBufferTextureCopy()||
+       !src||src->type!=BufferType::Storage||!dst||!dst->image||dst->depth||
+       dst->compressed||dst->renderTarget||dst->storage||
+       dst->dimension!=TextureDimension::Texture2D||dst->volumeDepth!=1||
+       dst->layers!=1||dst->samples!=1||
+       (copy.generateMipmaps?(!dst->generateMips||dst->levels!=maxTextureMipLevels(copy.width,copy.height,1)):dst->levels!=1)||
+       (dst->format!=PixelFormat::RGBA8&&dst->format!=PixelFormat::RGBA8_sRGB&&dst->format!=PixelFormat::RGBA16F&&dst->format!=PixelFormat::RGBA32F)||
+       (bpp!=4&&copy.generateMipmaps&&!supportsHdrTextureMipGeneration(dst->format))||
+       !validBufferTextureCopy2D(copy,src->size,dst->width,dst->height,bpp)) {
+        error_="Vulkan: rejected storage buffer to RGBA texture copy";return false;
+    }
+    const VkBuffer source=resolveBuffer(from.id,serial_);
+    if(!source){error_="Vulkan: copy source unavailable";return false;}
+    VkCommandBuffer cb=slots_[size_t(slot_)].main;
+    auto before=vkStruct<VkMemoryBarrier>(VK_STRUCTURE_TYPE_MEMORY_BARRIER);
+    before.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT|VK_ACCESS_TRANSFER_WRITE_BIT|VK_ACCESS_HOST_WRITE_BIT;
+    before.dstAccessMask=VK_ACCESS_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier(cb,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT|VK_PIPELINE_STAGE_TRANSFER_BIT|VK_PIPELINE_STAGE_HOST_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,0,1,&before,0,nullptr,0,nullptr);
+    barrierImage(cb,dst->image,false,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,uint32_t(dst->levels),0,1);
+    VkBufferImageCopy region{};
+    region.bufferOffset=VkDeviceSize(copy.sourceOffset);
+    region.bufferRowLength=uint32_t(copy.rowPitchBytes/bpp);
+    region.bufferImageHeight=uint32_t(copy.height);
+    region.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};
+    region.imageExtent={uint32_t(copy.width),uint32_t(copy.height),1};
+    vkCmdCopyBufferToImage(cb,source,dst->image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&region);
+    if(copy.generateMipmaps)generateMips(*dst,cb);
+    else barrierImage(cb,dst->image,false,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,1,0,1);
+    return true;
+}
+
 bool VulkanDevice::readTextureAsync(TextureHandle h, TextureReadbackDesc request,
                                     TextureReadFn callback) {
     const VTexture* texture = textures_.get(h.id);
@@ -827,13 +918,10 @@ bool VulkanDevice::readTextureAsync(TextureHandle h, TextureReadbackDesc request
         texture->dimension != TextureDimension::CubeArray &&
         texture->dimension != TextureDimension::Texture3D)
         return false;
-    if (texture->format != PixelFormat::RGBA8 &&
-        texture->format != PixelFormat::RGBA8_sRGB &&
-        texture->format != PixelFormat::RGBA16F)
-        return false;
+    if (!uncompressedTexturePixelBytes(texture->format)) return false;
     const int width = std::max(1, texture->width >> request.mipLevel);
     const int height = std::max(1, texture->height >> request.mipLevel);
-    const size_t bpp = texture->format == PixelFormat::RGBA16F ? 8u : 4u;
+    const size_t bpp = uncompressedTexturePixelBytes(texture->format);
     const size_t bytes = size_t(width) * size_t(height) * bpp;
     if (!bytes || bytes > (size_t(256) << 20)) return false;
     VkBuffer staging = VK_NULL_HANDLE;

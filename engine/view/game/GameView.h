@@ -2,6 +2,7 @@
 #include "engine/render/RenderDeviceLifetime.h"
 #include "engine/render/FramePublicationEpoch.h"
 #include "engine/render/ModelImageUploadTransaction.h"
+#include "engine/render/graph/TextureGraphNativeImageAccess.h"
 #include "engine/view/AppearanceAssetRegistry.h"
 // LEGACY compatibility adapter for historical RTS/editor scene presentation.
 // Generic game-agnostic View is now <engine/view/View.h> / aiverse::View.
@@ -32,6 +33,7 @@ namespace kingston { struct CabinResidentDraw; }
 #include <future>
 #endif
 #include <string>
+#include <stdexcept>
 #include <unordered_map>
 #include <vector>
 #include "../../render/Animation.h"
@@ -40,6 +42,7 @@ namespace kingston { struct CabinResidentDraw; }
 #include "../../game/GameData.h"
 #include "../../game/MapGrid.h"
 #include "Game2DView.h"
+#include "engine/render/graph/GraphTelemetry.h"
 #include "GameGroundFx.h"
 #include "GamePaintLayers.h"
 #include "GameGroundCanvas.h"
@@ -54,9 +57,12 @@ namespace kingston { struct CabinResidentDraw; }
 #include "GameModelResourceCache.h"
 #include "GameModelPreparationService.h"
 #include "GameTerrainRender.h"
+#include "ProjectileAppearance.h"
+#include "engine/view/ProjectilePresentation.h"
 #include "EntityFx.h"
 
 namespace aiverse::render { class CameraModelSnapshot; }
+namespace aiverse::render::texture_graph { class TextureGraphGpuOwner; }
 namespace aiverse::view {
 class View;
 struct ModelPoseRetarget;
@@ -84,6 +90,9 @@ struct SceneObject {
     int16_t carryRes = -1;       // resource index of the cargo
     int8_t shotWeapon = -1;      // projectiles: weapon index (of the shooter's type) that fired it; -1: unknown
     bool selected = false, hovered = false, visible = true, isProjectile = false;
+    bool selectable(const Rules& rules) const {
+        return visible && !isProjectile && type < rules.types.size() && rules.types[type].selectable;
+    }
     bool blip = false;           // not visible, but a radar / sonar contact of the viewer (Sensors.h): drawn as a dot
     float fade = 1;              // 0..1 opacity from the sim (route walkers fade at the route ends)
     bool unpowered = false;      // disabled by a power deficit / owner in low power (electric lights dim)
@@ -96,6 +105,8 @@ struct SceneObject {
     float steer = 0;             // vehicles (rules "driving"): steering angle of the front wheels, rad, + = left
     render::float3 target;
     Entity source;               // projectiles: who fired (muzzle point)
+    projectile::FlightOrigin projectileOrigin = projectile::FlightOrigin::Emission;
+    uint16_t shotTargetType = UINT16_MAX; // eligible straight flight; target holds interpolated ground coordinates
     uint16_t shooterType = UINT16_MAX; // projectiles: type of the unit that fired it (lights)
     // planets: body index and pos / facing / target body-local (origin = body centre); -1 = flat map
     // coordinates; kBodyTransit = between bodies: pos is the world position, facing the travel direction
@@ -109,7 +120,13 @@ struct SceneObject {
     bool posed = false, poseHasY = false;
     float poseY = 0, poseRotX = 0, poseRotZ = 0;
     render::float3 poseScale{1, 1, 1};
+    uint16_t upgradeType = kNoType; // optional visual replacement while upgrading
+    uint16_t modelType() const { return upgradeType == kNoType ? type : upgradeType; }
 };
+
+// Resolve appearance from the active production slots; selection and simulation retain the source type.
+struct Production;
+void projectProductionAppearance(SceneObject& object, const Rules& rules, const Production& production);
 
 // World-space premultiplier for SceneObject's authored pose. `facingYaw` is the
 // RTS draw yaw (models face +X: yaw = authored Y rotation + 90 degrees), `p`
@@ -135,6 +152,8 @@ struct GameScene {
     // view.entity_fx overrides (scale, opacity, colour) by entity; null = none (EntityFx.h)
     std::shared_ptr<EntityFxStore> entityFx;
     std::vector<SceneObject> objects;
+    PlanetForestVisualSnapshot planetForest;
+    PlanetForestMotionHistory planetForestMotion;
     std::map<uint64_t, render::mat4> entityFrames; // optional final frames supplied by a native presentation host
     std::vector<std::pair<render::float3, render::float3>> roads;
     std::vector<render::float3> moveMarkers;
@@ -186,6 +205,7 @@ struct ViewEffect {
     uint8_t owner = 0;
     render::float3 pos;
     float intensity = 1;
+    size_t slot = 0;
 };
 
 }  // namespace aiverse::game
@@ -198,6 +218,49 @@ class GameView : public view_adapter::ModelResourceProvider {
     friend class ::kingston::BulletFxHost;
     friend struct ::kingston::CabinResidentDraw;
 public:
+    // Owner-thread only, outside prepared animation transactions/draw. Copies
+    // diagnostic values; never returns an instance, graph or model pointer.
+    // The caller must establish the current world/entity generation.
+    Json sharedAnimationGraphDiagnostic(uint64_t entityKey,uint64_t worldEpoch,graph_telemetry::History* history=nullptr) const;
+    Json sharedAnimationProfile(uint64_t entityKey,uint64_t worldEpoch,const std::string& action);
+    void clearSharedAnimationProfile();
+    Json animationGraphDiagnostic(uint64_t entityKey) const {
+        Json out=Json::object();
+        out.set("entity",Json::string(std::to_string(entityKey)));
+        out.set("viewFrame",Json::string(std::to_string(frame_)));
+        const auto it=anims_.find(entityKey);
+        if(it==anims_.end()||!it->second.initialized||it->second.dead||
+           it->second.genericViewPose||it->second.seen!=frame_||
+           !it->second.last.entity.valid()||it->second.last.entity.packed()!=entityKey||
+           !it->second.graph.graph()){
+            out.set("available",Json::fromBool(false));
+            out.set("reason",Json::string("No current legacy view graph instance for this entity; culled/generic/uninitialized instances are not reported."));
+            return out;
+        }
+        const auto& instance=it->second.graph;
+        const auto* graph=instance.graph();
+        out.set("available",Json::fromBool(true));
+        out.set("state",Json::string(instance.state()));
+        out.set("stateTime",Json::number(double(instance.stateTime()),6));
+        out.set("healthy",Json::fromBool(instance.healthy()));
+        out.set("errorMessage",Json::string(instance.error()));
+        out.set("poseValid",Json::fromBool(it->second.poseValid));
+        out.set("typeIndex",Json::number(int64_t(it->second.type)));
+        Json active=Json::array();
+        for(const auto& state:graph->states())if(state.id==instance.state()){
+            for(int index:state.program)active.push(Json::string(graph->nodes()[size_t(index)].id));
+            break;
+        }
+        out.set("activeProgram",active);
+        Json events=Json::array();
+        const auto& notifies=instance.notifies();
+        for(size_t i=0;i<notifies.size()&&i<32;++i){
+            Json n=Json::object();n.set("node",Json::string(notifies[i].node));n.set("name",Json::string(notifies[i].name));events.push(n);
+        }
+        out.set("notifyCount",Json::number(int64_t(notifies.size())));out.set("notifies",events);
+        out.set("note",Json::string("Last committed view state; animation LOD may defer evaluation. Active program is not a per-node execution trace."));
+        return out;
+    }
     GameView();
     ~GameView();
     GameView(const GameView&) = delete;
@@ -236,6 +299,11 @@ public:
     // use for host frame-lifetime and teardown diagnostics only.
     size_t activeModelReadLeases() const noexcept {
         return resources_.activeModelReaders();
+    }
+    // Owner-thread host preflight. Callback scope is not a cache reader:
+    // trusted graph publication must still be able to commit its images.
+    bool modelMutationBlocked() const noexcept {
+        return resources_.activeModelReaders()!=0 || nativeGraphCallbackActive_ || strictAppearanceReload_;
     }
     render::ModelResourceCache::ModelReadSafetyStats modelReadSafetyStats() const noexcept {
         return resources_.modelReadSafetyStats();
@@ -349,13 +417,51 @@ public:
             const render::Model&,const std::vector<render::Material>&)>;
     // The host owns GPU shader caches. Stage all candidate appearance
     // pipelines before committing new materials or Models to the live View.
+    // Synchronous trusted callback: candidate Model/materials may be scratch
+    // objects, not cache residents. Do not retain pointers/handles or reenter
+    // View mutation, publication, frame or teardown APIs from this callback.
     void setAppearancePipelineValidator(AppearancePipelineValidator validator) {
+        if(nativeGraphCallbackActive_ || strictAppearanceReload_)
+            throw std::logic_error("appearance validator replacement during transaction");
         appearancePipelineValidator_=std::move(validator);
     }
     bool gpuAppearancePending() const noexcept {return gpuAppearancePending_;}
     bool reloadAppearanceTypes(const std::set<size_t>& types,
                                bool reloadMaterialLibrary=false,
                                size_t* refreshed=nullptr);
+    // Thin compatibility adapter: the shared engine appearance transaction
+    // owns publication; this adapter only resolves an already resident choice.
+    struct GraphMaterialTargetInfo {
+        view::LiveAppearanceMaterialTarget identity;
+        std::string modelPath,materialName;
+        int variant=-1;
+        size_t proceduralLive=0,proceduralTombstones=0,pendingImageRetirement=0;
+    };
+    std::optional<GraphMaterialTargetInfo> graphMaterialTarget(size_t type,size_t choice,size_t material) const;
+    // Exact appearance identity, owner-thread and synchronous borrow only.
+    // The scope must be released before the next mutation/frame/shutdown.
+    render::texture_graph::NativeGraphImageRead readGraphMaterialImage(
+        size_t type,size_t choice,const view::LiveAppearanceMaterialTarget& target,
+        std::string_view output) const;
+    // Trusted synchronous transaction adapter. Borrowed Model, mirror and
+    // device arguments must not escape; no View reentry or reader acquisition.
+    // The callback owns its transactional success/refusal semantics.
+    using GraphMaterialApply=std::function<bool(view::AppearanceAssetRegistry::Snapshot&,
+        std::vector<render::Material>&,render::Model&,gfx::Device&,
+        const render::RenderDeviceLifetime::Lease&,render::ModelImageRollbackPool&,std::string*)>;
+    bool applyGraphMaterial(size_t type,size_t choice,const view::LiveAppearanceMaterialTarget& target,
+        const GraphMaterialApply& apply,std::string* error=nullptr);
+    // Thin shared adapter for native hosts and editor, never owns GPU work.
+    bool applyCompletedGraphMaterial(size_t type,size_t choice,const view::LiveAppearanceMaterialTarget& target,
+        render::texture_graph::TextureGraphGpuOwner& owner,const std::string& scope,const std::string& request,
+        std::string* error=nullptr);
+    using GraphImageRootProvider=std::function<bool(const render::Model&,std::vector<std::span<const render::Material>>&)>;
+    // Explicit external root proof required. The optional host inspection
+    // enumerates additional owner roots after the live target is resolved;
+    // false refuses reclamation. No reentry or mutation of returned spans.
+    render::texture_graph::GraphImageReclaimResult collectGraphMaterialImages(size_t type,size_t choice,size_t material,
+        const view::LiveAppearanceMaterialTarget& target,const render::texture_graph::GraphImageRoots& external,
+        const GraphImageRootProvider& inspectHost={});
     bool typeCurrent(uint16_t t) const { return typeLoaded(t) && requestedModels_[t]==loadedModels_[t]; }
     bool detailRequested(uint16_t t) const { return t<requestedModels_.size() && requestedModels_[t].empty(); }
     void requestDetail(uint16_t type, bool detailed);
@@ -375,6 +481,24 @@ public:
     // Includes road/shore Models AND SpriteMesh buffers so existing client/
     // editor frame hooks automatically poll every View-owned resource queue.
     size_t pendingModelRetirements() const;
+    // Opt-in native owner only. The callback certifies raw-index/handle
+    // consumers have been detached or are represented by the returned spans.
+    // Spans must remain valid through the synchronous sweep; no reentry.
+    struct GraphImageSweepStats {uint64_t inspected=0,detached=0,deferred=0;};
+    // Recycling additionally certifies that all stale raw index/handle
+    // references are permanently detached; no future replay of them is legal.
+    void setAutomaticGraphImageCollection(GraphImageRootProvider provider,bool recycleSlots=false){
+        if(nativeGraphCallbackActive_ || strictAppearanceReload_)
+            throw std::logic_error("graph root provider replacement during transaction");
+        graphImageRootProvider_=std::move(provider);
+        graphImageRecycleSlots_=bool(graphImageRootProvider_)&&recycleSlots;
+        graphImageSweepCursor_.clear();graphImageSweepStats_={};
+    }
+    bool automaticGraphImageRecyclingEnabled()const noexcept{return graphImageRecycleSlots_;}
+    bool automaticGraphImageCollectionEnabled()const noexcept{return bool(graphImageRootProvider_);}
+    GraphImageSweepStats automaticGraphImageCollectionStats()const noexcept{return graphImageSweepStats_;}
+    // Returns true only when at least one image was detached in this sweep.
+    bool collectAutomaticGraphImages();
     bool collectRetiredModels();
     size_t pendingRolledBackImages() const noexcept {
         return imageRollback_.pendingImages();
@@ -558,6 +682,11 @@ public:
     // Where a drawn unit's shots leave its model: the look's "muzzle" (node + offset) in world space and the unit's
     // facing; false when the unit is not drawn yet or its model has no muzzle (effects then use the simulation point).
     bool muzzleOf(Entity e, render::float3& pos, render::float3& dir) const;
+    // Current fitted projectile point in particle space, sampled after the view draw.
+    bool projectileDrawPoint(Entity projectile, render::float3& point) const;
+    bool projectileImpactPathPoint(Entity projectile, render::float3& point) const;
+    // Named node in particle space; no model ownership escapes this query.
+    bool effectNodeOf(Entity e, const std::string& node, render::mat4& frame) const;
     // Problems found while loading view blocks ("type 'knight': models/knight.glb: file not found").
     const std::vector<std::string>& warnings() const { return warnings_; }
     // Read-only static geometry scene (HLOD / opt-in STRATA counters).
@@ -581,10 +710,17 @@ public:
         renderedTris_ = double(cameraTriangles); renderedShadowTris_ = double(shadowTriangles); renderedDraws_ = double(drawCalls);
     }
     bool geometryOnly() const { return geometryOnly_; }
+    // Owner-thread scoped inspection of a resident choice. Release before
+    // loading, publishing, trimming or rendering another transaction.
+    render::ModelReadLease readModelOf(uint16_t type, size_t choice = 0) const;
+    // Legacy borrowed identity; do not dereference or retain image indices/
+    // GPU handles across mutations. Prefer readModelOf for inspection.
     const render::Model* modelOf(uint16_t type, size_t choice = 0) const;
+    const render::Model* projectileModelOf(uint16_t type,size_t weapon) const; // borrowed, same lifetime as modelOf
     const std::vector<ViewEvent>& events() const { return events_; }
     const std::vector<ViewEffect>& effects() const { return effects_; }
     void setSelectionOutline(bool on) { outline_ = on; }
+    bool selectionOutline() const { return outline_; }
     void setRetainPickingGeometry(bool on){resources_.setRetainPickingGeometry(on);}
     // Register immutable native pose operations before init().
     void setAnimationOperations(render::AnimationOperations operations) { animationOperations_ = std::move(operations); }
@@ -628,6 +764,14 @@ public:
     const PlanetCamera& planetCamera() const { return planetCam_; }
     PlanetRenderer& planets() { return planets_; }
     const PlanetRenderer& planets() const { return planets_; }
+    // Non-owning native world presentation callback; detach before owner teardown.
+    using PlanetCaveDraw=std::function<void(render::Renderer3D&,const render::SphereViewFrame&,double)>;
+    void setPlanetCaveDraw(PlanetCaveDraw draw){planetCaveDraw_=std::move(draw);}
+    bool hasPlanetCaveDraw()const noexcept{return bool(planetCaveDraw_);}
+    // Native hosts drawing their own planet pass reuse the same callback.
+    void drawPlanetCaves(render::Renderer3D& renderer,const render::SphereViewFrame& frame,double seconds){
+        if(planetCaveDraw_)planetCaveDraw_(renderer,frame,seconds);
+    }
     // Per frame before beginScene: orbit camera smoothing; returns the Camera to render with (view world).
     const render::Camera& updatePlanetCamera(double seconds, float dt, int viewH);
     // Screen point -> body + body-local surface point (terrain / ocean picking).
@@ -635,6 +779,8 @@ public:
     // Match maps: the simulation's Surface is the source of bodies, orbits, corner heights and cell flags
     // (map JSON only for visual keys). Call after the sim is set up, before buildTerrain().
     void setSimWorld(std::shared_ptr<const Surface> surf, const MapGrid& grid, const Json& map);
+    // Render-owner barrier; compares immutable snapshot identity (also rollback).
+    bool syncSimPlanetTerrain(const MapGrid& grid);
     // Sim-space positions (anchor(body) + local, Surface.h) <-> body + body-local position.
     static bool simToBody(render::float3 sim, int& body, render::float3& local);
     static render::float3 bodyToSim(int body, render::float3 local) { return anchorF(body) + local; }
@@ -659,6 +805,9 @@ public:
     // keep the position as it is, e.g. a flyer); false on other bodies. Ground altitude of a body-local point.
     bool planetFxPlace(render::float3 sim, float lift, render::float3& out, render::float3& up) const;
     float planetFxAltitude(render::float3 local) const;
+    // Prepared body-local visual placement, same ground/sea policy as drawPlanets.
+    bool planetFxObjectPose(const SceneObject& o,render::float3& position,render::float3& direction) const;
+    bool planetFxTerrain(render::float3 local,float& relief,float& clearance,render::float3& up) const;
     // Object frame in the view world (columns: east, up, south, ground point); false when not on a body.
     bool planetPlacement(const SceneObject& o, render::mat4& out) const;
     void setFogLook(const FogLook& l) {
@@ -750,7 +899,14 @@ private:
         float sx = 1, sz = 1;                     // shapes: footprint scaling
         bool tracer = false;                      // optional visual bullets for attack events
         std::vector<float> projectileScale;       // "projectileScale": size of the projectile ball by weapon index (missing: 1; 0: not drawn)
+        float impactHeight = -1.f; // world units above the target base
         float projectileScaleDefault = 1;
+        struct ProjectileLook {
+            view_adapter::ProjectileAppearance config;
+            render::Model* model = nullptr; // borrowed from resources_
+            int clip = -1;
+        };
+        std::vector<ProjectileLook> projectiles; // authored by weapon slot
         float corpse = 2.5f;                      // seconds a dead object stays visible
         float corpseFade = 0.6f;                  // its last seconds fade out (0: drawn whole until removed)
         float corpseAlpha(float age) const { return GameView::corpseAlpha(corpse, corpseFade, age); }
@@ -758,6 +914,8 @@ private:
         float flyHeight = 2.4f;
         float unitSpeed = 0;
         Construction construction = Construction::Grow;
+        float hitFlashStrength = 0.3f, hitFlashDuration = 0.3f;
+        uint32_t hitFlashColor = 0;
         bool dissolveSpawn = false, dissolveDeath = false;
         bool transparent = false;                 // "transparent": Unity transparent queue (sorted, no depth write among its parts)
         // "groundShadow": a flat image under the model (OpenWar's footprint sprites), turning with the drawn model
@@ -807,6 +965,7 @@ private:
         } ground;
         float yaw = 0, speed = 0, distance = 0, turnRate = 0, accel = 0, phase = 0;
         float eventAge[render::kProcEvCount] = {1e9f, 1e9f, 1e9f, 1e9f};
+        uint8_t pendingAttackWindups = 0; // presentation only; weapon slots 0..3
         render::float3 attackDirection{};          // last shot in the animation tangent frame
         float castAge = 1e9f;
         render::float3 lastPos;
@@ -825,8 +984,9 @@ private:
         float prevTime[render::Animator::kLayers] = {0, 0, 0};
         float lodAccum = 0;                       // animation LOD: time not yet applied to the pose
         bool poseValid = false;
-        render::float3 launch;                    // projectiles: offset from the muzzle, decays
+        ::aiverse::view::ProjectilePresentation projectilePresentation;
         bool launched = false;
+        bool straightImpact = false; // projectile last.pos is its rendered point, last.target the endpoint
         double lastSeenTime = -1;                 // previews keep their own clock
     };
 
@@ -903,7 +1063,8 @@ private:
     // placement (planets): object frame in the view world (local +Y = up); null = flat (pos, ground)
     void drawObject(render::Renderer3D& r, EntityAnim& st, const SceneObject& o, float ground, float alpha, const render::float4* tintOverride = nullptr,
                     const render::mat4* placement = nullptr);
-    void drawProjectile(render::Renderer3D& r, uint64_t key, const SceneObject& o, float dt);
+    void drawProjectile(render::Renderer3D& r, uint64_t key, const SceneObject& o, float dt,
+                        render::float3 up = {0,1,0}, bool useMuzzle = true, const MapGrid* grid = nullptr);
     void emitClipEvents(EntityAnim& st, const ModelChoice& ch, const SceneObject& o);
     render::float3 nodeWorldPos(const EntityAnim& st, const ModelChoice& ch, int node, render::float3 offset) const;
     uint32_t stateBits(const EntityAnim& st, const SceneObject& o, bool moving) const;
@@ -933,10 +1094,16 @@ private:
     uint32_t drawTypeEpoch_ = 0;
     bool deferredLoading_ = false, streamingTypes_ = false;
     bool deferAppearanceVariants_ = true; // client default; editor disables
+    bool nativeGraphCallbackActive_ = false; // owner-thread synchronous callback/graph transaction
     bool strictAppearanceReload_ = false; // temporary CPU preflight during authored reload
     bool gpuAppearancePending_=false; // retry only unfinished async compiler work
     AppearancePipelineValidator appearancePipelineValidator_;
     render::ModelImageRollbackPool imageRollback_;
+    GraphImageRootProvider graphImageRootProvider_;
+    bool graphImageRecycleSlots_=false;
+    std::string graphImageSweepCursor_;
+    GraphImageSweepStats graphImageSweepStats_{};
+    void appendGraphImageRoots(const render::Model& model,std::vector<std::span<const render::Material>>& roots)const;
     render::ModelImageUploadTransaction* activeImageTransaction_ = nullptr; // borrowed during staging only
     // Unpublished Model owners during appearance reload: no model-cache
     // tombstones or speculative GPU residency until the outer transaction
@@ -1068,6 +1235,10 @@ private:
     render::float3 camPos_;
     // planets
     PlanetRenderer planets_;
+    // Authored visual detail retained only for bodies with explicit fine relief.
+    struct PlanetDetailBaseline { std::vector<int16_t> corners,detail; int scale=0; };
+    std::vector<PlanetDetailBaseline> planetDetailBaseline_;
+    PlanetCaveDraw planetCaveDraw_;
     GamePlanetGroundFx planetGroundFx_;   // territory, rock, roads, lanes on sphere faces
     PlanetFlora planetFlora_;            // TerraWeave trees and rocks on planet bodies
     void rebuildPlanetFlora();

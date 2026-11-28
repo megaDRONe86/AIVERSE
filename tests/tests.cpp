@@ -1,3 +1,5 @@
+#include "apps/client/NoticeEvents.h"
+#include "engine/view/game/MainCameraShake.h"
 #include <chrono>
 #include "engine/view/VisibilityField.h"
 #include "engine/render/NativeMeshBatch.h"
@@ -34,6 +36,8 @@ extern "C" {
 #include "engine/game/ComputerPlayer.h"
 #include "engine/game/Campaign.h"   // agent-mech
 #include "engine/game/GameCore.h"
+#include "apps/client/MatchFiles.h"
+#include "engine/game/CampaignFight.h"
 #include "../engine/roads/RoadNet.h"   // agent-roads
 #include "engine/game/ScriptIeee.h"
 #include "engine/game/Tiles.h"
@@ -351,6 +355,66 @@ TEST(replay_file_roundtrip) {
     CHECK(l.commands.size() == 2 && l.commands[1] == c);
     CHECK(l.checksums == r.checksums);
     std::remove(path);
+}
+
+TEST(client_match_save_and_replay_slots) {
+    namespace fs = std::filesystem;
+    using client::MatchFile;
+    using client::MatchFiles;
+    const auto root = fs::temp_directory_path() / ("aiverse-match-slots-" + std::to_string(std::random_device{}()));
+    CHECK(fs::create_directory(root));
+    struct Cleanup {
+        fs::path root;
+        ~Cleanup() { std::error_code ec; fs::remove_all(root, ec); }
+    } cleanup{root};
+
+    const std::string map = "maps/valley.json";
+    auto live = makeSim(kSkirmish, map, 7);
+    Command action;
+    action.type = game::kCmdPossess;
+    action.player = 1;
+    live->submit(action);
+    for (int i = 0; i < 10; ++i) live->step();
+    MatchFile slot;
+    slot.map = map;
+    slot.seed = 7;
+    slot.setup = R"({"human":1})";
+    slot.simulation = live->serialize();
+    slot.bots.emplace_back(2, std::string("ai\0state", 8));
+    std::string err;
+    CHECK(MatchFiles::write(root, "manual", false, slot, err));
+    CHECK(MatchFiles::list(root, false) == std::vector<std::string>{"manual"});
+    MatchFile saved;
+    CHECK(MatchFiles::read(root, "manual", false, saved, err));
+    CHECK(saved.map == map && saved.setup == slot.setup && saved.bots == slot.bots);
+    auto restored = makeSim(kSkirmish, map, saved.seed);
+    CHECK(restored->deserialize(saved.simulation));
+    for (int i = 0; i < 10; ++i) { live->step(); restored->step(); }
+    CHECK(live->checksum() == restored->checksum());
+
+    slot.replay.module = "game";
+    slot.replay.mapPath = map;
+    slot.replay.seed = slot.seed;
+    slot.replay.endTick = restored->tick();
+    slot.replay.finalChecksum = restored->checksum();
+    slot.replay.commands = restored->executedCommands();
+    CHECK(!slot.replay.commands.empty());
+    CHECK(MatchFiles::write(root, "manual", true, slot, err));
+    CHECK(slot.replay.save((root / "imported.rpl").string()));
+    for (const auto& name : MatchFiles::list(root, true)) {
+        MatchFile recording;
+        CHECK(MatchFiles::read(root, name, true, recording, err));
+        CHECK(recording.nativeReplay == (name == "imported.rpl"));
+        auto playback = makeSim(kSkirmish, recording.map, recording.seed);
+        for (const auto& cmd : recording.replay.commands) playback->inject(cmd);
+        while (playback->tick() < recording.replay.endTick) playback->step();
+        CHECK(playback->checksum() == live->checksum());
+    }
+    CHECK(MatchFiles::list(root, true).size() == 2);
+    CHECK(!MatchFiles::read(root, "../manual", false, saved, err));
+    std::ofstream(root / "manual.avsave", std::ios::trunc) << "incomplete";
+    CHECK(!MatchFiles::read(root, "manual", false, saved, err));
+    CHECK(saved.simulation == slot.simulation);
 }
 
 // ------------------------------------------------------------------ generic mechanics (inline mini games)
@@ -1249,6 +1313,130 @@ TEST(audio_sample_games_banks_load_cleanly) {
     }
 }
 
+TEST(notice_events_run_once_per_tick_and_mirror_batch) {
+    auto sim = makeSimJson(R"({"victory":"noEntities","types":{"unit":{}}})", flatMap(12,12,
+        R"(,"entities":[{"type":"unit","owner":1,"pos":[2,2]},{"type":"unit","owner":2,"pos":[8,8]}])"));
+    sim->addSystem("test.notice.emit", [](Simulation& s) {
+        s.emit({game::kEvLevelUp, 1, {}, {}, int64_t(s.tick() + 1)});
+        s.emit({game::kEvHit});
+    });
+    auto local = client::collectNoticeEvents(*sim, false);
+    auto online = client::collectNoticeEvents(*sim, true);
+    SimSnapshot start;
+    sim->saveState(start);
+    const double tick = 1.0 / sim->tickRate();
+    CHECK(sim->advance(tick * .25) == 0 && local->drain().empty());
+    CHECK(sim->advance(tick * 3) == 3);
+    auto batch = local->drain();
+    CHECK(batch.size() == 3);
+    for (size_t i = 0; i < batch.size(); ++i) CHECK(batch[i].value == int64_t(i + 1));
+    CHECK(local->drain().empty());
+    CHECK(online->drain(1).size() == 1);
+    sim->loadState(start);
+    sim->step();
+    CHECK(online->drain(1).empty());
+    sim->step();
+    batch = online->drain(2);
+    CHECK(batch.size() == 1 && batch.front().value == 2);
+    local->drain();
+    sim->present({{game::kEvBuildDone}});
+    sim->present({});
+    sim->present({{game::kEvResearched}});
+    batch = local->drain();
+    CHECK(batch.size() == 2 && batch[0].type == game::kEvBuildDone && batch[1].type == game::kEvResearched);
+    CHECK(local->drain().empty());
+}
+
+TEST(build_button_checks_only_immediate_cost) {
+    auto run = [](const char* model, const char* storage, int gold, bool expected) {
+        Json rules = Json::parse(R"({"resources":{"gold":{"global":true},"wood":{}},
+            "types":{"tower":{"structure":{"footprint":[1,1]},"cost":{"gold":4,"wood":8}}}})");
+        rules.set("costModel", Json::string(model));
+        rules.set("storage", Json::string(storage));
+        auto sim = makeSimJson(rules.dump(), flatMap(12, 12, ""));
+        auto& core = mod(*sim);
+        const int goldSlot = core.rules().findResource("gold");
+        core.state(*sim).players[1].stock[size_t(goldSlot)] = Fixed::fromInt(gold);
+        const auto before = sim->checksum();
+        int missing = -1;
+        CHECK(core.canAffordBuildStart(*sim, 1, core.rules().findType("tower"), &missing) == expected);
+        CHECK(missing == (expected ? -1 : core.rules().findResource(gold < 4 ? "gold" : "wood")));
+        CHECK(sim->checksum() == before);
+    };
+    run("upfront", "player", 0, false);
+    run("upfront", "player", 4, false);
+    run("upfront", "buildings", 4, true);
+    run("progressive", "player", 0, true);
+}
+
+TEST(audio_repeated_selection_uses_entity_and_time_window) {
+    auto sim = makeSimJson(R"({"types":{"scout":{"health":{"max":10}}}})",
+        flatMap(16,16,R"(,"entities":[{"type":"scout","owner":1,"pos":[3,3]},{"type":"scout","owner":1,"pos":[8,8]}])"));
+    std::vector<Entity> scouts;
+    sim->world().each<game::Unit>([&](Entity e, game::Unit&) { scouts.push_back(e); });
+    CHECK(scouts.size() == 2);
+    const auto first = scouts[0], second = scouts[1];
+    CHECK(first.valid() && second.valid() && first != second);
+    auto audioEngine = offlineAudio();
+    const Json bank = Json::parse(R"({"sounds":{"repeat":{"synth":{}}},
+        "types":{"scout":{"repeatSelect":{"sound":"repeat","count":3,"window":1}}}})");
+    CHECK(audioEngine->loadBank(bank, {}));
+    game::GameAudio sound;
+    CHECK(sound.init(*audioEngine, mod(*sim).rules(), bank) && sound.warnings().empty());
+    auto click = [&](Entity e, int played) {
+        CHECK(sound.onSelectionClick(*sim, e));
+        CHECK(sound.played() == played);
+    };
+    click(first, 0); click(first, 0); click(second, 0);
+    click(first, 0); click(first, 0); click(first, 1);
+    sound.update(*sim, 1.1);
+    click(first, 1); click(first, 1);
+    sound.resetSelectionClicks();
+    click(first, 1); click(first, 1); click(first, 2);
+    CHECK(sound.init(*audioEngine, mod(*sim).rules(), Json::object()));
+    CHECK(!sound.onSelectionClick(*sim, first));
+}
+
+TEST(audio_repeated_selection_sequential_cycles_without_window) {
+    auto sim = makeSimJson(R"({"types":{"scout":{"health":{"max":10}}}})",
+        flatMap(16,16,R"(,"entities":[{"type":"scout","owner":1,"pos":[3,3]}])"));
+    Entity scout;
+    sim->world().each<game::Unit>([&](Entity e, game::Unit&) { scout = e; });
+    CHECK(scout.valid());
+    auto audioEngine = offlineAudio();
+    const Json bank = Json::parse(R"({"sounds":{"repeat":{"synth":{}}},
+        "types":{"scout":{"repeatSelect":{"sound":"repeat","count":3,"order":"sequential","cycle":true}}}})");
+    CHECK(audioEngine->loadBank(bank, {}));
+    game::GameAudio sound;
+    CHECK(sound.init(*audioEngine, mod(*sim).rules(), bank) && sound.warnings().empty());
+    for (int i = 0; i < 3; ++i) CHECK(sound.onSelectionClick(*sim, scout));
+    CHECK(sound.played() == 1);
+    sound.update(*sim, 10.0); // no timeout when window is omitted
+    for (int i = 0; i < 3; ++i) CHECK(sound.onSelectionClick(*sim, scout));
+    CHECK(sound.played() == 2);
+}
+
+TEST(build_button_missing_resource_audio) {
+    audio::AudioEngine audioEngine;
+    audio::AudioConfig config;
+    config.openDevice = false;
+    audioEngine.init(config);
+    const Json bank = Json::parse(R"({"sounds":{"goldVoice":{"synth":{},"cooldown":1},
+        "genericVoice":{"synth":{},"cooldown":1}},
+        "events":{"notEnough.gold":"goldVoice","notEnough":"genericVoice"}})");
+    CHECK(audioEngine.loadBank(bank, {}));
+    game::Rules rules;
+    rules.resources.resize(2);
+    rules.resources[0].id = "gold";
+    rules.resources[1].id = "wood";
+    game::GameAudio sound;
+    CHECK(sound.init(audioEngine, rules, bank));
+    sound.onMissingResource(0);
+    CHECK(sound.played() == 1 && audioEngine.play("goldVoice") == audio::kNoVoice);
+    sound.onMissingResource(1);
+    CHECK(sound.played() == 2 && audioEngine.play("genericVoice") == audio::kNoVoice);
+}
+
 TEST(audio_aiverse_mapping_warnings) {
     auto a = offlineAudio();
     CHECK(loadBank(*a, R"({"sounds":{"s":{"synth":{}}}})"));
@@ -1764,6 +1952,76 @@ TEST(mech_dungeon_hand_slap_possess) {
     sim->submit(rel);
     run(*sim, 0.2);
     CHECK(!gs.possessed[1].valid() && !(w.get<game::Unit>(gob).flags & game::kUnitPossessed));
+}
+
+TEST(campaign_guard_needs_awareness_before_targeting_and_capture) {
+    const std::string rules = R"({"victory":"keyUnits","possession":{"firstPerson":true},"types":{
+        "fighter":{"move":{"speed":2},"health":{"max":200},"key":true},
+        "guard":{"health":{"max":200},"key":true,"sight":12,"weapons":[{"range":8,"damage":1}]}
+    }})";
+    auto sim = makeSimJson(rules, flatMap(20, 20, R"(,"entities":[
+        {"type":"fighter","owner":1,"pos":[5,5]},{"type":"guard","owner":2,"pos":[10,5]}])"));
+    auto& w = sim->world();
+    Entity fighter = findType(*sim, "fighter", 1), guard = findType(*sim, "guard", 2);
+    w.get<game::Unit>(guard).facing = {1_fx, {}, {}};
+    Command enter;
+    enter.player = 1;
+    enter.type = game::kCmdPossess;
+    enter.units = {fighter};
+    // Start the encounter before the ordinary RTS guard acquires a target.
+    enter.tick = sim->tick();
+    sim->inject(enter);
+    run(*sim, 2);
+    CHECK(w.has<game::Possessed>(fighter));
+    CHECK(!w.get<game::Combat>(guard).target.valid());
+    CHECK(w.get<game::Unit>(fighter).hp == 200_fx);
+    w.get<game::Unit>(guard).facing = {-1_fx, {}, {}};
+    run(*sim, 3);
+    CHECK(w.get<game::Combat>(guard).target == fighter);
+    w.get<Transform>(fighter).pos = w.get<Transform>(guard).pos - Vec3{1_fx, {}, {}};
+    bool captured = false;
+    for (int i = 0; i < 5; ++i) {
+        sim->step();
+        for (const auto& ev : sim->events()) {
+            if (ev.type == game::kEvCampaignFightEnd && ev.value == 1 && ev.a == fighter && ev.b == guard) captured = true;
+        }
+    }
+    CHECK(captured && !w.has<game::Possessed>(fighter));
+}
+
+TEST(campaign_fight_wounds_survive_retreat_and_save) {
+    std::string rules(kDungeonRules);
+    rules.insert(rules.find("\"cost\"", rules.find("\"possession\"")), "\"firstPerson\": true, ");
+    auto sim = makeSimJson(rules, dungeonMap(R"(,{"type":"imp","owner":1,"pos":[7,6]})"));
+    Entity fighter = findType(*sim, "imp", 1);
+    Command enter;
+    enter.player = 1;
+    enter.type = game::kCmdPossess;
+    enter.units = {fighter};
+    sim->submit(enter);
+    run(*sim, 0.2);
+    auto& w = sim->world();
+    CHECK(w.has<game::CampaignFight>(fighter));
+    w.get<game::Unit>(fighter).hp -= 5_fx;
+    sim->step();
+    const auto& fight = w.get<game::CampaignFight>(fighter);
+    CHECK(fight.penaltyMilli > 0);
+    const auto& wounds = fight.health.bodies.at(int64_t(fighter.packed()) + 1).wounds;
+    CHECK(wounds.size() == 1 && wounds.begin()->second.part > 0);
+    const auto snapshot = sim->serialize();
+    CHECK(!snapshot.empty() && sim->deserialize(snapshot));
+    Command retreat = enter;
+    retreat.units.clear();
+    sim->submit(retreat);
+    bool returned = false;
+    for (int i = 0; i < 5; ++i) {
+        sim->step();
+        for (const auto& ev : sim->events()) {
+            if (ev.type == game::kEvCampaignFightEnd && ev.a == fighter && ev.value == 0) returned = true;
+        }
+    }
+    CHECK(returned && !w.has<game::Possessed>(fighter));
+    CHECK(w.get<game::CampaignFight>(fighter).penaltyMilli > 0);
 }
 
 // ------------------------------------------------------------------ territory war (State.io style)
@@ -2396,6 +2654,16 @@ TEST(atlas_pack_integration_and_runtime_lookup) {
     CHECK(src.atlased("units/a/walk.png") && src.load("units/a/walk.png", back) && sameImage(back, sprite));
     CHECK(src.load("tiles/t.png", back) && sameImage(back, tile));
     CHECK(!src.load("models/m.png", back));
+    CHECK(src.loadImage("units/a/walk.png", back) && sameImage(back, sprite));
+    CHECK(src.loadImage("models/m.png", back) && sameImage(back, tile));
+    CHECK(!src.loadImage("missing.png", back) && sameImage(back, tile));
+    atlas::ImageSource broken([&](const std::string& path, std::string& out) {
+        if (path == atlas::kManifestPath) return p->read(path, out);
+        if (path == "units/a/walk.png") { out = atlas::encodePng(tile); return true; }
+        return false;
+    }, atlas::decodeImageFile);
+    CHECK(!broken.loadImage("units/a/walk.png", back)); // corrupt atlas must not silently use stale raw pixels
+
 }
 
 // ---------------- models (models agent): loaders, animation, procedural ----------------
@@ -3162,6 +3430,51 @@ double level(const std::vector<float>& st, double hz, double from, double to) {
 }
 } // namespace
 
+TEST(audio_repeated_selection_mixer_order_and_resets) {
+    auto sim = makeSimJson(R"({"types":{"scout":{"health":{"max":10}}}})",
+        flatMap(16,16,R"(,"entities":[{"type":"scout","owner":1,"pos":[3,3]},{"type":"scout","owner":1,"pos":[8,8]}])"));
+    std::vector<Entity> scouts;
+    sim->world().each<game::Unit>([&](Entity e, game::Unit&) { scouts.push_back(e); });
+    CHECK(scouts.size() == 2);
+    if (scouts.size() != 2) return;
+    auto a = offlineAudio();
+    const std::map<std::string,std::string> clips = {
+        {"normal.wav", wavOf(48000,.12f,[](float t){return tone(440,t);})},
+        {"first.wav", wavOf(48000,.12f,[](float t){return tone(660,t);})},
+        {"second.wav", wavOf(48000,.12f,[](float t){return tone(880,t);})}};
+    Json bank = Json::parse(R"({"sounds":{
+        "normal":{"files":["normal.wav"],"spatial":false},
+        "repeat":{"files":["first.wav","second.wav"],"spatial":false}},
+        "types":{"scout":{"select":"normal","repeatSelect":{
+            "sound":"repeat","count":3,"order":"sequential","cycle":true,"window":0}}}})");
+    CHECK(loadBank(*a,bank.dump(),nullptr,clips));
+    game::GameAudio sound;
+    CHECK(sound.init(*a,mod(*sim).rules(),bank));
+    auto click = [&](Entity who, int expectedHz) {
+        CHECK(sound.onSelectionClick(*sim,who));
+        const auto pcm = renderBuf(*a,.2f);
+        CHECK(level(pcm,expectedHz,.02,.10) > .1);
+        for (int other : {440,660,880})
+            if (other != expectedHz) CHECK(level(pcm,other,.02,.10) < .03);
+    };
+    click(scouts[0],440); click(scouts[0],440); click(scouts[0],660);
+    sound.update(*sim,10); // window=0 must retain next variant after a long gap
+    click(scouts[0],880); click(scouts[0],440); // cycle returns to the normal voice
+    click(scouts[0],440); click(scouts[0],660);
+    sound.onCommand(*sim,scouts[0],game::kCmdMove);
+    click(scouts[0],440); // the order resets even without a move acknowledgement sound
+    click(scouts[0],440); click(scouts[0],660);
+    click(scouts[1],440); click(scouts[0],440); // changed entity resets
+    click(scouts[0],440); click(scouts[0],660);
+    sound.resetSelectionClicks(); // client clearing/group selection uses this API
+    click(scouts[0],440);
+    bank.member("types").member("scout").member("repeatSelect").set("window", Json::number(int64_t(1)));
+    CHECK(sound.init(*a,mod(*sim).rules(),bank));
+    click(scouts[0],440); click(scouts[0],440); click(scouts[0],660);
+    sound.update(*sim,1.1);
+    click(scouts[0],440); // an explicitly positive window expires
+}
+
 TEST(audio_music_loop_points) {
     auto a = offlineAudio();
     // 0..0.5 s: 200 Hz intro, 0.5..1 s: 800 Hz loop body
@@ -3420,6 +3733,166 @@ TEST(fx_quality_tiers_bound_particles) {
     CHECK(fx::defaultQualityFor("Mali-T720", true) == fx::FxQuality::Low || std::getenv("AIVERSE_PARTICLES"));
     CHECK(fx::defaultQualityFor("Adreno (TM) 640", true) == fx::FxQuality::Medium || std::getenv("AIVERSE_PARTICLES"));
     CHECK(fx::defaultQualityFor("Apple M2", false) == fx::FxQuality::High || std::getenv("AIVERSE_PARTICLES"));
+}
+
+TEST(fx_node_binding_selects_entity_and_falls_back_to_terrain) {
+    auto sim = makeSimJson(R"({"types":{"unit":{}}})", flatMap(12,12,""));
+    const Entity caster = sim->world().create();
+    const Entity target = sim->world().create();
+    fx::ParticleSystem ps;
+    CHECK(ps.init(nullptr));
+    ps.setQuality(fx::FxQuality::High);
+    CHECK(ps.define("marker", fxParse(R"({"emitters":[{"burst":1,"life":2,"speed":0}]})")) >= 0);
+    game::GameFx bridge;
+    const Json bank = Json::parse(R"({"events":{
+        "attack":{"effect":"marker","node":"weapon","offset":[1,2,3]},
+        "ability":{"effect":"marker","node":"chest","anchor":"target"},
+        "hit":{"effect":"marker","node":"missing","height":4}}})");
+    CHECK(bridge.init(ps, mod(*sim).rules(), bank) && bridge.warnings().empty());
+    bridge.setNodeFn([&](Entity entity, const std::string& node, render::mat4& frame) {
+        if (node == "weapon") CHECK(entity == caster);
+        else CHECK(entity == target);
+        if (node == "missing") return false;
+        frame.at(0,3) = entity == caster ? 10.f : 20.f;
+        return true;
+    });
+    bridge.setHeightFn([](float, float) { return 7.f; });
+    sim->addSystem("test.node.events", [=](Simulation& s) {
+        s.emit({game::kEvAttack,1,caster,target});
+        s.emit({game::kEvAbility,1,caster,target});
+        s.emit({game::kEvHit,1,target,caster});
+    });
+    bridge.attach(*sim, 0);
+    sim->step();
+    bridge.update(*sim, nullptr);
+    ps.update(.01f);
+    std::vector<fx::FxParticleInfo> particles;
+    ps.snapshot(particles);
+    CHECK(particles.size() == 3);
+    for (fx::float3 expected : {fx::float3{11,2,3}, fx::float3{20,0,0}, fx::float3{0,11,0}}) {
+        CHECK(std::any_of(particles.begin(), particles.end(), [&](const auto& p) {
+            return render::length(p.pos - expected) < .01f;
+        }));
+    }
+}
+
+TEST(main_camera_shake_distance_pause_and_expiry) {
+    const Json binding = Json::parse(R"({"amplitude":2,"duration":1,"radius":10,"frequency":12})");
+    game::MainCameraShake near, halfway, outside;
+    near.start(binding, 0, 0);
+    halfway.start(binding, 5, 0);
+    outside.start(binding, 10, 0);
+    render::Camera navigation;
+    const auto first = near.sample(navigation, 0).target;
+    CHECK(render::length(first) > 0);
+    CHECK(render::length(halfway.sample(navigation, 0).target - first * .5f) < .0001f);
+    CHECK(render::length(outside.sample(navigation, 0).target) == 0);
+    CHECK(render::length(near.sample(navigation, 1).target - first) == 0);
+    CHECK(render::length(near.sample(navigation, 0).target) == 0);
+    CHECK(render::length(navigation.target) == 0);
+}
+
+TEST(animated_model_effect_uses_existing_handle_lifecycle) {
+    const auto source = R"({"model":{"source":"models/aura.glb","clip":"idle","duration":0.5,"loop":true,"castShadow":false,
+        "materials":[{"material":"Glow","blend":"additive","color":[[0,"#ffffff00"],[1,"#ff0000ff"]],"uvSpeed":[1,-2],"textures":["a","b"]}]}})";
+    auto definition = fxParse(source);
+    auto roundTrip = fxParse(fx::effectToJson(definition).dump().c_str());
+    CHECK(roundTrip.model.source == definition.model.source);
+    CHECK(!definition.model.castShadow && !roundTrip.model.castShadow);
+    CHECK(roundTrip.model.materials[0].blend=="additive");
+    CHECK(roundTrip.model.materials.size() == 1 && roundTrip.model.materials[0].textures.size() == 2);
+    fx::ParticleSystem ps;
+    CHECK(ps.init(nullptr));
+    const auto id = ps.define("aura",roundTrip);
+    const auto handle = ps.play(id,{2,3,4});
+    CHECK(handle.valid());
+    std::vector<fx::ParticleSystem::ModelInstance> models;
+    ps.update(.1f);
+    ps.move(handle,{4,5,6});
+    ps.modelInstances(models);
+    CHECK(models.size() == 1);
+    if (!models.empty()) {
+        CHECK(models[0].handle == handle && models[0].time > 0);
+        CHECK(models[0].world.at(0,3) == 4 && models[0].world.at(1,3) == 5);
+    }
+    ps.stop(handle);
+    ps.modelInstances(models);
+    CHECK(models.empty());
+    definition.model.loop=false;
+    const auto shot=ps.play(ps.define("shot",definition),{});
+    CHECK(shot.valid());
+    for (int i=0;i<12;++i) ps.update(.05f);
+    CHECK(!ps.alive(shot));
+}
+
+TEST(fx_chain_jump_retains_both_endpoints_after_tick_and_expires) {
+    auto sim = makeSimJson(R"({"types":{"unit":{}}})", flatMap(12,12,""));
+    fx::ParticleSystem ps;
+    CHECK(ps.init(nullptr));
+    game::GameFx bridge;
+    CHECK(bridge.init(ps, mod(*sim).rules(), Json::parse(R"({"events":{"chainJump":{"mode":"beam","scale":2,"height":1,"lifetime":0.25}}})")));
+    CHECK(bridge.warnings().empty());
+    sim->addSystem("test.chain.presentation", [](Simulation& s) {
+        SimEvent jump{game::kEvChainJump};
+        jump.pos = {Fixed::fromInt(8), {}, Fixed::fromInt(7)};
+        jump.chain = std::make_shared<ChainJumpPresentation>(ChainJumpPresentation{{Fixed::fromInt(2), {}, Fixed::fromInt(3)}, -1});
+        s.emit(jump);
+    });
+    bridge.attach(*sim, 0);
+    sim->step();
+    bridge.update(*sim, nullptr);
+    CHECK(bridge.chainLinks().size() == 1);
+    const auto link = bridge.chainLinks().front();
+    CHECK(link.beam && link.scale == 2 && link.from.x == 2 && link.from.y == 1 && link.from.z == 3);
+    CHECK(link.to.x == 8 && link.to.y == 1 && link.to.z == 7);
+    bridge.update(*sim, nullptr, .125f);
+    CHECK(bridge.chainLinks().size() == 1);
+    bridge.update(*sim, nullptr, .125f);
+    CHECK(bridge.chainLinks().empty());
+}
+
+TEST(fx_budget_config_limits_particles_and_counts_skipped_events) {
+    auto sim = makeSimJson(R"({"types":{"unit":{}}})", flatMap(12,12,""));
+    fx::ParticleSystem ps;
+    ps.setQuality(fx::FxQuality::High);
+    CHECK(ps.init(nullptr));
+    game::GameFx bridge;
+    const Json bank = Json::parse(R"({"limits":{"combatPerFrame":2,"particles":{"high":5,"low":1}}})");
+    CHECK(bridge.init(ps, mod(*sim).rules(), bank) && bridge.warnings().empty());
+    const int effect = ps.define("burst", fxParse(R"({"emitters":[{"burst":20,"life":2,"speed":0}]})"));
+    CHECK(ps.play(effect, {}).valid());
+    ps.update(.01f);
+    CHECK(ps.stats().particles == 5 && ps.stats().dropped > 0);
+    ps.setQuality(fx::FxQuality::Low);
+    ps.update(.01f);
+    CHECK(ps.stats().particles == 1);
+    sim->addSystem("test.budget.events", [](Simulation& s) {
+        for (int i = 0; i < 4; ++i) s.emit({game::kEvHit});
+        s.emit({game::kEvMiss});
+        s.emit({game::kEvWave});
+    });
+    bridge.attach(*sim, 0);
+    sim->step();
+    bridge.update(*sim, nullptr);
+    CHECK(bridge.skippedCombatEvents() == 3);
+    sim->step();
+    bridge.update(*sim, nullptr);
+    CHECK(bridge.skippedCombatEvents() == 6);
+    bridge.detach();
+    CHECK(bridge.init(ps, mod(*sim).rules(), Json::parse(R"({"limits":{"combatPerFrame":0,"particles":{"low":0}}})")));
+    bridge.attach(*sim, 0);
+    sim->step();
+    bridge.update(*sim, nullptr);
+    ps.update(.01f);
+    CHECK(bridge.skippedCombatEvents() == 5 && ps.stats().particles == 0);
+    bridge.detach();
+    CHECK(bridge.init(ps, mod(*sim).rules(), Json::parse(R"({"limits":{"particles":{"low":-2},"combatPerFrame":1.5}})")));
+    CHECK(bridge.warnings().size() == 2);
+    bridge.attach(*sim, 0);
+    sim->step();
+    bridge.update(*sim, nullptr);
+    CHECK(bridge.skippedCombatEvents() == 0);
+    bridge.detach();
 }
 
 TEST(fx_attached_trail_follows_and_stops) {
@@ -7994,6 +8467,21 @@ TEST(models_dae_skinned_two_bones) {
     CHECK(near(pose[size_t(top)].t.y, 1));
 }
 
+TEST(models_gltf_resolves_authored_texture_frames) {
+    using namespace interchangetest;
+    Json source = Json::parse(modeltest::skinnedGltf());
+    source.set("images", Json::parse(R"([{"name":"glow","uri":"glow.tga"}])"));
+    source.set("textures", Json::parse(R"([{"name":"soft","source":0},{"name":"sharp","source":0,"sampler":0}])"));
+    source.set("samplers", Json::parse(R"([{"magFilter":9728}])"));
+    auto model = loadGltf("marker.gltf", source.dump(), mapReader({{"glow.tga", tga2x2()}}), nullptr);
+    CHECK(model->findImage("glow") == 0);
+    CHECK(model->findImage("glow.tga") == 0);
+    CHECK(model->findImage("soft") == 0);
+    CHECK(model->findImage("sharp") == 1);
+    CHECK(model->findImage("glow.tga#t1") == 1);
+    CHECK(model->findImage("missing") == -1);
+}
+
 TEST(models_dae_textured_zup_and_errors) {
     using namespace interchangetest;
     std::vector<std::string> warn;
@@ -9921,6 +10409,7 @@ TEST(gen_planet_world_players) {
 // ---------------- Lua scripting (scripting agent) ----------------
 #include "engine/game/Script.h"
 #include "engine/game/ScriptInternal.h"
+#include "engine/game/MatchChat.h"
 #include <fstream>
 #include <iterator>
 
@@ -9944,6 +10433,36 @@ static bool scriptLogHas(Simulation& sim, const std::string& text, bool error = 
     return false;
 }
 static Fixed gold(Simulation& sim, uint8_t p) { return mod(sim).state(sim).players[p].stock[size_t(mod(sim).rules().findResource("gold"))]; }
+
+TEST(match_chat_replays_player_text_to_simulation_script) {
+    const char* source = R"(
+        on("chat", function(e)
+            if e.text == "/точка 2" then game.add_var("sender_total", e.player) end
+        end)
+    )";
+    auto run = [&](const std::vector<Command>& commands) {
+        auto sim = scriptSim({{"chat.lua", source}});
+        for (const auto& command : commands) sim->submit(command);
+        for (int tick = 0; tick < 5; ++tick) sim->step();
+        CHECK(mod(*sim).scripts()->errorCount() == 0);
+        CHECK(mod(*sim).state(*sim).trig.vars["sender_total"] == Fixed::fromInt(3));
+        return sim->checksum();
+    };
+    Replay live;
+    Command chat = game::chatCommand("/точка 2");
+    for (uint8_t sender : {1, 2}) {
+        chat.tick = sender;
+        chat.player = sender;
+        live.commands.push_back(chat);
+    }
+    live.finalChecksum = run(live.commands);
+    Replay playback;
+    CHECK(playback.decode(live.encode()));
+    CHECK(playback.commands == live.commands);
+    CHECK(run(playback.commands) == live.finalChecksum);
+    CHECK(!game::chatCommand(std::string(257, 'a')).param);
+    CHECK(!game::chatCommand("  ").param);
+}
 
 TEST(script_no_scripts_no_vm) {   // only the standard library: no "scripts" system, ScriptStore not hashed
     auto sim = makeSim(kSkirmish, "maps/valley.json", 3);
@@ -10136,6 +10655,73 @@ TEST(script_embed_requires) {
 }
 
 #include "engine/view/game/GameViewScript.h"
+TEST(local_order_feedback_is_delivered_once_without_a_tick) {
+    Json rules = Json::parseFile(kSkirmish + "/rules.json");
+    rules.set("viewScripts", Json::parse(R"(["scripts/view/order.lua"])"));
+    rules.set("$scriptSources", Json::parse(R"J({"scripts/view/order.lua":
+        "view.on('order', function(e) assert(e.event == 'order' and e.kind == 'attack' and e.queued and e.player == 1 and e.x == 0 and e.y == 2 and e.z == 0); view.notice(e.kind) end)"})J"));
+    Json map = Json::parseFile(kSkirmish + "/maps/valley.json");
+    Simulation sim(SimConfig{}, std::make_unique<game::GameCore>());
+    sim.setup(rules, map);
+    game::ViewScripts scripts;
+    CHECK(scripts.load(sim, rules, map, 1));
+    scripts.attach(sim);
+    const auto before = sim.checksum();
+    std::vector<SimEvent> events{{game::kViewEventOrder, 1, kNullEntity, kNullEntity,
+        game::kCmdAttack, {Fixed{}, Fixed::fromInt(2), Fixed{}}, kCmdQueue}};
+    scripts.queueLocalOrder(events.front());
+    scripts.update(sim, .016f);
+    const auto requests = scripts.takeRequests();
+    CHECK(requests.size() == 1 && requests.front().text == "attack");
+    scripts.update(sim, .016f);
+    CHECK(scripts.takeRequests().empty() && scripts.log().empty());
+
+    game::GameOverlays overlays;
+    overlays.init(mod(sim).rules(), Json::parse(R"([{"id":"orders","event":{"on":"order","lifetime":1,"rise":1,"grow":2},"shape":"ring"}])"), Json(), "");
+    CHECK(overlays.set().warnings.empty());
+    game::OverlayContext context;
+    context.player = 1;
+    context.orders = &events;
+    overlays.setContext(context);
+    game::GameScene scene;
+    const auto& grid = mod(sim).state(sim).grid;
+    std::vector<uint8_t> fog(size_t(grid.w * grid.h), 0);
+    overlays.prepare(scene, 0, &fog, grid, 20);
+    CHECK(overlays.popupCount() == 1);
+    events.clear();
+    overlays.prepare(scene, .5, &fog, grid, 20);
+    CHECK(overlays.popupCount() == 1);
+    overlays.prepare(scene, 2, &fog, grid, 20);
+    CHECK(overlays.popupCount() == 0 && sim.checksum() == before);
+}
+
+TEST(structure_upgrade_appearance_projects_only_active_production) {
+    game::Rules rules;
+    rules.types.resize(3);
+    auto& source = rules.types.front();
+    source.structure = true;
+    game::Production production;
+    production.queue.push_back({1, {}, {}, false});
+    production.queue.push_back({2, Fixed::fromRatio(1, 4), {}, true});
+    auto project = [&] {
+        game::SceneObject object;
+        game::projectProductionAppearance(object, rules, production);
+        return object;
+    };
+    CHECK(project().modelType() == 0);
+    source.view = Json::parse(R"({"showUpgradeTarget":true})");
+    CHECK(project().modelType() == 0);
+    source.queueSlots = 2;
+    auto preview = project();
+    CHECK(preview.type == 0 && preview.modelType() == 2 && preview.build == .25f);
+    production.queue.back().progress = Fixed{};
+    CHECK(project().modelType() == 2 && project().build == 0);
+    production.queue.pop_back();
+    CHECK(project().modelType() == 0 && project().build == 1);
+    production.queue.clear();
+    CHECK(!project().producing);
+}
+
 TEST(script_view_scripts) {
     Json rules = Json::parseFile(kSkirmish + "/rules.json");
     rules.set("viewScripts", Json::parse(R"(["scripts/view/v.lua"])"));
@@ -11543,6 +12129,29 @@ TEST(ai_map_player_presets) {   // map players[i].ai: per-slot preset + knobs (s
     CHECK(cont->checksum() == rush->checksum());
 }
 
+#include "apps/client/ResourceHud.h"
+
+TEST(resource_hud_labels_from_rules) {
+    const auto rules = game::loadRules(Json::parse(R"({
+      "resources":{"gold":{"name":"Gold","hudLabelFormat":"{value}"},
+                   "supply":{"kind":"capacity","name":"Supply","hudLabelFormat":"{name} {value}/{cap}"}},
+      "types":{"scout":{"health":{"max":10}}}
+    })"));
+    CHECK(rules.resources.size() == 2);
+    game::PlayerEconomy eco;
+    eco.stock.assign(2, Fixed::fromInt(42));
+    eco.cap.assign(2, Fixed::fromInt(100));
+    eco.capUsed.assign(2, Fixed::fromInt(3));
+    eco.capProvided.assign(2, Fixed::fromInt(8));
+    for (size_t slot = 0; slot < rules.resources.size(); ++slot) {
+        auto resource = rules.resources[slot];
+        const bool gold = resource.id == "gold";
+        CHECK(client::resourceHudLabel(resource, eco, slot) == (gold ? "42" : "Supply 3/8"));
+        resource.hudLabelFormat.clear();
+        CHECK(client::resourceHudLabel(resource, eco, slot) == (gold ? "Gold: 42" : "Supply: 3/8"));
+    }
+}
+
 TEST(script_hud_resource_progress) {
     auto sim=makeSimJson(R"({"types":{"unit":{"hp":10}}})",R"({"size":[4,4],"players":[{},{}]})",3);
     const auto manifest=Json::parse(R"({"scriptHud":[{"items":[{"progressVar":"gold_{player}","progressMaxVar":"price_{player}"},{"progressVar":"fraction_{player}"}]}]})");
@@ -12067,6 +12676,30 @@ TEST(script_command_map_click) {
 }
 
 // OpenWar presentation hooks (agent-openwar): game.json "playerColors", flat lighting, view camera API
+TEST(view_selection_request_is_local_and_bounded) {
+    Json rules = Json::parse(R"({"types":{"scout":{"health":{"max":10}}},"viewScripts":["scripts/view/select.lua"]})");
+    Json sources = Json::object();
+    sources.set("scripts/view/select.lua", Json::string(R"LUA(
+view.on_frame(function()
+ local e = game.units{owner=1,type='scout'}[1]
+ view.select({e})
+ view.select_add(e)
+ assert(#view.selection() == 1)
+end)
+)LUA"));
+    rules.set("$scriptSources", sources);
+    Json map = Json::parse(flatMap(8,8,R"(,"entities":[{"type":"scout","owner":1,"pos":[3,3]}])"));
+    Simulation sim(SimConfig{}, std::make_unique<game::GameCore>()); sim.setup(rules, map);
+    Entity scout;
+    sim.world().each<game::Unit>([&](Entity e, game::Unit&) { scout = e; });
+    game::ViewScripts view; CHECK(view.load(sim, rules, map, 1));
+    view.setSelection({}); view.update(sim, .016f);
+    std::vector<Entity> requested;
+    CHECK(view.takeSelectionRequest(requested));
+    CHECK(requested.size() == 1 && requested[0] == scout);
+    CHECK(!view.takeSelectionRequest(requested));
+}
+
 TEST(openwar_player_colors_flat_lighting_view_camera) {
     // playerColors: hex / 0..1 / 0..255 entries, null keeps the default, errors are reported, reset on reload
     const render::float4 def1 = game::overlayPlayerColor(1);
@@ -16072,25 +16705,26 @@ TEST(native_editor_build_helpers) {
     auto has = [](const std::vector<std::string>& v, const std::string& a) { return std::find(v.begin(), v.end(), a) != v.end(); };
     CHECK(has(p.configureArgs, "-DAIVERSE_CONTENT_DIR=/games/My Game") && has(p.configureArgs, "-DCMAKE_BUILD_TYPE=Release"));
     CHECK(has(p.configureArgs, "-G") && has(p.configureArgs, "-DCMAKE_MAKE_PROGRAM=/usr/bin/ninja") && has(p.configureArgs, "-DAIVERSE_NATIVE_DIR="));
-    CHECK(has(p.buildArgs, "aiverse_editor") && has(p.buildArgs, "aiverse_headless") && has(p.buildArgs, "3"));
+    CHECK(has(p.configureArgs, "-DAIVERSE_BUILD_EDITOR=OFF") && has(p.configureArgs, "-DAIVERSE_BUILD_STUDIO_HTML5=ON") && has(p.buildArgs, "aiverse_studio") && has(p.buildArgs, "aiverse_headless") && has(p.buildArgs, "3"));
     // the client too (the project's modules reach "launch client"), without a content copy inside the project
     CHECK(has(p.buildArgs, "aiverse_client") && has(p.configureArgs, "-DAIVERSE_CLIENT_BUNDLE_CONTENT=OFF") && has(p.configureArgs, "-DAIVERSE_BUILD_CLIENT=ON"));
     CHECK(fs::path(p.clientBinary) == fs::path("/games/My Game/Builds/.temp/editor-linux/AiverseGame"));
-    CHECK(fs::path(p.editorBinary) == fs::path("/games/My Game/Builds/.temp/editor-linux/aiverse_editor") && p.launchTarget == p.editorBinary);
+    CHECK(fs::path(p.editorBinary) == fs::path("/games/My Game/Builds/.temp/editor-linux/apps/studio-native/AiverseStudio") && p.launchTarget == p.editorBinary);
     const std::string cmd = nativeBuildCommand(p);
     CHECK(cmd.rfind("'/usr/bin/cmake' '-S' '/eng' '-B' '" + p.buildDir + "'", 0) == 0);
     CHECK(cmd.find(" 2>&1 && '/usr/bin/cmake' '--build' ") != std::string::npos);
     CHECK(!has(planNativeBuild("/eng", "/g", "linux", "cmake", "/usr/bin/ninja", true, 0).configureArgs, "-G"));   // keeps the cached generator
     NativeBuildPlan mac = planNativeBuild("/eng", "/g", "macos", "/opt/homebrew/bin/cmake", "", false, 0);
-    CHECK(fs::path(mac.launchTarget) == fs::path("/g/Builds/.temp/editor-macos/AiverseEditor.app") &&
-          fs::path(mac.editorBinary) == fs::path("/g/Builds/.temp/editor-macos/AiverseEditor.app/Contents/MacOS/AiverseEditor"));
+    CHECK(fs::path(mac.launchTarget) == fs::path("/g/Builds/.temp/editor-macos/apps/studio-native/AiverseStudioHTML5.app") &&
+          fs::path(mac.editorBinary) == fs::path("/g/Builds/.temp/editor-macos/apps/studio-native/AiverseStudioHTML5.app/Contents/MacOS/AiverseStudioHTML5"));
     CHECK(fs::path(mac.clientBinary) == fs::path("/g/Builds/.temp/editor-macos/AiverseGame.app/Contents/MacOS/AiverseGame"));
     CHECK(!has(mac.buildArgs, "--parallel") && !has(mac.configureArgs, "-G"));
-    CHECK(has(mac.configureArgs, "-DAIVERSE_EDITOR_BUNDLE_ID=com.aiverse.editor.project") && !has(p.configureArgs, "-DAIVERSE_EDITOR_BUNDLE_ID=com.aiverse.editor.project"));
-    CHECK(fs::path(planNativeBuild("/eng", "/g", "windows", "cmake", "", false, 0).editorBinary) == fs::path("/g/Builds/.temp/editor-windows/Release/aiverse_editor.exe"));
-    CHECK(nativeRestartCommand("macos", "/g/B/AiverseEditor.app", "/g/G.rtsproj", "/eng/build") ==
-          "open -n '/g/B/AiverseEditor.app' --args '/g/G.rtsproj' --native-editor --tools-from '/eng/build'");
-    CHECK(nativeRestartCommand("linux", "/g/aiverse_editor", "/g", "").find("AIVERSE_NATIVE_EDITOR=1 '/g/aiverse_editor' '/g' --native-editor") != std::string::npos);
+    CHECK(has(mac.buildArgs, "aiverse_studio") && has(mac.configureArgs, "-DAIVERSE_BUILD_EDITOR=OFF"));
+    CHECK(fs::path(planNativeBuild("/eng", "/g", "windows", "cmake", "", false, 0).editorBinary) == fs::path("/g/Builds/.temp/editor-windows/apps/studio-native/Release/AiverseStudio.exe"));
+    CHECK(nativeRestartCommand("macos", "/g/B/AiverseStudioHTML5.app", "/g/My Game") ==
+          "open -n '/g/B/AiverseStudioHTML5.app' --args --project '/g/My Game'");
+    CHECK(nativeRestartCommand("linux", "/g/AiverseStudio", "/g/My Game") ==
+          "( '/g/AiverseStudio' --project '/g/My Game' >/dev/null 2>&1 & )");
     CHECK(isProjectBuildExe("/g/Builds/.temp/editor-linux/aiverse_editor") && isProjectBuildExe("/g/Builds/editor-linux/aiverse_editor") && isProjectBuildExe("/g/Builds/.temp/editor-macos/AiverseEditor.app/Contents/MacOS/AiverseEditor"));
     CHECK(!isProjectBuildExe("/eng/build/lin/aiverse_editor") && !isProjectBuildExe("/Applications/AiverseEditor.app/Contents/MacOS/AiverseEditor"));
 
@@ -16119,6 +16753,16 @@ TEST(native_editor_build_helpers) {
     fs::remove_all(root);
     fs::create_directories(root / "proj" / "native");
     fs::create_directories(root / "proj" / "Builds" / ".temp" / "editor-linux" / "gen");
+    for (const std::string host : {"macos", "windows"}) {
+        const fs::path cache = fs::path(nativeBuildDir((root / "proj").string(), host)) / "CMakeCache.txt";
+        fs::create_directories(cache.parent_path());
+        std::ofstream(cache) << "CMAKE_GENERATOR:INTERNAL=Ninja Multi-Config\n";
+        auto cached = planNativeBuild(eng, (root / "proj").string(), host, "cmake", "ninja", true, 1);
+        CHECK(fs::path(cached.launchTarget).parent_path().filename() == "Release");
+        std::ofstream(cache) << "CMAKE_GENERATOR:INTERNAL=Unix Makefiles\n";
+        cached = planNativeBuild(eng, (root / "proj").string(), host, "cmake", "", true, 1);
+        CHECK(fs::path(cached.launchTarget).parent_path().filename() == "studio-native");
+    }
     auto touch = [](const fs::path& f, int ageSec) {
         std::ofstream(f) << "x";
         fs::last_write_time(f, fs::file_time_type::clock::now() - std::chrono::seconds(ageSec));
@@ -16134,6 +16778,8 @@ TEST(native_editor_build_helpers) {
     std::ofstream(fs::path(bd) / "gen" / "NativeRegistry.cpp") << "#include \"x\"\n    result.push_back({\"income\", 1u, &::createIncomeModule});\n";
     CHECK((nativeBuildModules(bd) == std::vector<std::string>{"income"}));
     CHECK(nativeBuildHasModules(bd, {"income"}) && !nativeBuildHasModules(bd, {"income", "openwar"}, &why) && why.find("openwar") != std::string::npos);
+    std::ofstream(fs::path(bd) / "gen" / "NativeRegistry.cpp") << "    {\"income\", 1u, &::createIncomeModule},\n";
+    CHECK(nativeBuildHasModules(bd, {"income"}));
     touch(root / "proj" / "native" / "Income.cpp", 10);    // sources edited after the build
     CHECK(!nativeBuildUpToDate(bin.string(), proj, engine.string(), &why) && why.find("Income.cpp") != std::string::npos);
     touch(root / "proj" / "native" / "Income.cpp", 300);
@@ -17603,7 +18249,7 @@ TEST(game_wizard_makes_a_playable_project) {
     Json m = Json::parseFile((dir / "game.json").string());
     CHECK(m["maps"].size() == 3 + Json::parse(readSource("templates/skirmish/game.json"))["maps"].size() && m["maps"][0].getStr("file") == "maps/wiz_level_1.json" && m["maps"][2].getStr("file") == "maps/wiz_tutorial.json");
     CHECK(m.getStr("name") == "Wizard Test" && m["store"]["products"].size() == 3 && m["ads"].isObject() && m["plugins"].has("mock-ads"));
-    CHECK(m["icons"].getStr("default") == "branding/wiz_icon.png" && m["splash"].getStr("image") == "art/key_art.png");
+    CHECK(m["icons"].getStr("default") == "branding/wiz_icon.png" && m["splash"].getStr("image") == "content/art/key_art.png");
     Json lv = Json::parseFile((dir / "maps/wiz_level_1.json").string());
     CHECK(lv["generate"].getStr("preset") == "classic" && lv["generate"].getStr("template") == "maps/valley.json");
     // the tutorial: steps from the rules, its scripts, hidden panel commands
@@ -17624,7 +18270,7 @@ TEST(game_wizard_makes_a_playable_project) {
     Json sj = Json::parseFile((dir / "ui/screens.json").string());
     CHECK(sj.getStr("start") == "home" && sj.getStr("afterMatch") == "result");
     for (const char* f : {"ui/screens/home.rml", "ui/screens/levels.rml", "ui/screens/upgrades.rml", "ui/screens/result.rml", "ui/wizard_meta.lua",
-                          "ui/hud/wiz_tutorial.rml", "ui/hud/wiz_hint.rml", "ui/main.lua", "WIZARD.md", "art/key_art.png", "docs/gdd.md"})
+                          "ui/hud/wiz_tutorial.rml", "ui/hud/wiz_hint.rml", "ui/main.lua", "WIZARD.md", "content/art/key_art.png", "docs/gdd.md"})
         CHECK(fs::exists(dir / f));
     Json ru = Json::parseFile((dir / "lang/ru.json").string());
     CHECK(ru.getStr("game.name") == "Wizard Test" && ru.has("wiz.tut.gather") && ru.has("wiz.hint.camera") && ru.has("wiz.levels"));
@@ -18213,3 +18859,359 @@ TEST(native_build_drops_cache_of_another_engine_folder) {
     fs::remove_all(bd);
 }
 #endif   // AIVERSE_TESTS_EDITOR_CORE
+
+#include "engine/view/ProjectilePresentation.h"
+TEST(projectile_presentation_segment_origin_and_shared_sample) {
+    using namespace aiverse;
+    view::ProjectilePresentation a, b;
+    const view::FlightSegment emission{1, view::FlightOrigin::Emission, {0,0,0}};
+    a.begin(emission, {0,2,0}); b.begin(emission, {0,2,0});
+    a.evaluate({1,0,0}, {1,0,0}, .1f);
+    a.evaluate({2,0,0}, {1,0,0}, .2f);
+    b.evaluate({2,0,0}, {1,0,0}, .2f);
+    CHECK(render::length(a.sample().position-b.sample().position)<1e-6f);
+    for(auto origin : {view::FlightOrigin::Split, view::FlightOrigin::Ricochet}) {
+        a.begin({2,origin,{4,1,0}}, {0,2,0});
+        a.evaluate({5,1,0}, {1,0,0}, .01f);
+        CHECK(render::length(a.sample().position-render::float3{5,1,0})<1e-6f);
+    }
+    a.finish({6,1,0});
+    a.evaluate({99,0,0}, {1,0,0}, 5.f);
+    CHECK(a.sample().terminal);
+    CHECK(render::length(a.sample().position-render::float3{6,1,0})<1e-6f);
+    a.begin(emission,{0,2,0});
+    a.evaluateStraight({10,0,0},{10,1,0});
+    CHECK(render::length(a.sample().position-render::float3{10,1,0})<1e-6f);
+    CHECK(!a.sample().terminal);
+}
+
+TEST(projectile_origin_versioned_archive) {
+    using namespace aiverse;
+    projectile::State state;
+    state.origin = projectile::FlightOrigin::Ricochet;
+    state.enabled = true;
+    state.age = Fixed::fromRatio(1,2);
+    for(uint32_t version : {12u,13u}) {
+        std::string bytes;
+        Archive out(&bytes); out.formatVersion=version; out(state);
+        CHECK(out.ok());
+        projectile::State restored;
+        Archive in(bytes); in.formatVersion=version; in(restored);
+        CHECK(in.ok() && in.remaining()==0);
+        CHECK(restored.age==state.age);
+        CHECK(restored.origin==(version==13 ? projectile::FlightOrigin::Ricochet : projectile::FlightOrigin::Unknown));
+    }
+    std::string corrupt;
+    Archive out(&corrupt); out.formatVersion=13; out(state);
+    corrupt.back()=char(255);
+    projectile::State restored;
+    Archive in(corrupt); in.formatVersion=13; in(restored);
+    CHECK(!in.ok());
+}
+
+TEST(projectile_shared_branch_provenance) {
+    using namespace aiverse;
+    projectile::ProjectileFlight flight;
+    flight.enabled=true;
+    projectile::ProjectileModifier modifier;
+    modifier.kind=projectile::ProjectileModKind::Split;
+    modifier.count=2;
+    modifier.timed=true;
+    flight.modifiers.push_back(modifier);
+    projectile::State parent;
+    Fixed speed=1_fx;
+    projectile::initialize(parent,speed,flight,{1_fx,Fixed{},Fixed{}});
+    int children=0;
+    projectile::split(parent,speed,flight,0,{Fixed{},1_fx,Fixed{}},[&](projectile::Branch child) {
+        ++children;
+        CHECK(child.state.origin==projectile::FlightOrigin::Split);
+    });
+    CHECK(children==2);
+    CHECK(parent.origin==projectile::FlightOrigin::Emission);
+    flight.modifiers[0].kind=projectile::ProjectileModKind::Ricochet;
+    projectile::initialize(parent,speed,flight,{1_fx,Fixed{},Fixed{}});
+    auto child=projectile::contact(parent,speed,flight,[](size_t){},[](Fixed)->std::optional<projectile::Target> {
+        return projectile::Target{Entity{1,1},{Fixed{},Fixed{},1_fx}};
+    });
+    CHECK(child.has_value());
+    if(child)CHECK(child->state.origin==projectile::FlightOrigin::Ricochet);
+    CHECK(parent.origin==projectile::FlightOrigin::Emission);
+}
+
+TEST(fx_finish_consumes_last_motion_once) {
+    fx::ParticleSystem ps;
+    ps.setQuality(fx::FxQuality::High);
+    ps.init(nullptr);
+    int id=ps.define("finish-path",fxParse(R"({"emitters":[{"perMeter":10,"loop":true,"life":1,"speed":0}]})"));
+    auto h=ps.play(id,{0,0,0});
+    ps.finish(h,{1,0,0});
+    ps.finish(h,{9,0,0}); // repeated finish and late moves cannot change the endpoint
+    ps.move(h,{8,0,0});
+    ps.update(.01f);
+    std::vector<fx::FxParticleInfo> particles;
+    ps.snapshot(particles);
+    CHECK(particles.size()==10);
+    CHECK(std::any_of(particles.begin(),particles.end(),[](const auto& p){return aiverse::render::length(p.pos-aiverse::render::float3{1,0,0})<1e-5f;}));
+    CHECK(!ps.playing(h));
+    const auto count=particles.size();
+    ps.update(.01f);ps.snapshot(particles);
+    CHECK(particles.size()==count);
+    ps.kill(h);
+    ps.finish(h,{99,0,0}); // stale handle is safe
+}
+
+TEST(fx_motion_finished_without_rendered_entity) {
+    auto sim=makeSimJson(R"({"types":{"unit":{}}})",flatMap(12,12,""));
+    fx::ParticleSystem ps; ps.setQuality(fx::FxQuality::High); CHECK(ps.init(nullptr));
+    CHECK(ps.define("terminal-trail",fxParse(R"({"emitters":[{"perMeter":10,"loop":true,"life":1,"speed":0}]})"))>=0);
+    game::GameFx bridge;
+    CHECK(bridge.init(ps,mod(*sim).rules(),Json::parse(R"({"events":{"trail":"terminal-trail"}})")));
+    sim->addSystem("test.motion.finished",[](Simulation& s){
+        auto event=SimEvent::motionFinished(Entity{9000,1},{1_fx,Fixed{},Fixed{}});
+        event.motion=std::make_shared<const MotionPathPresentation>(MotionPathPresentation{{},false});
+        s.emit(event);
+    });
+    bridge.attach(*sim,0); sim->step();
+    bridge.update(*sim,nullptr); ps.update(.01f);
+    std::vector<fx::FxParticleInfo> particles; ps.snapshot(particles);
+    CHECK(particles.size()==10);
+    CHECK(std::any_of(particles.begin(),particles.end(),[](const auto& p){return aiverse::render::length(p.pos-aiverse::render::float3{1,0,0})<1e-5f;}));
+    bridge.update(*sim,nullptr);ps.update(.01f);ps.snapshot(particles);
+    CHECK(particles.size()==10);
+}
+
+#include "engine/mechanics/AttackTiming.h"
+TEST(attack_phase_fractional_time_is_conserved) {
+    using namespace aiverse;
+    using namespace lib::mechanics;
+    AttackTimingState state;
+    beginAttackWindup(state,Entity{1,1},Fixed::fromRatio(3,100));
+    const Fixed tick=Fixed::fromRatio(5,100);
+    auto step=consumeAttackPhase(state,tick);
+    CHECK(step.complete);
+    CHECK(step.unused==tick-Fixed::fromRatio(3,100));
+    Fixed cooldown=Fixed::fromRatio(1,100);
+    commitAttackRelease(state,Fixed::fromRatio(15,1000));
+    auto rest=consumeAttackRest(state,cooldown,step.unused);
+    CHECK(rest.recoveryCompleted && state.phase==WeaponAttackPhase::Idle);
+    CHECK(rest.available==step.unused-Fixed::fromRatio(15,1000));
+    CHECK(cooldown==Fixed{});
+    beginAttackWindup(state,Entity{1,1},Fixed::fromRatio(3,100));
+    step=consumeAttackPhase(state,rest.available);
+    CHECK(!step.complete && step.unused==Fixed{});
+    CHECK(state.remaining==Fixed::fromRatio(3,100)-rest.available);
+}
+
+TEST(precise_windup_cooldown_preserves_authored_period) {
+    using namespace aiverse;
+    auto map=Json::parse(flatMap(12,12,""));
+    map.set("entities",Json::parse(R"([{"type":"shooter","owner":1,"pos":[2,2]},{"type":"target","owner":2,"pos":[4,2]}])"));
+    auto sim=makeSimJson(R"({"types":{"shooter":{"weapons":[{"range":8,"damage":1,"cooldown":0.02,"windup":0.3,"preciseCooldown":true}]},"target":{"health":{"max":100000}}}})",map.dump());
+    Entity shooter,target;
+    sim->world().each<game::Unit>([&](Entity e,const auto&){if(sim->world().has<game::Combat>(e))shooter=e;else target=e;});
+    CHECK(shooter.valid()&&target.valid());
+    if(!shooter.valid()||!target.valid())return;
+    auto& combat=sim->world().get<game::Combat>(shooter);combat.target=target;combat.autoTarget=false;
+    int releases=0;
+    for(int tick=0;tick<200;++tick){sim->step();for(const auto& event:sim->events())if(event.a==shooter&&event.type==game::kEvAttackReleased)++releases;}
+    const auto elapsed=sim->dt()*200;
+    const auto period=Fixed::fromRatio(3,10)+Fixed::fromRatio(2,100);
+    CHECK(releases==int(((elapsed-Fixed::fromRatio(3,10))/period).floorInt())+1);
+    const auto saved=sim->serialize(); CHECK(!saved.empty());
+    for(int i=0;i<30;++i)sim->step();
+    const auto expected=sim->checksum();
+    std::string error;
+    CHECK(sim->deserialize(saved,&error));
+    for(int i=0;i<30;++i)sim->step();
+    CHECK(sim->checksum()==expected);
+
+}
+
+TEST(precise_windup_subtick_recovery_and_cancellation) {
+    using namespace aiverse;
+    using namespace lib::mechanics;
+    auto map=Json::parse(flatMap(12,12,""));
+    map.set("entities",Json::parse(R"([{"type":"shooter","owner":1,"pos":[2,2]},{"type":"target","owner":2,"pos":[4,2]}])"));
+    auto make=[&](const char* weapon) {
+        return makeSimJson(std::string(R"({"types":{"shooter":{"weapons":[)")+weapon+R"(]},"target":{"health":{"max":100000}}}})",map.dump());
+    };
+    auto entities=[](Simulation& sim) {
+        std::pair<Entity,Entity> pair;
+        sim.world().each<game::Unit>([&](Entity e,const auto&){if(sim.world().has<game::Combat>(e))pair.first=e;else pair.second=e;});
+        return pair;
+    };
+    auto count=[](Simulation& sim,Entity shooter,uint16_t kind) {
+        return std::count_if(sim.events().begin(),sim.events().end(),[&](const auto& e){return e.a==shooter&&e.type==kind;});
+    };
+    // Recovery and cooldown overlap; their maximum, not sum, sets the period.
+    auto sim=make(R"({"range":8,"damage":1,"cooldown":0.005,"windup":0.005,"backswing":0.01,"preciseCooldown":true})");
+    auto [shooter,target]=entities(*sim);
+    auto& combat=sim->world().get<game::Combat>(shooter);combat.target=target;combat.autoTarget=false;
+    const Fixed windup=Fixed::fromRatio(5,1000), rest=Fixed::fromRatio(1,100);
+    int releases=0;
+    for(int tick=1;tick<=20;++tick) {
+        sim->step();
+        const int thisTick=int(count(*sim,shooter,game::kEvAttackReleased));
+        if(tick==1)CHECK(thisTick>1);
+        releases+=thisTick;
+        const auto elapsed=sim->dt()*tick;
+        CHECK(releases==int(((elapsed-windup)/(windup+rest)).floorInt())+1);
+    }
+    // An out-of-range tick cancels the current windup, with no release or
+    // stored time credit; reacquiring the target requires a full fresh windup.
+    sim=make(R"({"range":3,"damage":1,"cooldown":0.02,"windup":0.3,"preciseCooldown":true})");
+    std::tie(shooter,target)=entities(*sim);
+    auto& c=sim->world().get<game::Combat>(shooter);c.target=target;c.autoTarget=false;
+    sim->step();
+    CHECK(c.attackTiming[0].phase==WeaponAttackPhase::Windup);
+    CHECK(count(*sim,shooter,game::kEvAttackReleased)==0);
+    auto& position=sim->world().get<Transform>(target).pos;
+    const auto original=position;position.x=Fixed::fromInt(10);
+    sim->step();
+    CHECK(c.attackTiming[0].phase==WeaponAttackPhase::Idle);
+    CHECK(count(*sim,shooter,game::kEvAttackCancelled)==1);
+    CHECK(count(*sim,shooter,game::kEvAttackReleased)==0);
+    for(int i=0;i<10;++i)sim->step();
+    position=original;c.target=target;
+    Fixed elapsed{};bool released=false;
+    for(int i=0;i<20&&!released;++i) {
+        sim->step();elapsed+=sim->dt();
+        released=count(*sim,shooter,game::kEvAttackReleased)>0;
+        CHECK(released==(elapsed>=Fixed::fromRatio(3,10)));
+    }
+    CHECK(released);
+}
+
+#include "engine/view/MapProjection.h"
+#include <limits>
+TEST(map_projection_crop_roundtrip_and_frame) {
+    using namespace aiverse;
+    view::MapProjection projection;
+    CHECK(projection.set(10,20,30,60));
+    const auto point=projection.point(.25f,.75f);
+    const auto uv=projection.uv(point.x,point.z);
+    CHECK(std::abs(uv.x-.25f)<1e-6f&&std::abs(uv.y-.75f)<1e-6f);
+    CHECK(!projection.intersects(2,30,1));
+    CHECK(!projection.set(20,20,10,30));
+    CHECK(!projection.set(-3.0e38f,0,3.0e38f,1));
+    CHECK(!projection.set(0,0,std::numeric_limits<float>::infinity(),1));
+    CHECK(projection.left==10&&projection.bottom==60);
+    view::MapProjection grid; CHECK(grid.set(0,0,24,40));
+    CHECK(projection.clipTo(grid));
+    CHECK(projection.left==10&&projection.right==24&&projection.bottom==40);
+    const render::float3 quad[4]={{10,0,20},{20,0,20},{24,0,40},{8,0,40}};
+    const auto rectangle=view::MapProjection::rectangularFrame(quad);
+    CHECK(rectangle[0].x==8&&rectangle[1].x==24&&rectangle[2].z==40);
+}
+
+#include "engine/view/game/PlanarMinimap.h"
+// The game HUD and the Studio overlay preview share one minimap raster: authored
+// bounds crop it, invalid scene types are skipped and view.minimap=false hides a type.
+TEST(planar_minimap_shared_bounds_and_scene_guards) {
+    using namespace aiverse;
+    game::MapGrid grid; grid.init(40,20);
+    for (auto& f : grid.flags) f = game::kCellGround;
+    auto layout=game::minimap::resolveLayout(Json::parse(R"({"minimap":{"bounds":[10,0,30,20],"cameraFrame":"rectangle"}})"),Json::object(),40,20);
+    CHECK(layout.bounds.left==10&&layout.bounds.right==30&&layout.rectangle);
+    // The map value wins over game.json; bounds outside the grid are clipped.
+    layout=game::minimap::resolveLayout(Json::object(),Json::parse(R"({"minimap":{"bounds":[-5,0,20,50]}})"),40,20);
+    CHECK(layout.bounds.left==0&&layout.bounds.right==20&&layout.bounds.bottom==20&&!layout.rectangle);
+    bool rejected=false;
+    try { (void)game::minimap::resolveLayout(Json::parse(R"({"minimap":{"bounds":[50,0,60,10]}})"),Json::object(),40,20); }
+    catch (const std::runtime_error&) { rejected=true; }
+    CHECK(rejected);
+    rejected=false;
+    try { (void)game::minimap::resolveLayout(Json::object(),Json::object(),0,0); } catch (const std::runtime_error&) { rejected=true; }
+    CHECK(rejected);
+    const auto raster=game::minimap::build(grid,layout,{},0,0);
+    CHECK(raster.width==raster.height&&raster.width>0&&raster.base.size()==size_t(raster.width)*size_t(raster.height));
+    game::Rules rules=game::loadRules(Json::parse(R"({"types":{"hidden":{"view":{"minimap":false}},"shown":{}}})"));
+    game::GameScene scene;
+    game::SceneObject bad; bad.type=uint16_t(rules.types.size()+5); bad.pos={5,0,5}; bad.visible=true;
+    game::SceneObject hidden; hidden.type=uint16_t(rules.findType("hidden")); hidden.owner=1; hidden.pos={5,0,5}; hidden.visible=true;
+    scene.objects={bad,hidden};
+    std::vector<uint32_t> pixels;
+    game::minimap::rasterize(raster,grid,rules,scene,nullptr,nullptr,nullptr,pixels);
+    CHECK(pixels==raster.base);
+    game::SceneObject shown=hidden; shown.type=uint16_t(rules.findType("shown")); shown.pos={5,0,5};
+    scene.objects={shown};
+    game::minimap::rasterize(raster,grid,rules,scene,nullptr,nullptr,nullptr,pixels);
+    CHECK(pixels!=raster.base);
+}
+
+#include "engine/view/PortraitOptions.h"
+TEST(portrait_options_inheritance_and_background) {
+    using namespace aiverse;
+    const auto defaults=Json::parse(R"({"model":"models/portrait.glb","zoom":2,"background":[0.1,0.2,0.3]})");
+    const render::float4 player{.8f,.1f,.2f,1};
+    auto look=view::PortraitOptions::resolve(Json::parse(R"({"background":"player","focusHeight":0.7})"),defaults,player);
+    CHECK(look.model=="models/portrait.glb" && look.zoom==2);
+    CHECK(look.background.x==player.x && look.background.y==player.y);
+    CHECK(std::abs(look.focusHeight-.7f)<1e-6f);
+    look=view::PortraitOptions::resolve(Json::parse(R"({"model":"","zoom":99,"background":[1,"bad",0]})"),defaults,player);
+    CHECK(look.model.empty() && look.zoom==8);
+    CHECK(std::abs(look.background.x-.1f)<1e-6f && look.background.w==1);
+    look=view::PortraitOptions::resolve(Json::parse(R"({"background":[0,0,0,0.5]})"),Json{},player);
+    CHECK(look.background.w==.5f);
+}
+
+TEST(model_material_additive_policy) {
+    using namespace aiverse::render;
+    auto mode=AlphaMode::Opaque;
+    CHECK(parseMaterialBlend("additive",mode));
+    CHECK(alphaBlended(mode) && materialBlendMode(mode)==aiverse::gfx::BlendMode::Additive);
+    CHECK(parseMaterialBlend("additive-unweighted",mode));
+    CHECK(alphaBlended(mode) && materialBlendMode(mode)==aiverse::gfx::BlendMode::AdditiveUnweighted);
+    CHECK(!parseMaterialBlend("invalid",mode));
+    CHECK(mode==AlphaMode::AdditiveUnweighted);
+    CHECK(!alphaBlended(AlphaMode::Mask) && !alphaBlended(AlphaMode::Opaque));
+}
+
+TEST(particle_blend_space_roundtrip_and_trail_override) {
+    auto effect=fxParse(R"({"emitters":[{"burst":1,"blendSpace":"display","trail":{"blendSpace":"linear"}}]})");
+    CHECK(effect.emitters[0].blendSpace==fx::FxBlendSpace::Display);
+    CHECK(effect.emitters[0].trail.blendSpace==fx::FxBlendSpace::Linear);
+    auto roundtrip=fxParse(fx::effectToJson(effect).dump().c_str());
+    CHECK(roundtrip.emitters[0].blendSpace==effect.emitters[0].blendSpace);
+    CHECK(roundtrip.emitters[0].trail==effect.emitters[0].trail);
+    CHECK(!fx::effectToJson(effect)["emitters"][size_t(0)]["trail"].has("time"));
+    effect=fxParse(R"({"emitters":[{"burst":1,"blendSpace":"display","trail":{"time":0.5,"blendSpace":"linear"}}]})");
+    roundtrip=fxParse(fx::effectToJson(effect).dump().c_str());
+    CHECK(roundtrip.emitters[0].trail==effect.emitters[0].trail);
+    effect=fxParse(R"({"emitters":[{"burst":1,"blendSpace":"display","trail":{}}]})");
+    CHECK(effect.emitters[0].trail.blendSpace==fx::FxBlendSpace::Display);
+}
+
+TEST(models_mdl_preserves_additive_layers) {
+    using namespace mdxtest;
+    using namespace aiverse::render;
+    std::string text=kMdl;
+    const std::string layer="Layer { FilterMode Transparent, TwoSided, static TextureID 0, }";
+    const auto at=text.find(layer);CHECK(at!=std::string::npos);if(at==std::string::npos)return;
+    text.replace(at,layer.size(),layer+"\n Layer { FilterMode AddAlpha, static TextureID 0, static Alpha 0.5, }");
+    auto model=loadModel("units/guy/guy.mdl",modeltest::mapReader({{"units/guy/guy.mdl",text},{"units/Textures/Guy.blp",paletted2x2()}}),nullptr);
+    bool found=false;
+    for(const auto& mesh:model->meshes)for(size_t i=1;i<mesh.primitives.size();++i) {
+        const auto& overlay=mesh.primitives[i];const auto& base=mesh.primitives[i-1];
+        const auto& material=model->materials[size_t(overlay.material)];
+        if(material.alpha!=AlphaMode::Additive)continue;
+        found=true;
+        CHECK(overlay.firstIndex==base.firstIndex && overlay.indexCount==base.indexCount);
+        CHECK(overlay.firstVertex==base.firstVertex && overlay.vertexCount==base.vertexCount);
+        CHECK(std::abs(material.baseColor.w-.5f)<1e-6f && !material.castShadow);
+    }
+    CHECK(found);
+}
+
+#ifdef AIVERSE_TESTS_EDITOR_CORE
+#include "apps/editor/core/MaterialOps.h"
+TEST(materials_additive_authoring_validation) {
+    for (const char* mode : {"opaque", "mask", "blend", "alpha", "additive", "additive-unweighted"}) {
+        Json material = Json::object();
+        material.set("alpha", Json::string(mode));
+        CHECK(editor::checkMaterial(material).empty());
+    }
+    CHECK(!editor::checkMaterial(Json::parse(R"({"alpha":"unsupported"})")).empty());
+    CHECK(!editor::checkMaterial(Json::parse(R"({"alpha":1})")).empty());
+}
+#endif

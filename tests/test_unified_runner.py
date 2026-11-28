@@ -29,6 +29,8 @@ class UnifiedRunnerTests(unittest.TestCase):
         )
         self.bin_dir = self.root / "fake-bin"
         self.bin_dir.mkdir()
+        # Fake-tool tests exercise the portable runner without a real disk.
+        self.write_tool("uname", "#!/usr/bin/env bash\necho Linux\n")
         self.write_tool("ctest",
             "#!/usr/bin/env bash\n"
             "printf 'FAKE_CTEST_ARGS:%s\\n' \"$*\"\n"
@@ -58,6 +60,15 @@ class UnifiedRunnerTests(unittest.TestCase):
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False,
         )
 
+    def test_local_mac_missing_kingston_stops_before_tools(self):
+        self.write_tool("uname", "#!/usr/bin/env bash\necho Darwin\n")
+        self.write_tool("mount", "#!/usr/bin/env bash\nexit 0\n")
+        result = self.invoke("--quick", extras={"GITHUB_ACTIONS": ""})
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertIn("KINGSTON is not mounted and writable", result.stdout)
+        self.assertNotIn("FAKE_CMAKE_ARGS", result.stdout)
+        self.assertNotIn("FAKE_CTEST_ARGS", result.stdout)
+
     def test_bash_syntax(self):
         subprocess.run(["bash", "-n", str(self.root / "run-tests.sh")], check=True)
 
@@ -76,6 +87,14 @@ class UnifiedRunnerTests(unittest.TestCase):
         self.assertIn("FAKE_EXTRA_PASSED", result.stdout)
         self.assertIn("PASS extra-sample", result.stdout)
         self.assertTrue(list((self.root / "build/fixture/test-reports").glob("*/summary.txt")))
+
+    def test_python_suite_uses_configured_interpreter(self):
+        self.write_tool("configured python", "#!/bin/sh\necho CONFIGURED_PYTHON\n")
+        (self.root / "build/fixture/test-python.txt").write_text(str(self.bin_dir / "configured python") + "\n")
+        (self.root / "tests/extra-test-suites.txt").write_text("sample|python3|tests/sample.sh|\n")
+        result = self.invoke("--no-build")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("CONFIGURED_PYTHON", result.stdout)
 
     def test_ctest_failure_is_reported_without_hiding_extras(self):
         result = self.invoke("--no-build", extras={"FAKE_CTEST_EXIT": "7"})

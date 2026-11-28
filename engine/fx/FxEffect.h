@@ -90,6 +90,7 @@
 //   "forceFields": [{ "position": [0, 1, 0], "shape": "sphere" | "cylinder", "radius": 5, "startRadius": 0, "length": 4,
 //                     "direction": [0, 0, 0], "gravity": 2, "gravityFocus": 0, "rotation": 90, "rotationAttraction": 0.5, "drag": 0 }]
 #pragma once
+#include "SpectraSdfBinary.h"
 #include <cstdint>
 #include <string>
 #include <utility>
@@ -105,6 +106,7 @@ using render::float4;
 
 enum class FxQuality : uint8_t { Off, Low, Medium, High };
 enum class FxBlend : uint8_t { Alpha, Additive, Premultiplied, Multiply, Subtract, Opaque };
+enum class FxBlendSpace : uint8_t { Linear, Display };
 enum class FxAlign : uint8_t { Camera, Velocity, Ground, Upright, World, Local };
 enum class FxShape : uint8_t { Point, Sphere, Disc, Ring, Hemisphere, Cone, Box, Line, Donut, Mesh };
 enum class FxSubEvent : uint8_t { Birth, Death, Collision, Trigger, Manual };
@@ -172,6 +174,7 @@ struct FxTrail {
     FxTextureMode textureMode = FxTextureMode::Stretch;
     bool dieWithParticles = true;               // false: the trail fades out on its own after the particle died
     FxQuality minQuality = FxQuality::Medium;   // ribbons are the first thing to go on weak GPUs
+    FxBlendSpace blendSpace = FxBlendSpace::Linear;
     bool operator==(const FxTrail&) const;
 };
 struct FxLight {
@@ -189,6 +192,11 @@ struct FxCollision {
     bool ground = true;                         // the terrain (setGroundHeight) + "height"
     std::vector<FxPlane> planes;                // effect space
     float radius = 0;                           // particle radius as a share of its size (Unity radius scale)
+    bool scene = false;                         // opt-in host swept collision provider
+    float staticSphereRadius=0;                // 0 disables analytic SDF obstacle
+    float3 staticSphereCenter{0,0,0};           // particle simulation space, not emitter space
+    StaticSdfVolume staticSdf;
+    std::string staticSdfAsset; // resolved source path; required for large-volume JSON export
 };
 struct FxNoise {
     FxRange strength{0, 0};                     // over the lifetime
@@ -328,23 +336,43 @@ struct EmitterDef {
     std::vector<std::string> meshes;           // draw particles as these meshes (random per particle)
     bool ringBuffer = false;                   // with maxParticles: old particles stay until replaced
     FxTriggerDef trigger;
+    FxBlendSpace blendSpace = FxBlendSpace::Linear;
 
     bool continuous() const { return rate.max > 0 || rate.curved() || perMeter.max > 0 || perMeter.curved(); }
     float endTime() const;  // when this emitter stops creating particles (loop: infinity)
 };
 
+struct ModelMaterialTrack {
+    std::string material;
+    std::vector<FxColorKey> color;
+    float2 uvSpeed{};
+    std::vector<std::string> textures;
+    std::string blend; // empty inherits the source material
+};
+struct AnimatedModelEffect {
+    std::string source, clip;
+    float duration = 1;
+    bool loop = false;
+    bool castShadow = true;
+    std::vector<ModelMaterialTrack> materials;
+};
+
 struct EffectDef {
     std::vector<EmitterDef> emitters;
     std::vector<FxForceField> forceFields;
+    AnimatedModelEffect model;
     bool looping() const;   // any looping emitter: lives until stop()
     float lifetime() const; // longest time until the last particle dies (looping: infinity)
 };
 
 // Parses an effect. `where` prefixes error messages ("fx/boom.json"). Returns false on errors;
 // `out` is still filled with everything that parsed.
-bool parseEffect(const Json& j, const std::string& where, EffectDef& out, std::vector<std::string>& errors);
+bool parseEffect(const Json& j, const std::string& where, EffectDef& out, std::vector<std::string>& errors,
+                 const SdfResourceReader& sdfReader = {});
 // Writes only the fields that differ from the defaults, in a stable order (editor save, diffs).
-Json effectToJson(const EffectDef& def);
+// includeSdf=false is internal structural comparison only, not a save format.
+// High-resolution volumes require a valid source path; otherwise export throws.
+Json effectToJson(const EffectDef& def,bool includeSdf=true);
 
 bool parseColor(const Json& j, float4& out);  // "#rrggbb", "#rrggbbaa" or [r, g, b(, a)] in 0..1
 std::string colorToHex(float4 c);

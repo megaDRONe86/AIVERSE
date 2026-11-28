@@ -24,6 +24,8 @@ import sys
 import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from web_demos import copy_web_demos
+
 ROOT = Path(__file__).resolve().parents[2]
 DEVLOG = ROOT / 'docs/devlog'
 ENTRIES = DEVLOG / 'entries'
@@ -426,7 +428,7 @@ def check_releases():
     return errors
 
 
-from render import (Ctx, ROOT_LANG, MENU_SPY_JS, roadmap_lines, FEATURE_JS, DOCS_SEARCH_JS, doc_sections, GALLERY_JS, gallery_page, CATALOG_JS, catalog_page, MARK_LIGHT, RELEASES_JS, ROADMAP_JS, TRACK_JS, BLOG_JS, Converter, blog_page, devblog_page, feature_page, docs_index, doc_page, esc, localized_entries,  # noqa: E402
+from render import (Ctx, ROOT_LANG, MENU_SPY_JS, roadmap_lines, FEATURE_JS, DOCS_SEARCH_JS, doc_sections, GALLERY_JS, gallery_page, CATALOG_JS, catalog_page, MARK_LIGHT, RELEASES_JS, ROADMAP_JS, TRACK_JS, Converter, devblog_page, feature_page, docs_index, doc_page, esc, localized_entries,  # noqa: E402
                     release_chip, releases_page, render_page, roadmap_page, showcase_html, system_page,
                     systems_html, core_html, fill_tokens)
 
@@ -515,6 +517,11 @@ def cmd_build(args):
         shutil.rmtree(out)
     shutil.copytree(SITE, out, ignore=shutil.ignore_patterns('manifest.json', 'docs.json', '_layout.html', 'i18n', '.DS_Store'))
     manifest = json.loads((SITE / 'manifest.json').read_text(encoding='utf-8'))
+    try:
+        copy_web_demos(manifest.get('webDemos', {}), out, args.demo_root, ROOT)
+    except (OSError, ValueError) as exc:
+        print(f'error: {exc}', file=sys.stderr)
+        return 1
     copied = set()
 
     def copy_media(rel):
@@ -577,7 +584,7 @@ def cmd_build(args):
                 sys.exit(f'site page missing: {f.relative_to(out)}')
             text = fill_tokens(f.read_text(encoding='utf-8'), ctx, name)
             # One menu for every page: the static pages take the header of _layout.html, so a new
-            # menu item (gallery, blog, ...) cannot go missing from them.
+            # menu item (gallery, roadmap, ...) cannot go missing from them.
             head_re = re.compile(r'<header class="top">.*?</header>', re.S)
             shared = head_re.search(fill_tokens(layout, ctx, name)).group(0)
             nav_id = 'devlog' if name == 'devlog.html' else None
@@ -602,7 +609,7 @@ def cmd_build(args):
         for s in paged:
             body = system_page(s, paged, loc_entries, ctx, manifest['repoBlob'], doc_pages)
             (d / f'system-{s["id"]}.html').write_text(render_page(
-                layout, ctx, f'system-{s["id"]}.html', f'{ctx.loc(s, "name")} — {ctx.loc(s, "tagline")} · AIVERSE',
+                layout, ctx, f'system-{s["id"]}.html', f'{ctx.loc(s, "name")} — {ctx.loc(s, "tagline")} | AIVERSE',
                 ctx.loc(s, 'essence'), body, nav='systems', script=TRACK_JS), encoding='utf-8')
             pages += 1
             for it in s['includes']:
@@ -635,14 +642,15 @@ def cmd_build(args):
                         body_html = f'<p class="doc-note">{esc(T["incRuOnly"])}</p>' + body_html
                 name = f'system-{s["id"]}-{it["id"]}.html'
                 (d / name).write_text(render_page(
-                    layout, ctx, name, f'{ctx.loc(it, "name")} — {s["name"]} · AIVERSE', ctx.loc(it, 'text'),
+                    layout, ctx, name, f'{ctx.loc(it, "name")} — {s["name"]} | AIVERSE', ctx.loc(it, 'text'),
                     feature_page(s, it, body_html, ctx), nav='systems', script=FEATURE_JS), encoding='utf-8')
                 pages += 1
-        flag_ids = {s['id'] for s in flagships}
-        blog = [e for e in loc_entries if e['system'] not in flag_ids]
-        (d / 'blog.html').write_text(render_page(
-            layout, ctx, 'blog.html', f'{T["blogHubTitle"]} · AIVERSE', T['blogHubLead'],
-            blog_page(blog, systems, ctx), nav='blog', script=FEATURE_JS + BLOG_JS), encoding='utf-8')
+        # Keep bookmarked posts and topic filters in the same language.
+        (d / 'blog.html').write_text(
+            f'<!doctype html><html lang="{lang}"><meta charset="utf-8"><title>{T["navDevlog"]}</title>'
+            '<script>location.replace("devlog.html" + location.search + location.hash.replace(/^#topic=/, "#system="));</script>'
+            '<meta http-equiv="refresh" content="0;url=devlog.html">'
+            f'<a href="devlog.html">{T["navDevlog"]}</a></html>', encoding='utf-8')
         pages += 1
         for s in systems:
             mine = [e for e in loc_entries if e['system'] == s['id']]
@@ -650,15 +658,15 @@ def cmd_build(args):
                 continue
             name = f'devblog-{s["id"]}.html'
             (d / name).write_text(render_page(
-                layout, ctx, name, f'{T["blogTitle"]}: {s["name"]} · AIVERSE', T['blogLead'].format(s=s['name']),
+                layout, ctx, name, f'{T["blogTitle"]}: {s["name"]} | AIVERSE', T['blogLead'].format(s=s['name']),
                 devblog_page(s, mine, ctx, s['id'] in {p['id'] for p in paged}), nav='devlog', script=FEATURE_JS), encoding='utf-8')
             pages += 1
         (d / 'gallery.html').write_text(render_page(
-            layout, ctx, 'gallery.html', f'{T["galTitle"]} · AIVERSE', T['galLead'],
+            layout, ctx, 'gallery.html', f'{T["galTitle"]} | AIVERSE', T['galLead'],
             gallery_page(loc_entries, systems, ctx), nav='gallery', script=FEATURE_JS + GALLERY_JS), encoding='utf-8')
         pages += 1
         (d / 'roadmap.html').write_text(render_page(layout, ctx, 'roadmap.html', T['rmPageTitle'], T['rmDesc'],
-                                                    roadmap_page(flagships + [s for s in systems if s.get('core') and s.get('roadmap')], ctx), nav='roadmap', script=ROADMAP_JS),
+                                                    roadmap_page([s for s in systems if s.get('roadmap')], ctx), nav='roadmap', script=ROADMAP_JS),
                                         encoding='utf-8')
         rel_cfg = {'index': rel_data['builds']['index'], 'none': T['relDlNone'],
                    'os': {'windows': 'Windows', 'macos': 'macOS', 'linux': 'Linux'}}
@@ -705,9 +713,30 @@ def cmd_build(args):
             f'<link rel="canonical" href="../{page.name}">'
             f'<meta http-equiv="refresh" content="0; url=../{page.name}">'
             f'<script>location.replace("../{page.name}"+location.hash)</script>', encoding='utf-8')
+    # Web demos open in a popup (site/demo-player.js) on every page that can link to one.
+    for page in out.rglob('*.html'):
+        rel = page.relative_to(out).parts
+        if rel[0] in ('demos', 'en') or 'media' in rel:
+            continue
+        t = page.read_text(encoding='utf-8')
+        if 'demo-player.js' in t or '</body>' not in t:
+            continue
+        prefix = '../' * (len(rel) - 1)
+        page.write_text(t.replace('</body>', f'<script src="{prefix}demo-player.js" defer></script></body>', 1), encoding='utf-8')
+    # Owner rule: the site never uses the middle dot as a separator. Templates and data avoid it;
+    # this pass catches text that comes from documents (code blocks stay as written).
+    for page in [*out.rglob('*.html'), *out.rglob('*.json')]:
+        t = page.read_text(encoding='utf-8')
+        if '\u00b7' not in t:
+            continue
+        parts = re.split(r'(<pre[\s>].*?</pre>)', t, flags=re.S)
+        t2 = ''.join(x if x.startswith('<pre') else x.replace(' \u00b7 ', ', ').replace('\u00b7', ' ')
+                     for x in parts)
+        if t2 != t:
+            page.write_text(t2, encoding='utf-8')
     # Cache busting: the CDN and browsers keep style.css / devlog.js for minutes, so a fresh page
     # could meet a stale stylesheet. Every page asks for the exact version it was built with.
-    for asset in ('style.css', 'devlog.js'):
+    for asset in ('style.css', 'devlog.js', 'demo-player.js'):
         f = out / asset
         if f.is_file():
             v = hashlib.sha1(f.read_bytes()).hexdigest()[:10]
@@ -747,13 +776,20 @@ def cmd_publish(args):
         return 1
     out = Path(tempfile.mkdtemp(prefix='aiverse-site-'))
     try:
-        b = argparse.Namespace(out=str(out))
+        b = argparse.Namespace(out=str(out), demo_root=args.demo_root)
         if cmd_build(b):
             return 1
         index = out.parent / (out.name + '.index')
         env = dict(os.environ, GIT_INDEX_FILE=str(index))
         git('read-tree', 'origin/gh-pages', env=env)
-        git(f'--work-tree={out}', 'add', '--sparse', '-A', env=env)
+        try:
+            git(f'--work-tree={out}', 'add', '--sparse', '-A', env=env)
+        except SystemExit as error:
+            # Git 2.33 has no --sparse for add. Disable sparse checkout for
+            # this index-only invocation so every generated page is staged.
+            if 'unknown option' not in str(error) or 'sparse' not in str(error):
+                raise
+            git('-c', 'core.sparseCheckout=false', f'--work-tree={out}', 'add', '-A', env=env)
         tree = git('write-tree', env=env)
         if tree == git('rev-parse', 'origin/gh-pages^{tree}'):
             print('publish: gh-pages already matches main, nothing to push')
@@ -790,6 +826,9 @@ def main():
     b.set_defaults(fn=cmd_build)
     pb = sub.add_parser('publish')
     pb.add_argument('--dry-run', action='store_true')
+    for command in (b, pb):
+        command.add_argument('--demo-root', type=Path,
+                             help='directory of verified Web builds, one subdirectory per demo ID')
     pb.set_defaults(fn=cmd_publish)
     args = ap.parse_args()
     return args.fn(args)

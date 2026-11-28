@@ -146,7 +146,7 @@ bool builtinMesh(const std::string& name, FxMesh& out);
 using namespace detail;
 
 struct ParticleSystem::Impl {
-    struct Batch { uint32_t texId; FxBlend blend; gfx::TextureHandle tex; std::string graphKey; std::string error; gfx::ShaderHandle shader; gfx::PipelineHandle graphPipe[2]; std::vector<FxTexture> graphTextures; };
+    struct Batch { uint32_t texId; FxBlend blend; gfx::TextureHandle tex; std::string graphKey; std::string error; gfx::ShaderHandle shader; gfx::PipelineHandle graphPipe[2]; std::vector<FxTexture> graphTextures; FxBlendSpace blendSpace=FxBlendSpace::Linear; gfx::ShaderHandle displayShader; gfx::PipelineHandle displayPipe[2]; };
     struct MeshRT {
         std::vector<float3> pos, nrm;
         std::vector<float2> uv;
@@ -193,7 +193,8 @@ struct ParticleSystem::Impl {
     };
     struct Instance {
         uint16_t gen = 1;
-        bool used = false, stopped = false;
+        uint64_t telemetrySerial=0; // owner-local non-reused instance identity
+        bool used = false, stopped = false, finishing = false;
         bool emitting = true;          // false: done emitting; the slot lives on while it has particles
         int effect = -1;
         float3 pos, prev, dir{0, 1, 0};
@@ -291,6 +292,11 @@ struct ParticleSystem::Impl {
         bool mesh = false;  // true: nonindexed triangles; false: indexed quads
     };
     std::vector<ReactiveRun> reactiveRuns;
+    struct DisplayRun { uint16_t batch; uint32_t first,count; bool mesh; };
+    std::vector<DisplayRun> displayRuns;
+    FxFog displayFog;
+    gfx::ShaderHandle displayShader;
+    gfx::PipelineHandle displayQuadPipe,displayMeshPipe;
     gfx::ShaderHandle reactiveShader;
     gfx::PipelineHandle reactiveQuadPipe, reactiveMeshPipe;
     Rng rng;
@@ -302,6 +308,9 @@ struct ParticleSystem::Impl {
     std::vector<SubSpawn> pending;
     std::unordered_map<uint32_t, FxHandle> children;   // particle uid -> its birth sub-effect
     std::function<float(float, float)> ground;
+    std::shared_ptr<const SceneCollisionRegistry> sceneCollision;
+    uint32_t sceneCollisionBudget=8192;
+    SceneCollisionStats sceneCollisionStats{};
     std::function<float3(float3)> upFn;        // curved worlds (setUpFunction)
     std::function<float(float3)> altFn;        // curved worlds (setAltitudeFunction)
     bool haveSpace = false;                    // setViewSpace
@@ -348,7 +357,7 @@ struct ParticleSystem::Impl {
     FxTexture builtin(size_t i) const;
     FxTexture texture(const std::string& name, std::vector<std::string>& errors, const std::string& where);
     int mesh(const std::string& name, std::vector<std::string>& errors, const std::string& where);
-    uint16_t batchFor(const FxTexture& t, FxBlend blend, const Json& graph = {});
+    uint16_t batchFor(const FxTexture& t, FxBlend blend, const Json& graph = {}, FxBlendSpace space=FxBlendSpace::Linear);
     void build(EffectRT& e, std::vector<std::string>& errors);
 
     // ---- particles (ParticleSystem.cpp)

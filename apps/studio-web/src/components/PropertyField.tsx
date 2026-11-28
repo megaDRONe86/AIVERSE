@@ -2,6 +2,7 @@ import type React from 'react';
 import { useEffect, useRef, useState } from 'react';
 import type { StudioProperty } from '../types';
 import AssetReferencePicker from './AssetReferencePicker';
+import EntityReferencePicker from './EntityReferencePicker';
 import { isSameFieldValue, parseFieldDraft, scrubValue, validateBooleanChange } from '../propertyLogic';
 
 interface PropertyFieldProps {
@@ -72,7 +73,7 @@ export default function PropertyField({ property, disabled, onChange, variant = 
     title: 'Drag to change · Shift fine · Alt snap',
   } : {};
   if (property.type === 'asset') {
-    return <div className="property-row">
+    return <div data-property-key={property.key} className="property-row">
       <span>{property.label}</span>
       <AssetReferencePicker label={property.label} value={String(property.value)}
         kinds={property.assetKinds} disabled={locked}
@@ -81,8 +82,18 @@ export default function PropertyField({ property, disabled, onChange, variant = 
     </div>;
   }
 
+  if (property.type === 'text' && property.entityReference) {
+    return <div data-property-key={property.key} className="property-row">
+      <span>{property.label}</span>
+      <EntityReferencePicker label={property.label} value={String(property.value)}
+        options={property.options ?? []} disabled={locked}
+        onChange={value => { if (value !== property.value) onChange(value); }}/>
+      {property.description && <small className="property-description au-field__hint">{property.description}</small>}
+    </div>;
+  }
+
   if (property.type === 'boolean') {
-    return <label className="property-row">
+    return <label data-property-key={property.key} className="property-row">
       <span>{property.label}</span>
       <input type="checkbox" className="au-checkbox__input" disabled={locked} checked={!property.mixed && Boolean(property.value)}
         ref={el => { if (el) el.indeterminate = !!property.mixed; }}
@@ -95,7 +106,7 @@ export default function PropertyField({ property, disabled, onChange, variant = 
     </label>;
   }
 
-  return <label className={'property-row' + (variant === 'axis' ? ' property-row--axis' : '') + (className ? ' ' + className : '')}>
+  return <label data-property-key={property.key} className={'property-row' + (variant === 'axis' ? ' property-row--axis' : '') + (className ? ' ' + className : '')}>
     <span className={scrubbable ? 'property-scrub' : undefined} {...scrubHandlers}>{property.label}</span>
     {property.options?.length ?
       <select className="au-select" disabled={locked} value={property.mixed ? '\u0000mixed' : String(property.value)}

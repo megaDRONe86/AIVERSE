@@ -36,9 +36,13 @@ for item in StudioViewportLayoutTests StudioLightingValidationTests \
   StudioMaterialValidationTests StudioShaderGraphValidationTests \
   StudioFpsLightingContractTests StudioLightPreviewMathTests
 do
-  echo "==== C++17 contract: $item ===="
-  c++ -std=c++17 -Wall -Wextra -Werror -pedantic -I . \
+  echo "==== C++20 contract: $item ===="
+  c++ -std=c++20 -Wall -Wextra -Werror -pedantic -I . \
     "apps/studio-native/tests/$item.cpp" -o "$TEMP_DIR/$item"
   "$TEMP_DIR/$item"
 done
+echo "==== C++20 contract: owner history and agent policy ===="
+c++ -std=c++20 -Wall -Wextra -Werror -pedantic -I . \
+  apps/studio-native/tests/StudioOwnerHistoryTests.cpp engine/core/Fixed.cpp engine/data/Json.cpp engine/pack/Sha256.cpp -o "$TEMP_DIR/StudioOwnerHistoryTests"
+"$TEMP_DIR/StudioOwnerHistoryTests"
 echo "Headless contracts PASS. macOS Metal / React Vite still require separate builds."

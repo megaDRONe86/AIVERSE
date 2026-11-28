@@ -53,7 +53,7 @@
 .au-section__header{display:flex;flex-wrap:wrap;align-items:flex-start;justify-content:space-between;
   gap:var(--au-space-2);padding:var(--au-space-3) 0 var(--au-space-2);
   border-bottom:1px solid var(--au-line);margin-bottom:var(--au-space-3)}
-.au-section__title{min-width:0;font-size:var(--au-font-sm);font-weight:750;letter-spacing:.095em;
+.au-section__title{overflow-wrap:anywhere;min-width:0;font-size:var(--au-font-sm);font-weight:750;letter-spacing:.095em;
   color:var(--au-text-soft);text-transform:uppercase;margin:0}
 @container (max-width: 190px){
   .au-section__title{letter-spacing:.03em}
@@ -178,7 +178,7 @@
   animation:au-skeleton 1.3s ease-in-out infinite}
 @keyframes au-skeleton{to{background-position-x:-200%}}
 .au-scroll{min-height:0;min-width:0;overflow:auto}
-@media(max-width:840px){
+@container (max-width:480px){
   .au-panel__header{padding:var(--au-space-2) var(--au-space-3)}
   .au-panel__body{padding:var(--au-space-3)}
   .au-panel__body--flush{padding:0}
@@ -188,3 +188,148 @@
   .au-button,.au-input,.au-select,.au-textarea,.au-progress__bar{transition:none}
   .au-spinner,.au-skeleton{animation:none}
 }
+
+@container (max-width: 360px) {
+  .au-panel__header { gap: var(--au-space-2); min-height: 0; }
+  .au-panel__heading { flex-basis: 100%; min-width: 0; }
+  .au-panel__title { white-space: normal; overflow-wrap: anywhere; }
+  .au-panel__actions { justify-content: flex-start; margin: 0; }
+  .au-panel__footer { flex-wrap: wrap; min-height: 0; }
+  .au-empty { min-height: 96px; }
+}
+
+.au-dialog {
+  width: 100%; height: 100%; max-width: none; max-height: none;
+  margin: 0; border: 0; padding: 0; color: var(--au-text);
+}
+.au-dialog::backdrop { background: transparent; }
+
+/* Scope shared field chrome above panel-specific input rules. Keep the native
+   widgets in high contrast mode so the platform can draw its own indicators. */
+/* Unstyled form selects match adjacent text fields. Toolbar selectors with
+   an explicit height retain their compact layout. */
+:where(#root select:not([multiple]):is(:not([size]), [size="0"], [size="1"])) {
+  block-size: var(--au-control-height);
+  font-family: var(--studio-font);
+}
+@media (forced-colors: none) {
+  #root select:not([multiple]):is(:not([size]), [size="0"], [size="1"]) {
+    appearance: none;
+    box-sizing: border-box;
+    min-inline-size: 0;
+    max-inline-size: 100%;
+    padding-inline: var(--au-space-2) 26px;
+    border: 1px solid var(--au-line-strong);
+    border-radius: var(--au-radius-sm);
+    background-color: var(--au-field);
+    background-image: linear-gradient(45deg, transparent 50%, var(--au-text-soft) 50%),
+                      linear-gradient(135deg, var(--au-text-soft) 50%, transparent 50%);
+    background-size: 5px 5px;
+    background-position: right 13px center, right 8px center;
+    background-repeat: no-repeat;
+    color: var(--au-text);
+    text-overflow: ellipsis;
+    cursor: pointer;
+  }
+  #root select:dir(rtl):not([multiple]):is(:not([size]), [size="0"], [size="1"]) {
+    background-position: left 8px center, left 13px center;
+  }
+  #root select:not(:disabled):not([aria-invalid="true"]):hover {
+    border-color: var(--au-accent);
+  }
+  #root select:not([multiple]):is(:not([size]), [size="0"], [size="1"])[aria-invalid="true"] {
+    border-color: var(--au-danger);
+  }
+  #root input[type="range"] {
+    appearance: none;
+    box-sizing: border-box;
+    min-inline-size: 0;
+    max-inline-size: 100%;
+    min-block-size: 24px;
+    padding: 0;
+    border: 0;
+    border-radius: var(--au-radius-xs);
+    background: transparent;
+    box-shadow: none;
+    cursor: pointer;
+    --track-color: var(--au-line-strong);
+    --thumb-color: var(--au-accent);
+  }
+  #root input[type="range"]:enabled:hover,
+  #root input[type="range"]:enabled:active {
+    --track-color: var(--au-text-faint);
+    --thumb-color: var(--au-accent-ink);
+  }
+  /* Pseudo-elements from different engines must use separate rules. */
+  #root input[type="range"]::-webkit-slider-runnable-track {
+    height: 4px;
+    border-radius: 2px;
+    background: var(--track-color);
+  }
+  #root input[type="range"]::-moz-range-track {
+    height: 4px;
+    border-radius: 2px;
+    background: var(--track-color);
+  }
+  #root input[type="range"]::-webkit-slider-thumb {
+    appearance: none;
+    width: 14px;
+    height: 14px;
+    margin-top: -5px;
+    border: 2px solid var(--au-field);
+    border-radius: 50%;
+    background: var(--thumb-color);
+    box-shadow: 0 0 0 1px var(--track-color);
+  }
+  #root input[type="range"]::-moz-range-thumb {
+    box-sizing: border-box;
+    width: 14px;
+    height: 14px;
+    border: 2px solid var(--au-field);
+    border-radius: 50%;
+    background: var(--thumb-color);
+    box-shadow: 0 0 0 1px var(--track-color);
+  }
+  #root :is(select, input[type="range"]):disabled {
+    opacity: .55;
+    cursor: default;
+  }
+  #root :is(select, input[type="range"]):focus-visible {
+    outline: 2px solid var(--au-accent);
+    outline-offset: 2px;
+  }
+}
+
+@media (pointer: coarse) {
+  #root select:not([multiple]):is(:not([size]), [size="0"], [size="1"]),
+  #root input[type="range"] {
+    min-block-size: 44px;
+  }
+}
+
+.overlay-plan-with-minimap {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(128px, 192px);
+  align-items: start;
+  gap: 12px;
+}
+.overlay-minimap {
+  margin: 0;
+  padding: 10px;
+  border: 1px solid var(--au-line);
+  border-radius: 8px;
+  background: var(--au-surface);
+}
+.overlay-minimap figcaption { margin-bottom: 8px; font-weight: 600; }
+.overlay-minimap img { display: block; width: 100%; image-rendering: pixelated; }
+@container (max-width: 520px) {
+  .overlay-plan-with-minimap { grid-template-columns: minmax(0, 1fr); }
+  .overlay-minimap { width: min(100%, 192px); box-sizing: border-box; }
+}
+
+.placement-view-switch { display:inline-flex; gap:2px; margin-top:10px; padding:3px; border:1px solid var(--au-line); border-radius:7px; }
+.placement-view-switch button { background:transparent; border:0; padding:5px 10px; color:var(--au-text); border-radius:4px; }
+.placement-view-switch button[aria-pressed=true] { background:var(--au-surface-raised, #30465d); }
+.placement-model-preview { position:relative; display:flex; align-items:center; justify-content:center; height:240px; background:#11151c; border-radius:8px; overflow:hidden; }
+.placement-model-preview canvas { display:block; width:min(100%,240px); height:auto; }
+.placement-model-preview p { position:absolute; margin:0; }

@@ -1,6 +1,7 @@
 // Linux: X11 window + EGL + OpenGL ES 3, or Vulkan on request (GraphicsSettings.h). Used for development and CI
 // (works under Xvfb with Mesa: llvmpipe for GL, lavapipe for Vulkan).
 // Debug hooks (env):  AIVERSE_SCREENSHOT=out.ppm  AIVERSE_EXIT_AFTER_FRAMES=N  -> capture frame N and exit.
+#include "LinuxKey.h"
 #include "../PlatformCommon.h"
 #include "../GraphicsSettings.h"
 #include "../../gfx/Gfx.h"
@@ -12,6 +13,10 @@
 #include <GLES3/gl3.h>
 #include <X11/Xatom.h>
 #include <X11/Xlib.h>
+#if defined(AIVERSE_WITH_XCURSOR)
+#include <X11/Xcursor/Xcursor.h>
+#endif
+#include <vector>
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
 
@@ -43,26 +48,6 @@ uint8_t mods(unsigned s) {
     return m;
 }
 
-Key mapKey(KeySym k) {
-    if (k >= XK_a && k <= XK_z) return Key(int(Key::A) + int(k - XK_a));
-    if (k >= XK_A && k <= XK_Z) return Key(int(Key::A) + int(k - XK_A));
-    if (k >= XK_0 && k <= XK_9) return Key(int(Key::Num0) + int(k - XK_0));
-    if (k >= XK_F1 && k <= XK_F12) return Key(int(Key::F1) + int(k - XK_F1));
-    switch (k) {
-        case XK_Escape: return Key::Escape; case XK_Return: return Key::Enter; case XK_Tab: return Key::Tab;
-        case XK_BackSpace: return Key::Backspace; case XK_Delete: return Key::Delete; case XK_Insert: return Key::Insert;
-        case XK_space: return Key::Space; case XK_Left: return Key::Left; case XK_Right: return Key::Right;
-        case XK_Up: return Key::Up; case XK_Down: return Key::Down; case XK_Home: return Key::Home; case XK_End: return Key::End;
-        case XK_Page_Up: return Key::PageUp; case XK_Page_Down: return Key::PageDown;
-        case XK_Shift_L: return Key::LeftShift; case XK_Shift_R: return Key::RightShift;
-        case XK_Control_L: return Key::LeftCtrl; case XK_Control_R: return Key::RightCtrl;
-        case XK_Alt_L: return Key::LeftAlt; case XK_Alt_R: return Key::RightAlt;
-        case XK_Super_L: return Key::LeftSuper; case XK_Super_R: return Key::RightSuper;
-        case XK_minus: return Key::Minus; case XK_equal: return Key::Equal; case XK_comma: return Key::Comma;
-        case XK_period: return Key::Period; case XK_slash: return Key::Slash; case XK_semicolon: return Key::Semicolon;
-        default: return Key::Unknown;
-    }
-}
 
 void saveScreenshot(const std::string& path, int w, int h) {
     std::vector<uint8_t> px(size_t(w) * size_t(h) * 4);
@@ -277,7 +262,7 @@ int run(const AppConfig& cfgIn, AppCallbacks cb) {
             case KeyPress: case KeyRelease: {
                 KeySym ks = XLookupKeysym(&xe.xkey, 0);
                 e.type = xe.type == KeyPress ? EventType::KeyDown : EventType::KeyUp;
-                e.key = mapKey(ks); e.mods = mods(xe.xkey.state);
+                e.key = linuxKeyFromKeysym(ks); e.mods = mods(xe.xkey.state);
                 detail::dispatch(e);
                 if (xe.type == KeyPress && e.key == Key::F11 && state().cfg.allowFullscreen) detail::applyFullscreen(!state().fullscreen);
                 if (xe.type == KeyPress) {
@@ -333,6 +318,44 @@ int run(const AppConfig& cfgIn, AppCallbacks cb) {
     return 0;
 }
 
+bool setCursorImage(const uint8_t* pixels, int w, int h, int x, int y) {
+    if (!g_dpy || !g_win) return false;
+    if (!pixels) { XUndefineCursor(g_dpy, g_win); return true; }
+    if (w < 1 || h < 1 || w > 256 || h > 256 || x < 0 || y < 0 || x >= w || y >= h) return false;
+    Cursor cursor = None;
+#if defined(AIVERSE_WITH_XCURSOR)
+    XcursorImage* image = XcursorImageCreate(w,h);
+    if (!image) return false;
+    image->xhot = x; image->yhot = y;
+    for (int i = 0; i < w*h; ++i) {
+        const uint8_t* p = pixels + i*4;
+        auto channel = [&](int c) { return (unsigned(p[c])*p[3]+127)/255; };
+        image->pixels[i] = (uint32_t(p[3])<<24) | (channel(0)<<16) | (channel(1)<<8) | channel(2);
+    }
+    cursor = XcursorImageLoadCursor(g_dpy,image);
+    XcursorImageDestroy(image);
+#else
+    const int stride = (w+7)/8;
+    std::vector<char> source(stride*h), mask(stride*h);
+    for (int row=0; row<h; ++row) for (int col=0; col<w; ++col) {
+        const auto* p = pixels + 4*(row*w+col);
+        const int index = row*stride+col/8, bit = 1<<(col%8);
+        if (p[3] >= 128) mask[index] |= bit;
+        if (int(p[0])+p[1]+p[2] >= 384) source[index] |= bit;
+    }
+    Pixmap shape = XCreateBitmapFromData(g_dpy,g_win,source.data(),w,h);
+    Pixmap alpha = XCreateBitmapFromData(g_dpy,g_win,mask.data(),w,h);
+    XColor white{}, black{};
+    white.red = white.green = white.blue = 65535;
+    if (shape && alpha) cursor = XCreatePixmapCursor(g_dpy,shape,alpha,&white,&black,x,y);
+    if (shape) XFreePixmap(g_dpy,shape);
+    if (alpha) XFreePixmap(g_dpy,alpha);
+#endif
+    if (!cursor) return false;
+    XDefineCursor(g_dpy,g_win,cursor);
+    XFreeCursor(g_dpy,cursor);
+    return true;
+}
 bool pointerLocked() { return g_pointerLocked; }
 bool setPointerLock(bool enabled) {
     if (enabled==g_pointerLocked) return true;

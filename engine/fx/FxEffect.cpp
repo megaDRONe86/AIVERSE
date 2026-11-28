@@ -1,10 +1,12 @@
 #include "FxEffect.h"
+#include "engine/render/MaterialBlend.h"
 #include "SpectraParticleProgram.h"
 #include "engine/render/graph/ShaderGraph.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <limits>
+#include <stdexcept>
 
 namespace aiverse::fx {
 
@@ -128,6 +130,7 @@ struct Reader {
     Reader sub(const char* key) const { return Reader{obj[key], where + "." + key, errors}; }
 };
 
+constexpr const char* kBlendSpaceNames[] = {"linear", "display"};
 constexpr const char* kBlendNames[] = {"alpha", "additive", "premultiplied", "multiply", "subtract", "opaque"};
 constexpr const char* kAlignNames[] = {"camera", "velocity", "ground", "upright", "world", "local"};
 constexpr const char* kShapeNames[] = {"point", "sphere", "disc", "ring", "hemisphere", "cone", "box", "line", "donut", "mesh"};
@@ -143,7 +146,7 @@ constexpr const char* kTrailModeNames[] = {"particle", "ribbon"};
 constexpr const char* kInheritModeNames[] = {"initial", "current"};
 
 constexpr const char* kKnownKeys[] = {
-    "texture", "frames", "fps", "blend", "align", "burst", "rate", "perMeter", "delay", "duration", "loop",
+    "texture", "frames", "fps", "blend", "blendSpace", "align", "burst", "rate", "perMeter", "delay", "duration", "loop",
     "life", "speed", "size", "rotation", "spin", "direction", "spread", "shape", "radius", "gravity", "drag",
     "stretch", "sizeOverLife", "color", "minQuality", "comment",
     // optional modules
@@ -267,12 +270,13 @@ float EmitterDef::endTime() const {
 }
 
 bool EffectDef::looping() const {
+    if (!model.source.empty() && model.loop) return true;
     for (auto& e : emitters) if (e.loop && (e.continuous() || !e.bursts.empty())) return true;
     return false;
 }
 
 float EffectDef::lifetime() const {
-    float t = 0;
+    float t = model.source.empty() ? 0 : model.loop ? std::numeric_limits<float>::infinity() : model.duration;
     for (auto& e : emitters) {
         float life = e.life.max;
         if (e.lifeBySpeed.enabled) for (auto& k : e.lifeBySpeed.keys) life = std::max(life, e.life.max * k.k);
@@ -343,7 +347,7 @@ void parseBySpeed(const Json& e, Reader& r, const char* key, const char* valueKe
     });
 }
 
-void parseModules(const Json& e, Reader& r, EmitterDef& d) {
+void parseModules(const Json& e, Reader& r, EmitterDef& d, const SdfResourceReader& sdfReader) {
     r.range("aspect", d.aspect, 0.01f, 100);
     r.vec3("offset", d.offset);
     if (e.has("bursts")) {
@@ -431,7 +435,7 @@ void parseModules(const Json& e, Reader& r, EmitterDef& d) {
     if (e.has("collision")) {
         const Json& o = e["collision"];
         if (o.type() == Json::Type::Bool) d.collision.enabled = o.boolean();
-        else module(e, r, "collision", {"height", "bounce", "dampen", "lifeLoss", "minKillSpeed", "maxKillSpeed", "ground", "planes", "radius"},
+        else module(e, r, "collision", {"height", "bounce", "dampen", "lifeLoss", "minKillSpeed", "maxKillSpeed", "ground", "planes", "radius", "scene", "staticSphereRadius", "staticSphereCenter", "staticSdf"},
                     [&](const Json& c, Reader& cr) {
             FxCollision& col = d.collision;
             col.enabled = true;
@@ -442,6 +446,43 @@ void parseModules(const Json& e, Reader& r, EmitterDef& d) {
             cr.number("minKillSpeed", col.minKillSpeed, 0, 1000);
             cr.number("maxKillSpeed", col.maxKillSpeed, 0, 100000);
             cr.boolean("ground", col.ground);
+            cr.boolean("scene", col.scene);
+            cr.number("staticSphereRadius", col.staticSphereRadius, 0, 10000);
+            cr.vec3("staticSphereCenter", col.staticSphereCenter);
+            if(c.has("staticSdf")) {
+                const auto& grid=c["staticSdf"];
+                Reader sr{grid,cr.where+".staticSdf",r.errors};
+                auto& sdf=col.staticSdf;
+                if(grid.isString()){
+                    const auto path=grid.str();
+                    std::string error;
+                    if(!validSdfResourcePath(path))sr.fail("staticSdf","unsafe SDF resource path");
+                    else if(!sdfReader)sr.fail("staticSdf","external SDF requires a resource reader");
+                    else if(!loadSdfBinary(path,sdfReader,sdf,error))sr.fail("staticSdf",error);
+                    else col.staticSdfAsset=path;
+                }else if(!grid.isObject())sr.fail("staticSdf","expected object or content .sdfbin path");
+                else {
+                    unknownKeys(grid,{"origin","spacing","dimension","samples"},sr.where,r.errors,sr.ok);
+                    sr.vec3("origin",sdf.origin);
+                    sr.number("spacing",sdf.spacing,0.01f,1000.f);
+                    const auto& dim=grid["dimension"];
+                    const auto n=dim.integer(-1);
+                    if(!dim.isNumber()||n<3||n>kStaticSdfInlineMaxDimension||dim.toDouble()!=double(n))
+                        sr.fail("dimension","inline SDF requires integer 3..32; link a .sdfbin for higher resolution");
+                    else sdf.dimension=uint32_t(n);
+                    const auto& samples=grid["samples"];
+                    if(!samples.isArray()||samples.size()>kStaticSdfInlineMaxSamples||
+                       samples.size()!=size_t(sdf.dimension)*sdf.dimension*sdf.dimension)
+                        sr.fail("samples","expected dimension cubed distances");
+                    else for(size_t i=0;i<samples.size();++i) {
+                        if(!samples[i].isNumber()||!std::isfinite(samples[i].toDouble())||
+                           std::abs(samples[i].toDouble())>100000) {sr.fail("samples","invalid distance");break;}
+                        sdf.samples.push_back(float(samples[i].toDouble()));
+                    }
+                    if(!sdf.valid())sr.fail("staticSdf","invalid bounded volume");
+                }
+                if(!sr.ok)cr.ok=false;
+            }
             cr.number("radius", col.radius, 0, 10);
             if (c.has("planes")) {
                 const Json& l = c["planes"];
@@ -494,7 +535,7 @@ void parseModules(const Json& e, Reader& r, EmitterDef& d) {
             else { r.fail("subEmitters", "at most " + std::to_string(kMaxSubEmitters) + " sub-emitters per emitter"); break; }
         }
     }
-    module(e, r, "trail", {"time", "width", "color", "texture", "blend", "inheritColor", "sizeAffectsWidth", "minQuality", "mode", "ribbons",
+    module(e, r, "trail", {"time", "width", "color", "texture", "blend", "blendSpace", "inheritColor", "sizeAffectsWidth", "minQuality", "mode", "ribbons",
                            "ratio", "lifeColor", "lifeFraction", "minDistance", "textureMode", "dieWithParticles", "sizeAffectsLifetime"},
            [&](const Json& o, Reader& tr) {
         FxTrail& t = d.trail;
@@ -506,6 +547,10 @@ void parseModules(const Json& e, Reader& r, EmitterDef& d) {
         if (o.has("lifeColor") && !colorKeys(o["lifeColor"], t.lifeColor)) tr.fail("lifeColor", "expected \"#rrggbbaa\" or [[t, \"#rrggbbaa\"], ...]");
         if (o.has("texture")) { t.texture = o["texture"].str(); if (t.texture.empty()) tr.fail("texture", "expected a name"); }
         tr.choice("blend", t.blend, kBlendNames);
+        t.blendSpace=d.blendSpace;
+        tr.choice("blendSpace", t.blendSpace, kBlendSpaceNames);
+        if(t.blendSpace==FxBlendSpace::Display && t.blend!=FxBlend::Additive)
+            tr.fail("blendSpace","display requires additive blending");
         tr.boolean("inheritColor", t.inheritColor);
         tr.boolean("sizeAffectsWidth", t.sizeAffectsWidth);
         tr.boolean("sizeAffectsLifetime", t.sizeAffectsLifetime);
@@ -676,7 +721,7 @@ void bySpeedJ(Json& e, const char* key, const char* valueKey, const FxBySpeed& b
     e.set(key, o);
 }
 
-void modulesToJson(const EmitterDef& d, Json& e) {
+void modulesToJson(const EmitterDef& d, Json& e,bool includeSdf) {
     const EmitterDef base;
     if (!(d.aspect == base.aspect)) e.set("aspect", rangeJ(d.aspect));
     if (nonzero(d.offset)) e.set("offset", vecJ(d.offset));
@@ -742,6 +787,22 @@ void modulesToJson(const EmitterDef& d, Json& e) {
         if (c.minKillSpeed) o.set("minKillSpeed", numJ(c.minKillSpeed));
         if (c.maxKillSpeed) o.set("maxKillSpeed", numJ(c.maxKillSpeed));
         if (!c.ground) o.set("ground", Json::fromBool(false));
+        if (c.scene) o.set("scene", Json::fromBool(true));
+        if (c.staticSphereRadius>0) {
+            o.set("staticSphereRadius",numJ(c.staticSphereRadius));
+            o.set("staticSphereCenter",vecJ(c.staticSphereCenter));
+        }
+        if(includeSdf&&c.staticSdf.dimension>kStaticSdfInlineMaxDimension) {
+            if(!validSdfResourcePath(c.staticSdfAsset))throw std::runtime_error("High-resolution SDF requires external asset export");
+            o.set("staticSdf",Json::string(c.staticSdfAsset));
+        }else if(includeSdf&&c.staticSdf.dimension) {
+            Json grid=Json::object(),samples=Json::array();
+            grid.set("origin",vecJ(c.staticSdf.origin));
+            grid.set("spacing",numJ(c.staticSdf.spacing));
+            grid.set("dimension",numJ(float(c.staticSdf.dimension)));
+            for(float v:c.staticSdf.samples)samples.push(numJ(v));
+            grid.set("samples",samples);o.set("staticSdf",grid);
+        }
         if (c.radius) o.set("radius", numJ(c.radius));
         if (!c.planes.empty()) {
             Json a = Json::array();
@@ -775,13 +836,14 @@ void modulesToJson(const EmitterDef& d, Json& e) {
         const FxTrail& t = d.trail;
         Json o = Json::object();
         if (t.ribbon) { o.set("mode", Json::string("ribbon")); if (t.ribbons != 1) o.set("ribbons", Json::number(int64_t(t.ribbons))); }
-        o.set("time", numJ(t.time));
+        if(t.time!=tb.time)o.set("time", numJ(t.time));
         if (t.lifeFraction > 0) o.set("lifeFraction", numJ(t.lifeFraction));
         o.set("width", keysJ(t.width));
         o.set("color", colorKeysJ(t.color));
         if (!t.lifeColor.empty()) o.set("lifeColor", colorKeysJ(t.lifeColor));
         if (t.texture != tb.texture) o.set("texture", Json::string(t.texture));
         o.set("blend", Json::string(kBlendNames[size_t(t.blend)]));
+        o.set("blendSpace",Json::string(kBlendSpaceNames[size_t(t.blendSpace)]));
         if (!t.inheritColor) o.set("inheritColor", Json::fromBool(false));
         if (!t.sizeAffectsWidth) o.set("sizeAffectsWidth", Json::fromBool(false));
         if (t.sizeAffectsLifetime) o.set("sizeAffectsLifetime", Json::fromBool(true));
@@ -944,20 +1006,57 @@ bool FxTrail::operator==(const FxTrail& o) const {
         return true;
     };
     return enabled == o.enabled && time == o.time && lifeFraction == o.lifeFraction && width == o.width && ck(color, o.color) &&
-           ck(lifeColor, o.lifeColor) && texture == o.texture && blend == o.blend && inheritColor == o.inheritColor &&
+           ck(lifeColor, o.lifeColor) && texture == o.texture && blend == o.blend && blendSpace == o.blendSpace && inheritColor == o.inheritColor &&
            sizeAffectsWidth == o.sizeAffectsWidth && sizeAffectsLifetime == o.sizeAffectsLifetime && ribbon == o.ribbon && ribbons == o.ribbons &&
            ratio == o.ratio && minDistance == o.minDistance && textureMode == o.textureMode && dieWithParticles == o.dieWithParticles &&
            minQuality == o.minQuality;
 }
 
-bool parseEffect(const Json& j, const std::string& where, EffectDef& out, std::vector<std::string>& errors) {
+bool parseEffect(const Json& j, const std::string& where, EffectDef& out, std::vector<std::string>& errors,
+                 const SdfResourceReader& sdfReader) {
     out = {};
     const size_t before = errors.size();
+    size_t remainingSdfBytes=kSdfEffectReadBudget;
+    SdfResourceReader boundedSdfReader;
+    if(sdfReader)boundedSdfReader=[&](const std::string& path,std::string& bytes){
+        if(!sdfReader(path,bytes)||bytes.size()>kSdfBinaryMaxBytes||bytes.size()>remainingSdfBytes)return false;
+        remainingSdfBytes-=bytes.size();return true;
+    };
     if (!j.isObject()) { errors.push_back(where + ": expected an object with \"emitters\""); return false; }
     for (auto& [k, v] : j.members())
-        if (k != "emitters" && k != "comment" && k != "forceFields") errors.push_back(where + ": unknown field '" + k + "'");
+        if (k != "emitters" && k != "comment" && k != "forceFields" && k != "model") errors.push_back(where + ": unknown field '" + k + "'");
+    if (j.has("model")) {
+        const auto& m = j["model"];
+        auto& model = out.model;
+        model.source = m.getStr("source"); model.clip = m.getStr("clip");
+        model.duration = float(m["duration"].toDouble(1));
+        model.loop = m.getBool("loop");
+        model.castShadow = m.getBool("castShadow", true);
+        if (model.source.empty() || !std::isfinite(model.duration) || model.duration <= 0)
+            errors.push_back(where + ".model: expected source and positive duration");
+        if (m.has("materials") && !m["materials"].isArray()) errors.push_back(where+".model.materials: expected array");
+        for (const auto& item : m["materials"].items()) {
+            ModelMaterialTrack track;
+            track.material = item.getStr("material");
+            if(item.has("blend")) {
+                render::AlphaMode mode;
+                track.blend=item.getStr("blend");
+                if(!render::parseMaterialBlend(track.blend,mode))
+                    errors.push_back(where+".model.materials.blend: invalid material blend mode");
+            }
+            if (item.has("color") && !colorKeys(item["color"],track.color))
+                errors.push_back(where+".model.materials.color: invalid RGBA gradient");
+            Reader reader{item,where+".model.materials",errors};
+            reader.vec2("uvSpeed",track.uvSpeed,-10000,10000);
+            for (const auto& texture : item["textures"].items()) {
+                if (!texture.isString() || texture.str().empty()) errors.push_back(where+".model.materials.textures: expected model image names");
+                else track.textures.push_back(texture.str());
+            }
+            model.materials.push_back(std::move(track));
+        }
+    }
     const Json& list = j["emitters"];
-    if (!list.isArray() || list.size() == 0) { errors.push_back(where + ".emitters: expected a non-empty array"); return false; }
+    if ((j.has("emitters") && !list.isArray()) || (list.size() == 0 && out.model.source.empty())) { errors.push_back(where + ".emitters: expected a non-empty array"); return false; }
     if (list.size() > size_t(kMaxEmitters)) errors.push_back(where + ".emitters: at most " + std::to_string(kMaxEmitters) + " emitters");
 
     for (size_t i = 0; i < std::min(list.size(), size_t(kMaxEmitters)); ++i) {
@@ -1011,6 +1110,9 @@ bool parseEffect(const Json& j, const std::string& where, EffectDef& out, std::v
         }
         r.number("fps", d.fps, 0, 120);
         r.choice("blend", d.blend, kBlendNames);
+        r.choice("blendSpace", d.blendSpace, kBlendSpaceNames);
+        if(d.blendSpace==FxBlendSpace::Display && d.blend!=FxBlend::Additive)
+            r.fail("blendSpace","display requires additive blending");
         r.choice("align", d.align, kAlignNames);
         r.integer("burst", d.burst, 0, 2000);
         r.range("rate", d.rate, 0, 2000);
@@ -1034,7 +1136,7 @@ bool parseEffect(const Json& j, const std::string& where, EffectDef& out, std::v
 
         if (e.has("sizeOverLife") && !keysIn(e["sizeOverLife"], d.sizeOverLife, 0, 1e6f)) r.fail("sizeOverLife", "expected [[t, k], ...]");
         if (e.has("color") && !colorKeys(e["color"], d.color)) r.fail("color", "expected \"#rrggbbaa\" or [[t, \"#rrggbbaa\"], ...]");
-        parseModules(e, r, d);
+        parseModules(e, r, d, boundedSdfReader);
         if (d.burst == 0 && d.bursts.empty() && !d.continuous()) r.fail("burst", "emitter creates no particles: set burst, bursts, rate or perMeter");
         if (d.rate.max > 0 && !d.loop && d.duration <= 0) r.fail("duration", "rate needs a duration (or \"loop\": true)");
         if (d.loop && !d.bursts.empty() && d.duration <= 0) r.fail("duration", "looping bursts repeat every \"duration\": set it");
@@ -1047,7 +1149,7 @@ bool parseEffect(const Json& j, const std::string& where, EffectDef& out, std::v
     return errors.size() == before;
 }
 
-Json effectToJson(const EffectDef& def) {
+Json effectToJson(const EffectDef& def,bool includeSdf) {
     const EmitterDef base;
     Json root = Json::object();
     Json list = Json::array();
@@ -1060,6 +1162,7 @@ Json effectToJson(const EffectDef& def) {
         if (d.frameCols != 1 || d.frameRows != 1) { Json f = Json::array(); f.push(Json::number(int64_t(d.frameCols))); f.push(Json::number(int64_t(d.frameRows))); e.set("frames", f); }
         if (d.fps != base.fps) e.set("fps", numJ(d.fps));
         e.set("blend", Json::string(kBlendNames[size_t(d.blend)]));
+        if(d.blendSpace!=FxBlendSpace::Linear)e.set("blendSpace",Json::string(kBlendSpaceNames[size_t(d.blendSpace)]));
         if (d.align != base.align) e.set("align", Json::string(kAlignNames[size_t(d.align)]));
         if (d.burst) e.set("burst", Json::number(int64_t(d.burst)));
         if (!isZero(d.rate)) e.set("rate", rangeJ(d.rate));
@@ -1082,10 +1185,32 @@ Json effectToJson(const EffectDef& def) {
         e.set("sizeOverLife", keysJ(d.sizeOverLife));
         e.set("color", colorKeysJ(d.color));
         if (d.minQuality != base.minQuality) e.set("minQuality", Json::string(kQualityChoice[size_t(d.minQuality)]));
-        modulesToJson(d, e);
+        modulesToJson(d, e,includeSdf);
         list.push(e);
     }
     root.set("emitters", list);
+    if (!def.model.source.empty()) {
+        const auto& model = def.model;
+        Json m = Json::object(), tracks = Json::array();
+        m.set("source",Json::string(model.source)); m.set("duration",numJ(model.duration));
+        if (!model.castShadow) m.set("castShadow", Json::fromBool(false));
+        if (model.loop) m.set("loop",Json::fromBool(true));
+        if (!model.clip.empty()) m.set("clip",Json::string(model.clip));
+        for (const auto& track : model.materials) {
+            Json item = Json::object();
+            if (!track.material.empty()) item.set("material",Json::string(track.material));
+            if (!track.color.empty()) item.set("color",colorKeysJ(track.color));
+            if (!track.blend.empty()) item.set("blend",Json::string(track.blend));
+            Json speed=Json::array(); speed.push(numJ(track.uvSpeed.x)); speed.push(numJ(track.uvSpeed.y));
+            item.set("uvSpeed",speed);
+            Json frames=Json::array();
+            for (const auto& texture : track.textures) frames.push(Json::string(texture));
+            if (frames.size()) item.set("textures",frames);
+            tracks.push(item);
+        }
+        if (tracks.size()) m.set("materials",tracks);
+        root.set("model",m);
+    }
     if (!def.forceFields.empty()) {
         Json a = Json::array();
         for (auto& f : def.forceFields) {

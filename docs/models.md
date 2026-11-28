@@ -240,6 +240,15 @@ Quality tiers (`MaterialQuality`, chosen per GPU like shadows, `AIVERSE_MATERIAL
 
 ### Material library (`materials.json`)
 
+Each material authored in Studio or through `material_set` has its own JSON file
+under `content/materials/`. For example, `content/materials/steel.material.json`
+contains the PBR object, and the project index records
+`{"materials":{"steel":"content/materials/steel.material.json"}}`.
+References in rules and model assignments continue to use the material name.
+Studio reads legacy inline entries. **Convert library to material files** in
+Materials converts them explicitly. Saving a library edit also converts its
+remaining inline entries. Double-click a material file in Assets to edit it.
+
 `shadowDiffusion` adds receiver-side sun-shadow smoothing to a model material.
 Set it through the library, `material_set`, Studio's **Shadow diffusion (world units)**
 field, or native `render::Material::shadowDiffusion`. Zero preserves the old lookup.
@@ -402,14 +411,25 @@ deformed on the GPU from a float texture; weights come from the node / mesh defa
   `carry` = resource id or `"any"`: shown while carrying it, `weapon` = weapon id of the type: shown while the
   hero holds that weapon, rules `arsenal`). Materials named `*team*` take the
   team colour.
+- **impactHeight**: Set `view.impactHeight` on a target type (for example `0.45`) to place the endpoint of a straight, targeted shot that many world units above its base. The shot starts at the shooter's muzzle when available, otherwise at the first observed simulation position. Its model, built-in ball and trail share the line. A moving target updates the endpoint. Omitting the field preserves the existing presentation. Applies to ordinary flat-map targeted flight; programmed and ballistic flight keep their own paths.
 - **muzzle**: projectiles of this type start at that point and converge onto their simulated path across the
-  ground (within ~0.3 s) while keeping the muzzle's height; a `launch` view event is reported there. The game's
+  ground (within ~0.3 s) at muzzle height by default. A target with `impactHeight` supplies the endpoint for straight shots. A `launch` view event is reported at the muzzle. The game's
   effects follow it too (GameFx with `setAttackOriginFn` = `GameView::muzzleOf`, set by the client and the editor):
   the weapon's `attack` effect plays at the muzzle and its `trail` starts there.
 - **fx**: effect anchors listed in `GameView::effects()` every frame while active (`when`, `hpBelow`;
   the intensity grows as health drops). A particle system spawns `effect` at `pos`.
 - **View events** (`GameView::events()`, this frame): clip events, `launch`, `spawn`, `death`, each
   with entity, type, owner and world position — the hook for sounds and particles.
+
+
+### Structure upgrade preview
+
+Set `"showUpgradeTarget": true` in the **source structure's** `view` block to switch to the target
+type's appearance while an in-place upgrade occupies an active production slot. Its model or sprite
+uses the target's normal construction progression. A queued upgrade waits its turn. Cancelling
+restores the source appearance. Without the setting the building keeps its original appearance until
+completion. The simulated unit type, commands and selection continue to use the source throughout
+the upgrade. See the playable `demos/order-upgrade` example.
 
 ## Stages, construction and dissolve
 
@@ -432,7 +452,8 @@ deformed on the GPU from a float texture; weights come from the node / mesh defa
 - **dissolve**: `dissolveSpawn` burns new units in, `dissolveDeath` burns corpses away (instead of
   fading); `"dissolve": true` sets both.
 
-Selected and hovered objects get an outline (`GameView::setSelectionOutline`). The client shows the
+Selected and hovered objects get an outline (`GameView::setSelectionOutline`). Set `"selectionOutline": false` in
+`game.json` to suppress both model silhouettes while retaining authored rings and other HUD overlays. The client shows the
 building to place as a translucent model (`GameView::drawGhost`), and `game::Portrait`
 (`engine/view/game/GamePortrait.h`) renders any type into a texture for HUD portraits and buttons.
 
@@ -531,6 +552,21 @@ for each attack event. It defaults to false, so melee attacks and existing proje
 effects stay unchanged. Tracers travel to the event target in 90–240 ms, respect
 visible source/target objects, and are capped at 512 simultaneous streaks. They
 use the existing RHI triangle/line renderer on flat terrain and planets.
+
+### Per-weapon projectile models
+
+In a unit type's `view`, define `projectiles` keyed by the weapon's authored ID:
+
+```json
+{
+  "projectiles": {
+    "bow": {"model":"models/arrow.glb","forward":"+z","scale":0.45},
+    "rocket": {"model":"models/rocket.glb","forward":"+x","clip":"flight","clipSpeed":1.2,"scale":0.7,"tint":[1,0.7,0.3,1]}
+  }
+}
+```
+
+A string path is shorthand for a model with default settings. `forward` names the model's longitudinal axis (default +x; any signed Cartesian axis is accepted). The model is oriented along the simulated displacement, including pitch on ballistic arcs. On planets the orientation uses radial up. `scale` is a uniform multiplier of original model units; if absent the existing `projectileScale` value applies. Zero hides it. Optional `tint` is linear RGB or RGBA (0–1). `clip` names an imported looping animation; `clipSpeed` scales its presentation clock. Without a clip the bind pose is drawn. Imported materials and textures are retained. Missing/invalid assets fall back to the built-in projectile ball; a missing clip warns and uses bind pose. The same shared model cache, streaming and hot-reload owner is used; projectile assets are retained while their type is resident. Custom models follow the simulated height by default. A target with an authored `impactHeight` supplies the endpoint for straight shots. Source type and weapon slot are resolved from the projectile itself, including progression variants and dead shooters. This is presentation only, not a collision-size or projectile physics setting.
 
 ### Team colour from territory
 
@@ -1714,3 +1750,56 @@ destroyed old Model.
 [Stage 145 handoff](agent-handoffs/animation-stage145-generic-ecs-source-epoch-playback-2026-11-19.md).
 **NOT RUN:** native CMake/C++/CTest, Metal/Vulkan/GL, sanitizer, source
 hot-reload visual test, GPU failure injection or benchmarks.
+
+A status can attach a particle effect to its holder for its active lifetime. For example, set `"view": {"effect":"heal_glow","offset":[0,0.5,0]}` on the status definition. Named model nodes use socket-local offsets. Removing the status stops emission.
+
+For chain delivery, the ability ID selects an entry in `fx/fx.json` under `chainJumps`. Override it with `chainFx` on a chain effect or its delivery. `events.chainJump` supplies the fallback. For example, `"chainJumps":{"lightning":{"mode":"beam","scale":2,"lifetime":0.25,"height":1}}` draws a ribbon between each pair of hits. Set `"mode":"projectile","effect":"spark"` to move an emitter along the link during its lifetime. Beam color uses the renderer's packed RGBA integer.
+
+### Material techniques
+
+A model's `<model>.batching.json` can choose a different existing material for each source material. List rules in priority order. The first matching rule wins, with the source material as fallback. Distances are measured in world units from the camera to the transformed centre of the node's base mesh. The lower bound is inclusive and the upper bound exclusive. For example, this model contains materials named Stone, Polished and DistantStone.
+
+```json
+{
+  "materialTechniques": [
+    {"source": "Stone", "use": "Polished", "scheme": "inspection", "maxDistance": 12, "requires": ["rgba16f"]},
+    {"source": "Stone", "use": "DistantStone", "minDistance": 40}
+  ]
+}
+```
+
+A native host selects its scheme with `Renderer3D::setMaterialScheme` before submitting the model. The initial scheme is `default`; omitting `scheme` matches every scheme. `requires` accepts `compute`, `rgba16f` and `texture2dArray`, and all listed device capabilities must be present. Explicit glTF variant and per-node material selections take priority. Each draw retains the selected material for its dependent passes. The rule format targets model material names, which must be unique within the asset. Studio's Models panel and MCP expose `material_techniques_get` and `material_techniques_set`; reopen the model to reload its sidecar.
+
+### Quake III IBSP v46
+
+Import the unmodified level as maps/<name>.bsp and its extracted diffuse files under the project's textures/ tree. asset_import accepts individual files. Include scripts/shaderlist.txt and the named .shader files to resolve material aliases. If the package omits its shader list, list the script stems one per line. Studio classifies .bsp files as models. The usual type view.model path, model_info and native loadModel use the same importer. Scale Quake units with the entity transform; the example uses 1/32.
+
+The importer supports planar faces, triangle soups and quadratic patches; original face IDs are retained for cluster PVS, diffuse selection and independent 128×128 RGB lightmap pages. Base maps use their first UV set and each embedded irradiance page uses the face's second UV set. Set the renderer's baked quality to Off to inspect vertex and scene lighting separately. Shader translation chooses a static map/clampmap image, the editor image or a material-name image in TGA/JPEG/PNG format. Animated stages, blend-stage compositing, sky portals, collision brushes and game logic are outside this model importer.
+
+The optical regression uses **Egyptian Trouble** by Akom74 and Neon_Knight, with Egyptian textures by Simon “sock” O'Callaghan, from OpenArena Community Map Pack 1 v3. Map and textures are distributed under GPL-2.0-or-later. The capture uses the intermission camera authored in the level. The unmodified [Debian distribution and corresponding source](https://deb.debian.org/debian/pool/main/o/openarena-oacmp1/) contain the map, original artwork, notices and license.
+
+To reproduce, extract z_oacmp-volume1-v3.pk3 from openarena-oacmp1_3-17_all.deb, then run the following with the appropriate paths on a Mac with Metal.
+
+```sh
+python3 tests/render/prepare_openarena_bsp.py "$PK3" "$FIXTURE"
+export AIVERSE_OPENARENA_BSP="$FIXTURE/maps/oacmpdm3.bsp"
+export AIVERSE_BSP_FRAME_PNG="$OUTPUT/egyptian-trouble.png"
+cmake --build "$BUILD" --target aiverse_quake3_bsp_tests aiverse_bsp_metal_frame
+ctest --test-dir "$BUILD" -R '^quake3_bsp(_frame)?$' -V
+```
+
+
+### Additive model materials
+
+Material overrides accept `"blend":"additive"` (source RGB times source alpha
+plus destination RGB) and `"blend":"additive-unweighted"` (source RGB plus
+destination RGB). `blend` takes precedence over `alpha`; ordinary `alpha`/`blend`,
+`opaque` and `mask` modes also use the shared material parser. Both additive
+modes use the transparent pass with depth testing, no depth writes and no ordinary
+shadow casting. They remain scene-linear in HDR rendering.
+
+MDX/MDL Additive layers import as additive-unweighted and AddAlpha layers as
+additive. glTF materials can declare `extras.aiverseBlend` with either spelling;
+AIVERSE model export preserves it alongside the portable BLEND alphaMode fallback.
+FX `model.materials[]` accepts the same `blend` setting; omitting it inherits the
+imported material, and colour tracks retain an authored additive mode.

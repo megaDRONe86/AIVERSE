@@ -5,8 +5,10 @@
 #include <cmath>
 #include <stdexcept>
 #include "Editor.h"
+#include "core/PhysisNatureCommandSchema.h"
 #include "core/FxOps.h"
 #include "engine/fx/SpectraFX.h"
+#include "engine/fx/SpectraSdfFileIO.h"
 
 namespace aiverse::editor {
 
@@ -123,6 +125,7 @@ void Editor::registerFxPreviewOps() {
             r.set("z", Json::number(double(pos.z), 2));
             r.set("view", Json::string(playing() ? "game" : "scene"));
             r.set("particles", Json::number(int64_t(gameFx_.stats().particles)));
+            r.set("skippedCombatEvents", Json::number(gameFxBridge_.skippedCombatEvents()));
             r.set("quality", Json::string(fx::qualityName(gameFx_.quality())));
             if (d) {
                 r.set("emitters", Json::number(int64_t(d->emitters.size())));
@@ -149,7 +152,7 @@ void Editor::registerFxPreviewOps() {
             fx::EffectDef compiled;
             std::vector<std::string> errors;
             const Json overrides=p.has("overrides")?p["overrides"]:Json::object();
-            if(!spectra::compileGraph(p["graph"],overrides,compiled,errors)) {
+            if(!spectra::compileGraph(p["graph"],overrides,compiled,errors,fx::projectSdfReader(ws_.project.dir))) {
                 std::string why="SpectraFX graph compile failed:";
                 for(const auto& e:errors)why+="\n"+e;
                 throw std::runtime_error(why);
@@ -260,12 +263,7 @@ void Editor::registerFxPreviewOps() {
         "humidity 0..1, cellMeters (0 = map grid, else detailed preview cell), grass, flames, sound, volume, "
         "shoreSand (m of bare sand along authored NEREID water: no grass, no fuel; default 7), "
         "ignite {x,z} (scene metres; preview only), advanceTicks (0..600, preview only), reset. Then view_screenshot {window:'scene'}.",
-        Json::parse(R"({"properties":{"enabled":{"type":"boolean"},"playing":{"type":"boolean"},"speed":{"type":"number"},
-            "windSpeed":{"type":"number"},"windDirection":{"type":"number"},"humidity":{"type":"number"},
-            "cellMeters":{"type":"integer","minimum":0,"maximum":64},"grass":{"type":"boolean"},"flames":{"type":"boolean"},
-            "sound":{"type":"boolean"},"volume":{"type":"number"},"shoreSand":{"type":"number"},
-            "ignite":{"type":"object","properties":{"x":{"type":"number"},"z":{"type":"number"}},"required":["x","z"]},
-            "advanceTicks":{"type":"integer","minimum":0,"maximum":600},"reset":{"type":"boolean"}},"additionalProperties":false})"),
+        Json::parse(physisNatureCommandSchema),
         [this](const Json& p) -> Json {
             auto& nature = physisNaturePreview_;
             auto& st = nature.settings;

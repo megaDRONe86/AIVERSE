@@ -2,6 +2,7 @@
 #pragma once
 #include "engine/data/Json.h"
 #include "engine/render/Model.h"
+#include "engine/render/Animation.h"
 #include <atomic>
 #include <map>
 #include <mutex>
@@ -27,12 +28,15 @@ Json robotDocument();
 Json edit(const Json &document, const Json &commands);
 Build build(const Json &document, const std::atomic<bool> *cancel = nullptr, GeometryCache *cache = nullptr);
 Mesh geometry(const Json &specification, const std::atomic<bool> *cancel = nullptr);
+Mesh volumeCsgGeometry(const Json &specification, const std::atomic<bool> *cancel = nullptr);
 Mesh cableGeometry(const Json &specification, const std::atomic<bool> *cancel = nullptr);
 Mesh booleanMesh(const Mesh &a, const Mesh &b, const std::string &operation);
 void bevelConvex(Mesh &mesh, float amount);
 void smoothSubdivision(Mesh &mesh, int levels);
 void modifier(Mesh &mesh, const Json &operation);
 std::string exportGlb(const Model &model);
+Pose samplePose(const Model &model, const Json &request);
+std::string exportGlb(const Model &model, const Json& assetExtras);
 Json sample(const Model &model, const Json &request);
 Json autoWeights(const Json &document, const Json &request);
 Json generateClip(const Json &document, const Json &request);

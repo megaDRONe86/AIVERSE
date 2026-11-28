@@ -82,7 +82,7 @@ AIVERSE はメカニクスそのものを提供し、エージェントがゲー
 | **マルチプレイは同期ズレとの終わりなき戦い。** `float` がひとつあるだけで、iPhone と Android の対戦はずれていきます。 | シミュレーションはどこでもビット単位で同一です。浮動小数点ではなく固定小数点、独自の乱数生成器、チェックサム。CI はプッシュのたびに Linux x64/ARM64、Windows、macOS の対戦結果を照合します。ネットワークに流れるのはコマンドだけ。ロールバック付きロックステップと、マッチメイキングとリプレイ判定を備えたサーバーがあります。 |
 | **モバイル GPU は非力なのに、ゲームは美しくなければならない。** | 影、パーティクル、地形、ポストエフェクトなど、負荷の高い機能はすべて品質レベルを持ち、古い Mali や Adreno から Apple Silicon まで GPU に合わせて自動調整されます。 |
 | **全プラットフォームでのリリースはそれだけで一大プロジェクト。** 署名、アイコン、ストアや広告の SDK。 | `aiversebuild` ひとつのコマンドで .app、Xcode プロジェクト、Gradle/APK、Web、.exe を作成。アイコンとスプラッシュ画面は自動生成。App Store、Google Play、RuStore、Yandex Games、Steam、AdMob、AppLovin などのプラグインを用意し、ビルドにはゲームが選んだものだけが含まれます。 |
-| **新しいゲームは毎回ゼロから。** | 30 以上のプレイ可能なテンプレート、受け入れチェックリスト付きのジャンルキット、エージェント向けの 238 のスキル。新しいゲームは動くゲームから始まります。 |
+| **新しいゲームは毎回ゼロから。** | 30 以上のプレイ可能なテンプレート、受け入れチェックリスト付きのジャンルキット、エージェント向けの 303 のスキル。新しいゲームは動くゲームから始まります。 |
 | **メタと LiveOps はプロジェクトごとに書き直し。** | `aiverse::meta`：ショップ、通貨、クエスト、パス、デイリー報酬、スタミナ、クラン、トーナメント、天井付きの宝箱。JSON で設定します。 |
 
 ---
@@ -225,7 +225,7 @@ python3 tools/importers/port/aiverse_port.py /path/to/UnityProject --out /path/t
 - Unity 風のドッキング式エディター：シーン、インスペクター、地形、エフェクト、ライティング、UI、テストプレイ、デバイスシミュレーター
 - `aiversemcp`：エージェント向け MCP サーバー — マップの PHYSIS 設定、検証、Undo/Redo
 - **「ゲームを作る」**ウィザード
-- エージェント向けの 238 のスキルと、受け入れチェックリスト付きのジャンルキット
+- エージェント向けの 303 のスキルと、受け入れチェックリスト付きのジャンルキット
 - 手持ちのコピーから名作ゲームのアセットを取り込むインポーター
 
 </td>
@@ -258,12 +258,18 @@ Windows：`studio_windows.cmd [project]` で `AiverseStudio.exe` をビルドし
 CMake、Node.js が必要。WebView2 Runtime と Vulkan で動作）。
 
 `studio_mac.command` は Web UI とネイティブの Studio をビルドして開きます。エンジンだけなら：
-`cmake -S . -B build/mac -DCMAKE_BUILD_TYPE=Release && cmake --build build/mac -j 8`。従来の
-ImGui エディタ（`build/mac/AiverseEditor.app`）も引き続きビルドされ、Linux と Windows で動きます。
+`cmake -S . -B build/mac -DCMAKE_BUILD_TYPE=Release && cmake --build build/mac -j 8`。
 
-Linux：`cmake --preset linux-release && cmake --build build/linux-release`。コンパイルしたくない場合は、
-`builds` ブランチにビルド済みのエディターとツールがあります
-（[詳細](docs/ja/overview.md#ビルド済みエンジンbuilds-ブランチとコンパイラー不要の-aiversemcp)）。
+Linux では HTML5 Studio は WebKitGTK 4.1（2.40 以降）、SQLite、X11、Vulkan を使います。これらの開発パッケージと Node.js、CMake、Ninja を入れ、Studio を構成する前に Web UI をビルドします。
+
+```bash
+(cd apps/studio-web && npm install && npm run build)
+cmake --preset linux-release -DAIVERSE_BUILD_STUDIO_HTML5=ON -DAIVERSE_BUILD_EDITOR=OFF
+cmake --build --preset linux-release --target aiverse_studio
+./build/linux-release/apps/studio-native/AiverseStudio
+```
+
+Linux でエンジンだけをビルドするには `cmake --preset linux-release -DAIVERSE_BUILD_STUDIO_HTML5=OFF -DAIVERSE_BUILD_EDITOR=OFF` と `cmake --build --preset linux-release` を使います。`builds` ブランチにはビルド済みのツールもあります。 [ビルド済みのエンジンとツール](docs/ja/overview.md#ビルド済みエンジンbuilds-ブランチとコンパイラー不要の-aiversemcp)
 
 **2. ゲームを作る。** ハブで**「ゲームを作る」**を押すか、テンプレートからプロジェクトを作成します。
 Game ウィンドウですぐにボットと遊べます。

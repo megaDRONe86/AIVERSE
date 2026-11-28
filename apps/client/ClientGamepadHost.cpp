@@ -1,5 +1,6 @@
 // GameClient side of the gamepad (ClientGamepad.h): polling, snap targets, event injection, the cursor.
 #include "GameClient.h"
+#include <cstdlib>
 extern "C" {
 #include <lauxlib.h>
 #include <lua.h>
@@ -21,7 +22,7 @@ void GameClient::updateGamepad(float dt) {
     const std::string& want = gamepad_.snapTargets();
     if (sim_ && screen_ == Screen::Playing && want != "none")
         for (const auto& o : scene_.objects) {
-            if (o.type >= rules_.types.size()) continue;
+            if (o.type >= rules_.types.size() || !rules_.types[o.type].selectable) continue;
             bool structure = rules_.types[o.type].structure;
             if ((want == "structures" && !structure) || (want == "units" && structure)) continue;
             float2 sp;

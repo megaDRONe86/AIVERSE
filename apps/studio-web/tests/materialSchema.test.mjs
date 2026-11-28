@@ -22,7 +22,7 @@ test('patch output strips unsupported fields',()=>{
 });
 
 test('creation preset registry stays within native whitelist',()=>{
- assert.deepEqual([...MATERIAL_PRESETS],['matte','metal','glass']);
+ assert.deepEqual([...MATERIAL_PRESETS],['matte','metal','glass','triplanar']);
 });
 
 test('receiver shadow diffusion defaults to zero and survives authoring patches',()=>{
@@ -62,4 +62,13 @@ test('thin transmission remains independent of the SSS draft',()=>{
  assert.equal(fields.find(f=>f.key==='sssScale')?.value,.2);
  assert.equal(materialFields({}).find(f=>f.key==='thinTransmission')?.value,0);
  assert.deepEqual(editablePatch({thinTransmission:.35,sssScale:.8}),{thinTransmission:.35,sssScale:.8});
+});
+
+test('additive material modes can be selected and retained in a draft',()=>{
+ const alpha=materialFields({}).find(f=>f.key==='alpha');
+ for(const mode of ['additive','additive-unweighted']){
+  assert.ok(alpha.options.some(option=>option.value===mode));
+  assert.equal(materialFields({alpha:mode}).find(f=>f.key==='alpha').value,mode);
+  assert.deepEqual(editablePatch({alpha:mode}),{alpha:mode});
+ }
 });
