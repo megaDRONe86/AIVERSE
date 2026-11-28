@@ -3,26 +3,30 @@ import { ArchiveRestore, LocateFixed, Play, Pause, Square, StepForward } from 'l
 import { invoke } from '../bridge';
 import type { StudioGameState } from '../types';
 
-/** Play / Pause / Step / Stop, centred in the title bar (Unity layout). */
-export default function HeaderGameControls({enabled,onPlay,onError,onState}:{
-  enabled:boolean;onPlay:()=>void;onError:(message:string)=>void;onState?:(state:StudioGameState|null)=>void;
-}) {
+export function useStudioGameState(enabled:boolean,scriptErrors:boolean,project?:string) {
   const [state,setState]=useState<StudioGameState|null>(null);
-  const [pending,setPending]=useState(false);
-  const [note,setNote]=useState('');
-  useEffect(()=>{ if(!note)return; const t=window.setTimeout(()=>setNote(''),4000); return ()=>window.clearTimeout(t); },[note]);
-  useEffect(()=>{ onState?.(state); },[state,onState]);
   useEffect(()=>{
-    if(!enabled){setState(null);return;}
+    setState(null);
+    if(!enabled)return;
     let live=true,inFlight=false;
     const refresh=async()=>{
       if(inFlight)return;inFlight=true;
-      try {const next=await invoke('studio.gameState',{});if(live)setState(next);}
+      try {const next=await invoke('studio.gameState',{scriptErrors});if(live)setState(next);}
       catch {} finally {inFlight=false;}
     };
     void refresh();const timer=window.setInterval(refresh,500);
     return ()=>{live=false;window.clearInterval(timer);};
-  },[enabled]);
+  },[enabled,scriptErrors,project]);
+  return [state,setState] as const;
+}
+
+/** Play / Pause / Step / Stop, centred in the title bar (Unity layout). */
+export default function HeaderGameControls({enabled,onPlay,onError,state,setState}:{
+  enabled:boolean;onPlay:()=>void;onError:(message:string)=>void;state:StudioGameState|null;setState:(state:StudioGameState|null)=>void;
+}) {
+  const [pending,setPending]=useState(false);
+  const [note,setNote]=useState('');
+  useEffect(()=>{ if(!note)return; const t=window.setTimeout(()=>setNote(''),4000); return ()=>window.clearTimeout(t); },[note]);
   const action=async(kind:'play'|'here'|'pause'|'step'|'stop')=>{
     setPending(true);
     try {
@@ -46,15 +50,8 @@ export default function HeaderGameControls({enabled,onPlay,onError,onState}:{
     return ()=>window.removeEventListener('studio:play-control',control);
   });
   const playing=!!state?.active;
-  // Keep play changes: map entities take their in-game positions and amounts (⌥: also remove the ones that died).
-  const keep=async(removeDead:boolean)=>{
-    setPending(true);
-    try {
-      const r=await invoke('studio.keepPlayChanges',{removeDead});
-      setNote(r.moved+r.amounts+r.removed ? `Kept: ${r.moved} moved, ${r.amounts} amounts${r.removed?`, ${r.removed} removed`:''}` : 'Nothing changed on the map');
-    }catch(e){onError(e instanceof Error?e.message:String(e));}
-    finally{setPending(false);}
-  };
+  // Keep changes is reviewed in the Game panel, never applied by a title-bar shortcut.
+  const keep=()=>{onPlay();setNote('Game → Review changes');};
   return <div className={'header-game-controls'+(playing?' is-playing':'')} role="group" aria-label="Play controls">
     {playing
       ? <button className="icon-button is-on" aria-label="Stop" title="Stop (⌘P)" disabled={pending}
@@ -68,8 +65,8 @@ export default function HeaderGameControls({enabled,onPlay,onError,onState}:{
     <button className="icon-button" aria-label="Step one tick" title="Step one tick (⌥⌘P)"
       disabled={!state?.canStep||!state?.paused||pending} onClick={()=>void action('step')}><StepForward size={16}/></button>
     {playing && <button className="icon-button" aria-label="Keep play changes"
-      title="Keep play changes: map objects take their in-game positions and resource amounts (one undo step) · ⌥-click: also remove the ones that died"
-      disabled={!state?.inMatch||pending} onClick={e=>void keep(e.altKey)}><ArchiveRestore size={15}/></button>}
+      title="Open Game to review and selectively keep play changes"
+      disabled={!state?.inMatch||pending} onClick={keep}><ArchiveRestore size={15}/></button>}
     {note && <span className="header-game-note" role="status">{note}</span>}
   </div>;
 }

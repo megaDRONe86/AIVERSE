@@ -84,7 +84,7 @@ travailler sur le jeu.
 | **Le multijoueur, c’est des désynchronisations sans fin.** Un seul `float` suffit pour qu’une partie entre un iPhone et un Android diverge. | La simulation est identique au bit près partout : virgule fixe au lieu de flottants, générateur aléatoire propre, sommes de contrôle. La CI compare les parties sur Linux x64/ARM64, Windows et macOS à chaque push. Seules les commandes transitent sur le réseau ; il y a un lockstep avec rollback et un serveur avec matchmaking et verdict par replay. |
 | **Les GPU mobiles sont faibles, mais le jeu doit être beau.** | Chaque fonction coûteuse — ombres, particules, terrain, post-traitement — a des niveaux de qualité et s’adapte au GPU, des vieux Mali et Adreno jusqu’à Apple Silicon. |
 | **Sortir sur toutes les plateformes est un projet à part entière.** Signatures, icônes, SDK des stores et de la publicité. | `aiversebuild` produit en une commande un .app, un projet Xcode, Gradle/APK, web et .exe. Icônes et écrans de démarrage sont générés. Plugins pour l’App Store, Google Play, RuStore, Yandex Games, Steam, AdMob, AppLovin et d’autres — un build n’embarque que ceux que le jeu choisit. |
-| **Chaque nouveau jeu repart de zéro.** | Plus de 30 modèles jouables, des kits de genre avec listes de recette, 238 compétences pour les agents. Un nouveau jeu part d’un jeu qui fonctionne déjà. |
+| **Chaque nouveau jeu repart de zéro.** | Plus de 30 modèles jouables, des kits de genre avec listes de recette, 303 compétences pour les agents. Un nouveau jeu part d’un jeu qui fonctionne déjà. |
 | **La méta et le LiveOps sont réécrits dans chaque projet.** | `aiverse::meta` : boutique, monnaies, quêtes, passes, récompenses quotidiennes, énergie, clans, tournois, coffres avec garantie — configurés en JSON. |
 
 ---
@@ -228,7 +228,7 @@ Les modèles sont des paquets du [catalogue](https://chromealex.github.io/AIVERS
 - Éditeur à fenêtres ancrables façon Unity : scène, inspecteur, terrain, effets, éclairage, UI, partie de test et simulateur d’appareils
 - `aiversemcp` — serveur MCP pour les agents — configuration PHYSIS des cartes, validation et Undo/Redo
 - Assistant **Créer un jeu**
-- 238 compétences pour les agents et kits de genre avec listes de recette
+- 303 compétences pour les agents et kits de genre avec listes de recette
 - Importateurs de ressources de jeux classiques depuis votre propre copie
 
 </td>
@@ -261,12 +261,18 @@ Windows : `studio_windows.cmd [project]` compile et ouvre `AiverseStudio.exe` (r
 CMake, Node.js ; fonctionne avec WebView2 Runtime et Vulkan).
 
 `studio_mac.command` compile l'interface web et le Studio natif puis l'ouvre. Le moteur seul :
-`cmake -S . -B build/mac -DCMAKE_BUILD_TYPE=Release && cmake --build build/mac -j 8`. L'ancien
-éditeur ImGui (`build/mac/AiverseEditor.app`) est toujours compilé et fonctionne sous Linux et Windows.
+`cmake -S . -B build/mac -DCMAKE_BUILD_TYPE=Release && cmake --build build/mac -j 8`.
 
-Linux : `cmake --preset linux-release && cmake --build build/linux-release`. Si vous préférez ne pas
-compiler, la branche `builds` contient l’éditeur et les outils précompilés
-([détails](docs/fr/overview.md#moteur-précompilé-branche-builds-et-aiversemcp-sans-compilateur)).
+Sous Linux, HTML5 Studio utilise WebKitGTK 4.1 (2.40 ou plus récent), SQLite, X11 et Vulkan. Avec leurs paquets de développement, Node.js, CMake et Ninja installés, compilez l’interface web avant de configurer Studio.
+
+```bash
+(cd apps/studio-web && npm install && npm run build)
+cmake --preset linux-release -DAIVERSE_BUILD_STUDIO_HTML5=ON -DAIVERSE_BUILD_EDITOR=OFF
+cmake --build --preset linux-release --target aiverse_studio
+./build/linux-release/apps/studio-native/AiverseStudio
+```
+
+Pour le moteur seul sous Linux : `cmake --preset linux-release -DAIVERSE_BUILD_STUDIO_HTML5=OFF -DAIVERSE_BUILD_EDITOR=OFF` puis `cmake --build --preset linux-release`. La branche `builds` fournit aussi des outils précompilés. [Moteur et outils précompilés](docs/fr/overview.md#moteur-précompilé-branche-builds-et-aiversemcp-sans-compilateur)
 
 **2. Créer un jeu.** Dans le hub, cliquez sur **Créer un jeu** ou créez un projet à partir d’un modèle. Vous
 pouvez y jouer contre des bots tout de suite dans la fenêtre Game.

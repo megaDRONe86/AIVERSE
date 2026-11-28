@@ -13,7 +13,7 @@
 #include "engine/fx/SpectraFxGpuEmitterLibrary.h"
 #include "engine/fx/SpectraFxGpuRoutes.h"
 #include "engine/fx/SpectraFxSceneHost.h"
-#include "SpectraFxGpuPreviewPolicy.h"
+#include "apps/editor/core/SpectraFxGpuPreviewPolicy.h"
 #include "engine/render/Renderer3D.h"
 #include <cmath>
 #include <cstdint>
@@ -576,7 +576,7 @@ private:
         pass.clearColor[2]=0.16f;
         renderer.render(pass);
         if(canDraw)
-            previewHost_.render(renderer.lighting,view);
+            previewHost_.render(renderer.lighting,view,&renderer);
         previewDevice_->endPass();
         previewViewport_.image(*previewDevice_,width,height);
         if(ImGui::IsItemHovered()) {

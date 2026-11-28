@@ -10,17 +10,29 @@
 namespace aiverse::studio {
 struct StudioGameLaunch {
     std::string project; std::optional<size_t> map;
+    bool actorSession=false;
+    double startSpeed=1;
+    std::optional<uint8_t> localSeat;
+    std::string sourceMap;
+    uint64_t sourceRevision=0;
     // "Play from here": first match camera (target x, z; distance; pitch, yaw in degrees), Scene view's.
     std::optional<std::array<float,5>> camera;
 };
-inline StudioGameLaunch studioGameLaunch(const editor::Workspace& ws,bool currentMap) {
+inline StudioGameLaunch studioGameLaunch(const editor::Workspace& ws,bool currentMap,std::optional<uint8_t> localSeat={}) {
     if (ws.project.dir.empty()) throw std::runtime_error("Open a project before Play");
-    if (ws.project.actorSession()) throw std::runtime_error("Play of actor-session projects needs the actor-session client; Studio host migration is pending (G1)");
     if (ws.map.dirty || ws.project.rulesDirty || ws.project.manifestDirty)
         throw std::runtime_error("Save changes before Play");
     const auto missing=editor::missingNativeModules(ws.project.rulesJson,editor::compiledNativeIds());
     if (!missing.empty()) throw std::runtime_error("This Studio build lacks project native module: "+missing.front());
-    StudioGameLaunch plan{ws.project.dir,{}};
+    StudioGameLaunch plan{};
+    plan.actorSession=ws.project.actorSession();
+    plan.project=ws.project.dir;
+    if (localSeat) {
+        const auto& players=ws.map.data.players;
+        if (!currentMap || plan.actorSession || players.empty() || players.size()>255 || *localSeat>players.size() ||
+            (*localSeat && players[*localSeat-1].waves)) throw std::runtime_error("Choose a playable seat on the current map");
+        plan.localSeat=localSeat;
+    }
     if (currentMap) {
         if (ws.map.path.empty()) throw std::runtime_error("Save the current map before Play");
         const auto path=std::filesystem::weakly_canonical(ws.map.path);
@@ -30,7 +42,12 @@ inline StudioGameLaunch studioGameLaunch(const editor::Workspace& ws,bool curren
             if (std::filesystem::weakly_canonical(listed)==path) { plan.map=i; break; }
         }
         if (!plan.map) throw std::runtime_error("Save the map into the project map list before Play");
+        plan.sourceMap=ws.map.path;plan.sourceRevision=ws.map.revision;
     }
     return plan;
+}
+inline bool studioPlaySourceMatches(const StudioGameLaunch& plan,const editor::Workspace& ws){
+    return plan.map.has_value()&&plan.project==ws.project.dir&&plan.sourceMap==ws.map.path&&
+        plan.sourceRevision==ws.map.revision&&!ws.map.dirty&&!ws.project.rulesDirty&&!ws.project.manifestDirty;
 }
 }

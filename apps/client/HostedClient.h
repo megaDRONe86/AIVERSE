@@ -15,8 +15,10 @@
 #include "engine/render/RenderDeviceLifetime.h"
 #include "engine/platform/Platform.h"
 
-namespace aiverse { class Simulation; }
+namespace aiverse { class Simulation; class Json; }
 namespace aiverse::client { class GameClient; }
+namespace aiverse::render { enum class PrismaQuality; }
+namespace aiverse::game { class ViewScripts; }
 
 namespace aiverse::client {
 
@@ -26,7 +28,7 @@ public:
     ~HostedClient();
     // projectDir: content root; engineAssets: folder with the engine's assets ("engine/..." paths)
     void start(gfx::Device& dev, const std::string& projectDir, const std::string& engineAssets,
-               render::RenderDeviceLifetime::Lease deviceLease={}, std::optional<size_t> initialMap={});
+               render::RenderDeviceLifetime::Lease deviceLease={}, std::optional<size_t> initialMap={}, std::optional<uint8_t> localSeat={});
     void stop();
     // "Play from here": the first match camera (see GameClient::setStartCamera); call after start().
     void setStartCamera(float x, float z, float distance, float pitchDeg, float yawDeg);
@@ -41,6 +43,10 @@ public:
     // a destroyed graphics device. Intentionally keep abandoned C++ owners
     // inert until process exit (no GPU destroy and no destructor callbacks).
     size_t abandonOnDeviceLoss();
+    // Non-mutating owner-thread preflight for full host teardown.
+    bool canShutdown() const noexcept;
+    struct RetirementDiagnostics { size_t pending=0,busy=0,quarantined=0,staleEpoch=0; };
+    RetirementDiagnostics retirementDiagnostics() const noexcept;
     size_t pendingRetiredClients() const { return retired_.size(); }
     bool active() const { return client_ != nullptr; }
     bool loading() const;
@@ -57,12 +63,25 @@ public:
     bool quitRequested() const { return view_.quitRequested; }
     bool capturing() const { return captured_; }
     Simulation* simulation();
+    const game::ViewScripts* viewScripts() const;
+    Json assetResidencyReport() const;
+    Json staticGeometryReport() const;
+    Json prismaFrameReports() const;
+    void setPostQuality(render::PrismaQuality quality);
     bool inMatch() const;
+    // Forward editor-authored cave SDF into the SAME GameClient used by Play.
+    // Visual only; game collision and navigation are separate owners.
+    bool updateCavernsVisual(const Json& authored);
+
+    std::optional<size_t> currentMapIndex() const;
     std::string errorText() const;
     bool canControl() const;
     bool paused() const;
     bool canStep() const;
     bool setPaused(bool paused);
+    double simulationSpeed() const;
+    bool setSpeed(double speed);
+    bool checkpoint(bool restore);
     bool stepOnce();
 
 private:
@@ -73,14 +92,22 @@ private:
         std::unique_ptr<client::GameClient> client;
         platform::HostedView view;
         gfx::Device* device = nullptr;
+        render::RenderDeviceLifetime::Lease epoch;
         uint64_t completionToken = 0; // zero means quarantine until GPU idle
         bool initialized = false;
+        // Unknown partial shutdown is not safe to retry or destroy.
+        bool shutdownFailed = false;
     };
     std::vector<RetiredClient> retired_;
     platform::HostedView view_;
     gfx::Device* dev_ = nullptr;
+    std::unique_ptr<render::RenderDeviceLifetime> ownedEpoch_;
+    render::RenderDeviceLifetime::Lease epoch_;
+    bool currentEpochValid() const noexcept;
+    bool retiredEpochValid(const RetiredClient& item) const noexcept;
     int step_ = 0;
     std::optional<size_t> initialMap_;
+    std::optional<uint8_t> initialSeat_;
     float x_ = 0, y_ = 0, k_ = 1;
     bool focused_ = false, captured_ = false;
     bool finger_ = false;   // touch profile: the left button is down as finger 1 (event)

@@ -122,6 +122,7 @@
   "hud.ready": "READY", "hud.cooldown_seconds": "{seconds}s",
   "@language": "English",
 
+  "matchfiles": {"finished": "End of replay", "save": "Save in a new slot", "load": "Load match", "record": "Save replay", "watch": "Watch replay", "play": "Play", "pause": "Pause"},
   "menu": {
     "difficulty": "Difficulty",
     "easy": "Easy",
@@ -147,6 +148,9 @@
   },
 
   "hud": {
+    "idle_worker": "Idle worker",
+    "send_chat": "Send",
+    "messages": "Messages",
     "per_second": "({value}/s)",
     "supply": "Supply: {used}/{cap}",
     "eliminated": " (out)",
@@ -167,6 +171,7 @@
   },
 
   "mode": {
+    "move": "Move: choose a point",
     "attack": "Attack: choose a target",
     "patrol": "Patrol: choose a point",
     "repair": "Repair: choose a damaged unit",
@@ -187,6 +192,7 @@
   },
 
   "card": {
+    "move": "Move",
     "hint_touch": "Tap one of your units",
     "hint_mouse": "Drag a box to select units",
     "all_army": "All army",
@@ -239,6 +245,7 @@
     "shadows_high": "Shadows: high",
     "restart": "Restart",
     "to_menu": "Main menu",
+    "quit": "Quit game",
     "sound": "Sound:",
     "music": "Music:",
     "off": "off",
@@ -267,6 +274,9 @@
   },
 
   "lobby": {
+    "lan_host": "Host on LAN",
+    "lan_find": "Find LAN games",
+    "discovery_failed": "Could not open LAN discovery",
     "title": "Online game",
     "server": "Server",
     "name": "Your name",

@@ -4,6 +4,8 @@
 #include "Vulkan.h"
 #include "VkApi.h"
 #include "VkShaderCompiler.h"
+#include "VkScopeTiming.h"
+#include <deque>
 
 #include <array>
 #include <functional>
@@ -104,7 +106,7 @@ struct VCompute {
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkDescriptorSetLayout descriptorLayout = VK_NULL_HANDLE;
     VkPipelineLayout layout = VK_NULL_HANDLE;
-    bool bufferPushConstants = false;
+    bool bufferPushConstants = false,storageUniforms=false;
     uint32_t bufferBindings = 4;
 };
 struct VTextureView { VkImageView native = VK_NULL_HANDLE; uint32_t parentId = 0; };
@@ -159,6 +161,9 @@ struct FrameSlot {
     VkQueryPool timing = VK_NULL_HANDLE;
     uint32_t timingCount = 0;
     std::vector<std::string> timingLabels;   // one per query, "" = frame start
+    VkQueryPool scopeTiming=VK_NULL_HANDLE;
+    ScopeTimingFrame scopeRecords;
+    bool scopeSubmitted=false;
 };
 
 class VulkanDevice final : public Device {
@@ -180,6 +185,7 @@ public:
         gpuProps_.limits.maxComputeWorkGroupInvocations >= 64 &&
         gpuProps_.limits.maxComputeWorkGroupSize[0] >= 64; }
     bool supportsStorageTexture(PixelFormat,TextureDimension) const override;
+    bool supportsStorageUniformCompute(uint32_t slots) const override;
     ComputeHandle createCompute(const ComputeDesc&) override;
     void destroyCompute(ComputeHandle) override;
     bool beginCompute(ComputeHandle) override;
@@ -189,7 +195,12 @@ public:
     void setComputeUniforms(const void*,size_t) override;
     void dispatch(uint32_t,uint32_t) override;
     bool dispatchChecked(uint32_t,uint32_t=1) override;
+    bool supportsGpuComputeIndirect() const override{return supportsCompute();}
+    bool dispatchGpuIndirect(BufferHandle,size_t=0) override;
+    bool dispatchInternal(uint32_t,uint32_t,BufferHandle,size_t);
+    bool readBuffer(BufferHandle,void*,size_t) override;
     bool readBufferAsync(BufferHandle,size_t,BufferReadFn) override;
+    bool readBufferRangeAsync(BufferHandle,size_t,size_t,BufferReadFn) override;
     void endCompute() override;
     bool supportsTextureViews() const override { return true; }
     bool supportsTextureDimension(TextureDimension d) const override {
@@ -200,12 +211,19 @@ public:
     void updateBuffer(BufferHandle h, const void* data, size_t size, size_t offset) override;
     bool updateSharedBufferChecked(BufferHandle h, const void* data,
                                    size_t size, size_t offset) override;
+    bool updateStorageBufferChecked(BufferHandle,const void*,size_t,size_t=0) override;
+    bool supportsStorageBufferCopy() const override{return supportsCompute();}
+    bool copyStorageBufferChecked(BufferHandle,BufferHandle,size_t,size_t=0,size_t=0) override;
+    bool canUpdateSharedBuffers()const override{return !inPass_&&!activeComputeId_;}
     bool bufferInfo(BufferHandle h, BufferInfo& out) const override;
     void destroyBuffer(BufferHandle h) override;
     BufferUpdateStats bufferUpdateStats(BufferHandle h) override;
     TextureHandle createTexture(const TextureDesc& d) override;
     void updateTexture(TextureHandle h, int x, int y, int w, int h2, const void* pixels, int rowPitchBytes) override;
     bool updateTextureRegion(TextureHandle h, const TextureUploadDesc& u) override;
+    bool supportsStorageBufferTextureCopy() const override { return supportsCompute() && gpuHealthy(); }
+    bool supportsHdrTextureMipGeneration(PixelFormat) const override;
+    bool copyStorageBufferToTexture2D(BufferHandle,TextureHandle,const BufferTextureCopy2D&) override;
     bool textureInfo(TextureHandle h, TextureInfo& out) const override;
     void destroyTexture(TextureHandle h) override;
     TextureViewHandle createTextureView(TextureHandle texture, const TextureViewDesc& desc) override;
@@ -221,6 +239,9 @@ public:
     bool readTextureAsync(TextureHandle, TextureReadbackDesc, TextureReadFn) override;
     bool gpuHealthy() const override { return healthy_; }
     bool waitIdle() override;
+    bool beginGpuScope(uint64_t tag) override;
+    void endGpuScope() override;
+    std::vector<GpuTiming> takeGpuScopeTimings() override;
     // serial_ names the currently recording VkFence-backed frame. This is
     // NOT evidence of completion. completed_ advances only after a real
     // vkWaitForFences return of VK_SUCCESS for its recorded frame slot.
@@ -239,7 +260,12 @@ public:
     void abandonRetirementTokenAfterIdle(uint64_t token) override;
 
     void beginFrame(int framebufferWidth, int framebufferHeight) override;
+    bool supportsOffscreenFrames() const override { return supportsCompute(); }
+    bool beginOffscreenFrame() override;
     void endFrame() override;
+    void captureNextFrameTagged(TaggedCaptureFn fn) override {
+        captureNextFrame([this,fn=std::move(fn)](int w,int h,std::vector<uint8_t> pixels){if(fn)fn(frameSerial(),w,h,std::move(pixels));});
+    }
     void captureNextFrame(CaptureFn fn) override { capture_ = std::move(fn); }
     bool captureTexture(TextureHandle source,CaptureFn callback) override;
     bool readTexturePixelAsync(TextureHandle,int,int,PixelReadFn) override;
@@ -414,6 +440,10 @@ private:
     double timingFrameMs_ = 0.0;
     void timestamp(const std::string& label, VkPipelineStageFlagBits stage);
     void collectTiming(FrameSlot& s);
+    uint32_t scopeTimestampBits_=0;
+    std::deque<GpuTiming> completedScopes_;
+    void collectScopeTiming(FrameSlot& s,bool completed);
+    void pollScopeTimings();
     std::vector<VkImageView> swapViews_;
     VkDescriptorSetLayout rotLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout rotPipeLayout_ = VK_NULL_HANDLE;
@@ -437,7 +467,8 @@ private:
     uint64_t serial_ = 1, completed_ = 0;
     uint64_t nextRetirementToken_ = 1;
     std::map<uint64_t,VkFence> retirementFences_;
-    bool recording_ = false;
+    bool recording_ = false, offscreenFrame_ = false;
+    bool beginFrameInternal(int w,int h,bool offscreen);
     struct Garbage { uint64_t serial; std::function<void()> fn; };
     std::vector<Garbage> garbage_;
     CaptureFn capture_;
@@ -529,7 +560,7 @@ private:
     uint32_t activeComputeId_ = 0;
     std::array<TextureHandle,4> computeStorage_{};
     std::array<TextureHandle,8> computeSampled_{};
-    std::array<BufferHandle,8> computeBuffers_{};
+    std::array<BufferHandle,32> computeBuffers_{};
     bool computeStateValid_ = false;
     std::vector<uint8_t> computeUniforms_;
 };

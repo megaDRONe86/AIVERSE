@@ -1,16 +1,16 @@
 /** Persistable nested docking geometry; no React, renderer or genre dependencies. */
-export const STUDIO_PANELS = ['hierarchy','assets','scene','game','materials','animation','facial_rig','inspector','console','lighting','shader_graph','project','runtime','nereid_flow','rules','human_appearance','build','human_creator','wind','history','terrain','water','roads','tiles','fog','generate','postfx','effects','lightbake','models','scripts','input','overlays','branding','asset_audit','agent','fields','physis','actor','raid','balance','fx_graph','fx_functions','modeling','anim_assets','anim_graph','anim_rig','model_anim','project_import','stats','snapshot_diff','frame_capture','texture_resources','extensions','attachments','terraweave_generator','catalog'] as const;
+export const STUDIO_PANELS = ['hierarchy','assets','scene','game','materials','texture_graph','animation','facial_rig','inspector','console','lighting','shader_graph','project','runtime','nereid_flow','rules','human_appearance','build','human_creator','wind','history','terrain','water','roads','tiles','fog','generate','postfx','effects','lightbake','models','scripts','input','overlays','branding','asset_audit','agent','fields','physis','actor','raid','balance','fx_graph','fx_library','fx_functions','modeling','anim_assets','anim_graph','anim_rig','model_anim','project_import','stats','snapshot_diff','frame_capture','texture_resources','extensions','attachments','terraweave_generator','building_generator','catalog','feature_readiness','caverns','world_persistence','static_geometry','world_explorer','simulation_profiler','project_data'] as const;
 export type StudioPanel = typeof STUDIO_PANELS[number];
 /** Single metadata source for the UI shell and AI-authored panel integrations. */
 export const STUDIO_PANEL_TITLES: Record<StudioPanel,string> = {
   hierarchy: 'Hierarchy', assets: 'Assets', scene: 'Scene', game: 'Game',
-  materials: 'Materials', animation: 'Animation', facial_rig: 'Facial Rig', inspector: 'Inspector', console: 'Console', lighting: 'Lighting', shader_graph: 'Shader Graph', project: 'Project',
+  materials: 'Materials', texture_graph: 'Texture Graph', animation: 'Animation', facial_rig: 'Facial Rig', inspector: 'Inspector', console: 'Console', lighting: 'Lighting', shader_graph: 'Shader Graph', project: 'Project',
   runtime: "Runtime",
   nereid_flow: "NEREID Water",
   rules: "Rules",
   human_appearance: "VIVID Appearance",
   build: "Build",
-  wind: "Ветер",
+  wind: "Wind",
   history: "History",
   terrain: "Terrain",
   water: "Water",
@@ -40,24 +40,33 @@ export const STUDIO_PANEL_TITLES: Record<StudioPanel,string> = {
   raid: "Raid",
   balance: "Balance",
   fx_graph: "SpectraFX Graph",
+  fx_library: "SpectraFX Library",
   fx_functions: "SpectraFX Functions",
   modeling: "Modeling",
-  anim_assets: "Animation Clips",
+  anim_assets: "Animation Assets",
   anim_graph: "Animation Graph",
-  anim_rig: "Rig",
+  anim_rig: "Animation Rig",
   model_anim: "Model Animation",
   project_import: "Import Project",
   human_creator: "Character Creator",
+  static_geometry: "Static Geometry",
+  world_explorer: "World Explorer",
+  simulation_profiler: "Simulation Profiler",
+  world_persistence: "World Persistence",
   terraweave_generator: "TerraWeave Generator",
-  catalog: "Catalog"
+  building_generator: "Building Generator",
+  catalog: "Catalog",
+  feature_readiness: "Feature Readiness",
+  caverns: "Caverns",
+  project_data: "Project Data"
 };
 export const STUDIO_PANEL_HOME: Record<StudioPanel,string> = {
   hierarchy: 'dock-left', assets: 'dock-bottom', scene: 'dock-center', game: 'dock-center',
-  materials: 'dock-center', animation: 'dock-center', facial_rig: 'dock-center', inspector: 'dock-right', console: 'dock-bottom', lighting: 'dock-right', shader_graph: 'dock-center', project: 'dock-left',
+  materials: 'dock-center', texture_graph: 'dock-center', animation: 'dock-center', facial_rig: 'dock-center', inspector: 'dock-right', console: 'dock-bottom', lighting: 'dock-right', shader_graph: 'dock-center', project: 'dock-left',
   runtime: "dock-right",
   nereid_flow: "dock-right",
   rules: "dock-center",
-  human_appearance: "dock-right",
+  human_appearance: "dock-center",
   build: "dock-center",
   wind: "dock-right",
   history: "dock-right",
@@ -73,7 +82,7 @@ export const STUDIO_PANEL_HOME: Record<StudioPanel,string> = {
   models: "dock-right",
   scripts: "dock-center",
   input: "dock-right",
-  overlays: "dock-right",
+  overlays: "dock-center",
   branding: "dock-right",
   asset_audit: "dock-right",
   agent: "dock-bottom",
@@ -89,16 +98,25 @@ export const STUDIO_PANEL_HOME: Record<StudioPanel,string> = {
   raid: "dock-right",
   balance: "dock-right",
   fx_graph: "dock-right",
+  fx_library: "dock-right",
   fx_functions: "dock-right",
   modeling: "dock-right",
   anim_assets: "dock-right",
-  anim_graph: "dock-right",
-  anim_rig: "dock-right",
+  anim_graph: "dock-center",
+  anim_rig: "dock-center",
   model_anim: "dock-right",
   project_import: "dock-right",
-  human_creator: "dock-right",
+  human_creator: "dock-center",
+  static_geometry: "dock-right",
+  world_explorer: "dock-right",
+  simulation_profiler: "dock-bottom",
+  world_persistence: "dock-right",
   terraweave_generator: "dock-right",
-  catalog: "dock-right"
+  building_generator: "dock-right",
+  catalog: "dock-right",
+  feature_readiness: "dock-center",
+  caverns: "dock-right",
+  project_data: "dock-center"
 };
 
 export type DockAxis = 'horizontal' | 'vertical';
@@ -126,14 +144,16 @@ function stack(id: string, tabs: StudioPanel[], active: StudioPanel | null = tab
 function split(id: string, axis: DockAxis, ratio: number, first: DockNode, second: DockNode): DockSplit {
   return {kind:'split',id,axis,ratio,first,second};
 }
+/** Catalog, TerraWeave Generator and Texture Graph are on-demand tools.
+ * Keep them registered and reopenable without adding more default tabs. */
 export function defaultDockTree(): DockTree {
   return { version:3, root:split('root','vertical',.76,
     split('split-body-left','horizontal',.19,
       stack('dock-left',['hierarchy','project'],'hierarchy'),
       split('split-body-right','horizontal',.72,
-        stack('dock-center',['scene','game','materials','animation','facial_rig','shader_graph','rules','build','scripts','snapshot_diff'],'scene'),
-        stack('dock-right',['inspector','human_creator','lighting','runtime','nereid_flow','human_appearance','wind','history','terrain','water','roads','tiles','fog','generate','postfx','effects','lightbake','models','input','overlays','branding','asset_audit','fields','physis','actor','raid','balance','fx_graph','fx_functions','modeling','anim_assets','anim_graph','anim_rig','model_anim','project_import','stats','extensions','attachments'],'inspector'))),
-    stack('dock-bottom',['assets','console','agent','frame_capture','texture_resources'],'assets')) };
+        stack('dock-center',['scene','game','materials','animation','facial_rig','shader_graph','anim_graph','anim_rig','human_creator','human_appearance','rules','build','scripts','snapshot_diff','feature_readiness','overlays'],'scene'),
+        stack('dock-right',['inspector','lighting','runtime','nereid_flow','wind','history','terrain','water','roads','tiles','fog','generate','postfx','effects','lightbake','models','input','branding','asset_audit','fields','physis','actor','raid','balance','fx_graph','fx_library','fx_functions','modeling','anim_assets','model_anim','project_import','stats','extensions','attachments','world_persistence','static_geometry','building_generator','caverns','world_explorer'],'inspector'))),
+    stack('dock-bottom',['assets','console','agent','frame_capture','texture_resources','simulation_profiler'],'assets')) };
 }
 function traverse(node: DockNode, visitor: (n: DockNode)=>void): void {
   visitor(node);
@@ -224,6 +244,18 @@ export function closeTab(tree: DockTree, panel: StudioPanel): DockTree {
   const t=normalizeDockTree(tree);
   return compactDockTree({version:3,root:remove(t.root,panel)});
 }
+/** Switching tabs within the expanded stack keeps the same workspace geometry. */
+export function retainsExpandedStack(before: DockNode, after: DockNode, stackId: string): boolean {
+  if (before === after) return true;
+  if (before.id !== after.id) return false;
+  if (before.kind === 'split' && after.kind === 'split')
+    return before.axis === after.axis && before.ratio === after.ratio &&
+      retainsExpandedStack(before.first, after.first, stackId) && retainsExpandedStack(before.second, after.second, stackId);
+  return before.kind === 'stack' && after.kind === 'stack' &&
+    (before.id === stackId || before.active === after.active) &&
+    before.tabs.length === after.tabs.length && before.tabs.every((panel, index) => panel === after.tabs[index]);
+}
+
 export function activateTab(tree: DockTree, stackId: string, panel: StudioPanel): DockTree {
   const t=normalizeDockTree(tree);
   return {version:3,root:update(t.root,stackId,n=>n.kind==='stack' && n.tabs.includes(panel)?{...n,active:panel}:n)};
@@ -304,27 +336,19 @@ export function migrateDockV2(input: unknown): DockTree {
   const withRight=update(withLeft,'split-body-right',n=>n.kind==='split'?{...n,ratio:size(1-right/1000,.77,.12,.88)}:n);
   return normalizeDockTree({version:3,root:withRight});
 }
-// MetaHuman-style character studio: the editor wide on the left, the Scene
-// viewport as the main stage, a narrow right column, no bottom dock.
 export const DOCK_PRESET_EVENT='aiverse:dock-preset';
 export function characterDockTree(): DockTree {
-  return { version:3, root:split('root','horizontal',.36,
-    stack('dock-left',['human_creator','hierarchy','project'],'human_creator'),
-    split('split-body-right','horizontal',.8,
-      stack('dock-center',['scene','game','materials','animation','facial_rig','shader_graph'],'scene'),
-      stack('dock-right',['inspector','lighting','runtime','nereid_flow','human_appearance'],'lighting'))) };
-}
-// The character editor previews in the Scene viewport, which is not drawn
-// while another tab covers it: never keep the editor in the Scene stack.
-export function moveCharacterEditorBesideScene(tree: DockTree): DockTree {
-  return panelStack(tree,'human_creator')==='dock-center' && findDockStack(tree,'dock-right')
-    ? moveTab(tree,'human_creator','dock-right') : tree;
+  return {version:3, root:split('root','horizontal',.15,
+    stack('dock-left',['hierarchy','project'],'hierarchy'),
+    split('split-body-right','horizontal',.78,
+      stack('dock-center',['human_creator','human_appearance','facial_rig','scene'],'human_creator'),
+      stack('dock-right',['inspector','lighting'],'inspector')))};
 }
 export function readNestedDock(): DockTree {
   if(typeof window==='undefined')return defaultDockTree();
   try{
     const stored=window.localStorage.getItem(STORAGE_KEY);
-    if(stored!==null)return moveCharacterEditorBesideScene(normalizeDockTree(JSON.parse(stored) as unknown));
+    if(stored!==null)return normalizeDockTree(JSON.parse(stored) as unknown);
     const previous=window.localStorage.getItem(PREVIOUS_KEY);
     return previous!==null?migrateDockV2(JSON.parse(previous) as unknown):defaultDockTree();
   }catch{return defaultDockTree();}

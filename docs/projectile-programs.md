@@ -75,6 +75,9 @@ heading component; gravity and accumulated vertical velocity are independent.
 
 ### RTS trajectories and planets
 
+Weapon `flight.arc: true` fits a target-directed parabola using launch ground distance / effective projectile speed (minimum 0.1 s). Set `arcHeight` (0–128) for a constant apex offset, or `arcHeightPerDistance` (0–4) for proportional height; when neither is supplied the ratio is 0.25. If both are supplied they add, clamped to 128. Homing defaults to true only for fitted arcs. An eligible moving target updates the aim throughout flight, with the original arrival deadline; non-homing flight retains the launch aim. The actual impact may be earlier if swept collision detects a body or wall. Range and lifetime budgets can terminate it before the endpoint. On a planet the curve follows the local radial altitude; cross-body shots are not supported. At the endpoint a miss has no direct victim; splash uses the existing impact owner. Split, ricochet and pass-through branches continue with the inherited physical ballistic state, rather than restarting the fitted arc. Explicit nonzero gravity/verticalSpeed cannot be combined with fitted arcs. Existing ability `delivery.arc` remains unchanged; use one arc definition per delivery. Direction-only FPS flight rejects fitted arcs and retains raw gravity/verticalSpeed.
+
+
 Existing flat straight flight uses swept XZ disks and type radii. Ballistic flight uses swept
 3D spheres; target centres are at their surface position + 0.6, with radius at least 0.6.
 `delivery.arc:true` is supported with `flight`: `arcHeight` (0..128) derives initial vertical
@@ -191,3 +194,7 @@ can be used in any FPS project without RTS dependencies.
 - Windows, Linux, Android, iOS and Web builds/runtimes were not verified in this change.
 
 FPS state version 6 extends the version 3 layout; version 3 saves remain readable with default projectile-program state.
+
+### Flight provenance and saves
+
+The shared projectile state records `Emission`, `Split` or `Ricochet` when the common chain policy creates each flight. Timed splitting does not change the parent origin. Presentation adapters must use this explicit provenance rather than modifier consumption or hit history. Save v13 preserves it; older saves read as `Unknown` and do not reapply a muzzle offset. Portable actor projectile components use codec v2 with a v1 reader. Runtime compatibility verification is pending.

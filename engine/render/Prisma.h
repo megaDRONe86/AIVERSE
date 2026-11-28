@@ -8,6 +8,8 @@
 // Every effect has GLSL + MSL code (PrismaShaders.h, one body for both) and runs per quality tier
 // (PrismaQuality, PrismaData plans). RGBA16F on capable High-tier devices, RGBA8 fallback; no compute.
 #pragma once
+#include <array>
+#include <span>
 #include <functional>
 #include <algorithm>
 #include <cmath>
@@ -305,6 +307,23 @@ public:
     // Negative resumes the steady presentation clock; nonnegative freezes fog advection.
     void setLocalFogTime(double seconds) { fogTime_=seconds; }
     void setLocalFog(LocalFogSettings s) { fogSettings_=s; }
+    // One-shot external world-space scene radiance contribution. The caller
+    // owns all resources and must keep them alive until this frame resolves.
+    // No callback invoked across view/fence changes or configuration.
+    using SceneHdrContributor=std::function<gfx::TextureHandle(gfx::Device&,const PostFrame&,gfx::TextureHandle,gfx::TextureHandle)>;
+    bool setSceneHdrContributor(SceneHdrContributor contributor){
+        if(!dev_||!dev_->gpuSubmissionFence()||!contributor)return false;
+        sceneHdrContributor_=std::move(contributor);sceneHdrFence_=dev_->gpuSubmissionFence();
+        sceneHdrView_=viewId_;return true;
+    }
+    void clearSceneHdrContributor(){sceneHdrContributor_={};sceneHdrFence_=0;sceneHdrView_=0;}
+    // Borrow camera output textures only for this view on its current submission.
+    using CameraInputs = std::array<gfx::TextureHandle, 8>;
+    void setCompositorCameraInputs(const CameraInputs& inputs) {
+        compositorInputs_ = inputs;
+        compositorInputView_ = viewId_;
+        compositorInputFence_ = dev_ ? dev_->gpuSubmissionFence() : 0;
+    }
     // heatHaze shockwaves of one view (replaces the previous list; at most 4 are drawn, the
     // strongest first). Empty clears. Only drawn when the view's profile has heatHaze.
     void setShockwaves(uint64_t viewId, std::vector<PrismaShockwave> waves);
@@ -453,6 +472,7 @@ public:
         int width = 0, height = 0;
         PrismaQuality quality = PrismaQuality::Off;
         bool hdr = false, sceneReady = false;
+        int compositorPasses = 0;        // successfully encoded authored passes for this view
         int shaderGraphTextures = 0;     // authored graph texture bindings on last resolve
         bool shaderGraphFallback = false; // graph omitted, fixed postFX preserved if possible
         int autoExposureTextureSlot = -1; // -1 when final composite omitted exposure
@@ -501,6 +521,7 @@ private:
         PrismaBloomGraphCache bloomGraph; // invalidates on size, mip count or HDR format changes
         std::unique_ptr<PrismaRhiExecutor> graphExecutor; // size-shared graph cache, NOT view-owned
     };
+    Target runCompositor(Sized&, Target scene, const PrismaCompositor&, const CameraInputs&, float flip, int& encoded);
     struct RetiredSized {
         Sized resources;
         uint64_t lastSubmittedFence = 0; // 0 = no backend proof, await GPU idle
@@ -565,7 +586,8 @@ private:
     gfx::PipelineHandle composite(uint32_t mask, const Json* graph = nullptr,
                                   const std::string* graphKey = nullptr);
     void draw(Sized& s, const Target& dst, gfx::PipelineHandle pipe, const void* u, size_t size,
-              std::initializer_list<std::pair<int, gfx::TextureHandle>> tex);
+              std::initializer_list<std::pair<int, gfx::TextureHandle>> tex,
+              std::span<const gfx::TextureHandle> graphImages = {});
     const Lut* lut(const std::string& path);
     void release(gfx::TextureHandle& t);
     void retireTarget(gfx::TextureHandle& t); // holds until real GPU fence
@@ -644,7 +666,11 @@ private:
     // Host-declared full output size, needed for offscreen targets whose RHI
     // metadata may be unavailable. Updated by renderSizeForOutput each frame.
     std::map<uint64_t, std::pair<int,int>> requestedOutputSizes_;
+    CameraInputs compositorInputs_{};
+    uint64_t compositorInputFence_ = 0, compositorInputView_ = 0;
     uint64_t viewId_ = 0;
+    SceneHdrContributor sceneHdrContributor_;
+    uint64_t sceneHdrFence_=0,sceneHdrView_=0;
     std::map<std::string, Lut> luts_;
     std::map<std::string, gfx::TextureHandle> images_;   // lensFlare dirt (invalid = failed)
     gfx::TextureHandle smaaArea_, smaaSearch_;

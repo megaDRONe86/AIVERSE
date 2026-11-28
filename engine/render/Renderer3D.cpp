@@ -301,6 +301,7 @@ void Renderer3D::shutdown() {
     objectMotionReactiveSkinPipeline_ = {}; objectMotionReactiveSkinShader_ = {};
     objectMotionReactiveBakedPipeline_ = {}; objectMotionReactiveBakedShader_ = {};
     motionReactiveDraws_.clear();
+    displayDraws_.clear();
     shutdownModels();
     lights.shutdown();
     lights.setTargetRetirement(nullptr);
@@ -366,7 +367,9 @@ void Renderer3D::invalidateSharedMaterialState(
 
 void Renderer3D::invalidateModelCachesFor(const Model* model) {
     if (!model) return;
-    windDebugMaterials_.erase(model);
+    for(auto it=windDebugMaterials_.begin();it!=windDebugMaterials_.end();){
+        if(it->first==model||it->second.model==model)it=windDebugMaterials_.erase(it);else ++it;
+    }
     for (auto it = staticMaterialOwners_.begin(); it != staticMaterialOwners_.end();) {
         if (it->first.model == model) {
             staticMaterialOwnerBytes_ -= it->second.hashes.size() * sizeof(uint64_t);
@@ -393,6 +396,41 @@ void Renderer3D::invalidateModelCachesFor(const Model* model) {
     // A mixed-model command layout borrows every source Model pointer.
     // Asset unload must not leave any of those pointers in a layout cache.
     retireIndirectLayoutsFor(model);
+}
+
+bool Renderer3D::appendGraphImageRoots(const Model& model,std::vector<std::span<const Material>>& roots)const{
+    // Capture callbacks may retain additional external roots. Do not infer
+    // that they are finished merely because there are no current items.
+    if(capture_||modelPacketTap_||geometryPacketTap_)return false;
+    for(const auto& item:modelItems_)if(item.model==&model)return false;
+    for(const auto& command:modelSubmitted_)if(command.source.model==&model)return false;
+    for(const auto& image:model.images){
+        if(image.proceduralGraphImage&&!image.proceduralGraphRetired&&image.tex.valid()&&
+           gpuMaterialResources_.referencesTexture(image.tex))return false;
+    }
+    for(const auto& [id,packet]:staticRenderPackets_){(void)id;
+        if(packet.draw.model==&model&&!packet.materialsSnapshot.empty())roots.emplace_back(packet.materialsSnapshot);
+    }
+    for(const auto& [key,entry]:windDebugMaterials_){(void)key;
+        if(entry.model==&model&&!entry.materials.empty())roots.emplace_back(entry.materials);
+    }
+    return true;
+}
+bool Renderer3D::canDetachCompletedGraphImageReplay()const noexcept{
+    return !capture_&&!modelPacketTap_&&!geometryPacketTap_;
+}
+bool Renderer3D::detachCompletedGraphImageReplay()noexcept{
+    if(!canDetachCompletedGraphImageReplay())return false;
+    // This discards CPU replay/diagnostic references, not submitted GPU work.
+    // The existing image retirement queue still fences all previous use.
+    discardSceneSubmission();
+    customMaterialReceiver_.clear();customSurfaceReceiver_.clear();
+    modelSubmitted_.clear();trackedModels_.fill(nullptr);trackedModelCount_=0;
+    modelSubmissionTruncated_=true;modelSubmissionMainEncoded_=false;
+    gpuMaterialResources_.reset();gpuEncodedBatches_.clear();gpuEncodedCovered_.clear();
+    gpuModelCommandsReady_=false;gpuBatchPlan_.signature.clear();gpuBatchPlan_.groups.clear();
+    lastItem_=nullptr;
+    return true;
 }
 
 void Renderer3D::setPresentationTime(float seconds) {
@@ -566,7 +604,8 @@ void Renderer3D::beginScene(const Camera& cam, int fbW, int fbH) {
     reflectionPlaneValid_ = false;
     reflectionPlaneY_ = 0.f;
     items_.clear(); meshSnapshots_.clear(); lines_.clear(); tris_.clear(); custom_.clear(); customOpaque_.clear(); customShadow_.clear(); customFeedback_.clear();
-    motionReactiveDraws_.clear(); // per-scene extensions register after beginScene
+    motionReactiveDraws_.clear();
+    displayDraws_.clear(); // per-scene extensions register after beginScene
     modelItems_.clear(); jointData_.clear(); morphData_.clear(); modelStats_ = {};
     strataPreviewStats_ = {}; // diagnostic preflight never persists across scenes
     maintainIndirectLayoutCaches(); // prune unused layouts even in empty scenes
@@ -596,6 +635,7 @@ void Renderer3D::discardSceneSubmission() noexcept {
     items_.clear(); meshSnapshots_.clear();lines_.clear();tris_.clear();
     custom_.clear();customOpaque_.clear();customShadow_.clear();customFeedback_.clear();
     motionReactiveDraws_.clear();
+    displayDraws_.clear();
     modelItems_.clear();jointData_.clear();morphData_.clear();
     materialStateIds_.clear();materialHashCandidates_.clear();
     materialRepresentatives_.clear();materialItemIds_.clear();
@@ -1080,7 +1120,7 @@ void Renderer3D::renderCurrentFrameReactiveMask(
             it.mat->shaderGraph || it.materialRole == 1 ||
             it.shadowRole == 2) return false;
         const bool translucent = it.tint.w < 0.99f ||
-            it.mat->transparent || it.mat->alpha == AlphaMode::Blend ||
+            it.mat->transparent || alphaBlended(it.mat->alpha) ||
             (it.flags & kDrawTransparent) != 0;
         // Fade parts are skipped by the velocity overlay until their
         // coverage is reproduced. Mark only actual dithered fragments
@@ -1103,7 +1143,7 @@ void Renderer3D::renderCurrentFrameReactiveMask(
         const bool deform = it.joints >= 0 || it.baked ||
             (it.prim->morphTargets > 0 && it.model->morphTex.valid());
         const bool translucent = it.tint.w < 0.99f ||
-            it.mat->transparent || it.mat->alpha == AlphaMode::Blend ||
+            it.mat->transparent || alphaBlended(it.mat->alpha) ||
             (it.flags & kDrawTransparent) != 0;
         // Current-pose reactive silhouettes also protect animated LOD
         // fades and dissolving characters. LOD dither is reproduced in
@@ -1395,7 +1435,7 @@ void Renderer3D::renderCurrentFrameReactiveMask(
                 if (it.mat->team != TeamMode::BaseAlpha &&
                     it.mat->baseTex >= 0 &&
                     size_t(it.mat->baseTex) < it.model->images.size()) {
-                    const auto t=it.model->images[size_t(it.mat->baseTex)].tex;
+                    const auto t=resolvedMaterialTexture(*it.model,*it.mat,&Material::baseTex);
                     if (t.valid()) base=t;
                 }
                 dev_->setUniforms(0,&u,sizeof u);
@@ -1526,7 +1566,7 @@ void Renderer3D::renderCurrentFrameReactiveMask(
             if (it.mat->team != TeamMode::BaseAlpha &&
                 it.mat->baseTex >= 0 &&
                 size_t(it.mat->baseTex) < it.model->images.size()) {
-                const auto t=it.model->images[size_t(it.mat->baseTex)].tex;
+                const auto t=resolvedMaterialTexture(*it.model,*it.mat,&Material::baseTex);
                 if (t.valid()) base=t;
             }
             dev_->setTexture(1,base);
@@ -1966,7 +2006,7 @@ void Renderer3D::renderObjectMotionVectors(PostProcess& post) {
                 gfx::TextureHandle base=white_;
                 if (it.mat->baseTex >= 0 &&
                     size_t(it.mat->baseTex) < it.model->images.size()) {
-                    auto tex=it.model->images[size_t(it.mat->baseTex)].tex;
+                    auto tex=resolvedMaterialTexture(*it.model,*it.mat,&Material::baseTex);
                     if (tex.valid()) base=tex;
                 }
                 dev_->setTexture(1,base);
@@ -2131,15 +2171,23 @@ void Renderer3D::renderObjectMotionVectors(PostProcess& post) {
 void Renderer3D::resolvePrisma() {
     if(dev_)checkGpuDevice(*dev_);
     if (!post_) {
+        sceneDepthConsumer_={};resolvedDepthSource_={};
         objectMotionStats_ = {};
         objectMotionStats_.reactiveCallbacksDropped =
             static_cast<uint32_t>(motionReactiveDraws_.size());
         motionReactiveDraws_.clear();
+        displayDraws_.clear();
         return;
     }
     PostProcess* post = post_;
+    auto displayDraws=std::move(displayDraws_);displayDraws_.clear();
+    const auto displayDepth=resolvedDepthSource_;
     post_ = nullptr;
     dev_->endPass();
+    auto depthConsumer=std::move(sceneDepthConsumer_);
+    sceneDepthConsumer_={};
+    if(depthConsumer&&resolvedDepthSource_.valid())depthConsumer(*dev_,resolvedDepthSource_,viewProj_,camPos_);
+    resolvedDepthSource_={};
     renderObjectMotionVectors(*post);
     PostFrame f{viewProj_, camPos_, lighting,
                 sceneW_ > 0 ? sceneW_ : dev_->framebufferWidth(),
@@ -2149,7 +2197,16 @@ void Renderer3D::resolvePrisma() {
                 cam_.ortho ? -200.0f : cam_.zNear,
                 cam_.ortho ? 1000.0f : cam_.zFar, cam_.ortho};
     post->resolve(*dev_, postOut_, f);
+    gfx::TextureInfo outputInfo{};
+    int outputW=f.width,outputH=f.height;
+    if(postOut_.colorTarget.valid() && dev_->textureInfo(postOut_.colorTarget,outputInfo)) {
+        outputW=outputInfo.width;outputH=outputInfo.height;
+    } else if(!postOut_.colorTarget.valid()) {
+        outputW=dev_->framebufferWidth();outputH=dev_->framebufferHeight();
+    }
+    for(auto& draw:displayDraws)draw(*dev_,displayDepth,outputW,outputH);
     motionReactiveDraws_.clear();
+    displayDraws_.clear();
     hdrFrame_ = false;
 }
 
@@ -2239,6 +2296,7 @@ void Renderer3D::render(const gfx::PassDesc& screenPass, PostProcess* post) {
     postOut_ = screenPass;
     const int sw = sceneW_ > 0 ? sceneW_ : dev_->framebufferWidth(), sh = sceneH_ > 0 ? sceneH_ : dev_->framebufferHeight();
     const gfx::PassDesc mainPass = post_ ? post_->scenePass(screenPass, sw, sh) : screenPass;
+    resolvedDepthSource_=post_?mainPass.depthTarget:gfx::TextureHandle{};
     hdrFrame_ = post_ && post_->linearScene();
     lights.setLinearScene(hdrFrame_);
     renderReflection();

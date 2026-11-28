@@ -1,5 +1,6 @@
 // View scripts: presentation-only Lua VM (see GameViewScript.h).
 #include "GameViewScript.h"
+#include "GameOverlayData.h"
 #include "engine/platform/Platform.h"
 #include "engine/render/AnimationAsset.h"
 #include <map>
@@ -13,7 +14,7 @@ namespace aiverse::game {
 using namespace script;
 
 namespace {
-const char* eventName(uint16_t t) { return simEventName(t); }   // every GameEvent (Script.cpp table)
+const char* eventName(uint16_t t) { return t == kViewEventOrder ? "order" : simEventName(t); }   // every GameEvent (Script.cpp table)
 struct Collector { std::vector<SimEvent> events; bool enabled = true; };
 } // namespace
 
@@ -27,6 +28,7 @@ struct ViewScripts::Impl {
     std::map<std::string, std::vector<int>> handlers;   // event -> function refs (LUA_NOREF: disabled)
     std::vector<int> frame;
     std::vector<ViewRequest> requests;
+    int64_t nextFxHandle = 1;
     std::vector<Command> commands;
     std::vector<UiRequest> ui;
     std::map<std::string, std::string> uiLast;          // key -> last value sent (unchanged values are not resent)
@@ -37,6 +39,9 @@ struct ViewScripts::Impl {
     std::shared_ptr<Collector> collector;
     uint8_t player = 0;
     ViewTargeting targeting;
+    std::vector<Entity> selection;
+    std::vector<Entity> selectionRequest;
+    bool selectionRequested = false;
     float dragDx = 0, dragDy = 0;     // view.set_map_drag_offset (window points)
     ViewCamera camera;
     std::function<bool(uint64_t,render::float3&)> visualPosition;
@@ -301,7 +306,14 @@ int vRequest(lua_State* L, Vm& vm, ViewRequest::Kind k) {
     r.kind = k;
     r.text.assign(s, len);
     lua_pop(L, 1);
-    if (!lua_isnoneornil(L, 2)) { r.x = float(toDouble(L, 2)); r.z = float(toDouble(L, 3)); r.positioned = true; }
+    if (k == ViewRequest::Notice && lua_istable(L, 2)) {
+        lua_getfield(L, 2, "duration");
+        if (!lua_isnil(L, -1)) r.duration = float(toDouble(L, -1));
+        lua_pop(L, 1);
+        lua_getfield(L, 2, "style");
+        if (lua_isstring(L, -1)) r.style = lua_tostring(L, -1);
+        lua_pop(L, 1);
+    } else if (!lua_isnoneornil(L, 2)) { r.x = float(toDouble(L, 2)); r.z = float(toDouble(L, 3)); r.positioned = true; }
     if (k == ViewRequest::Effect) {
         if (!lua_isnoneornil(L, 4)) r.y = float(toDouble(L, 4));
         if (!std::isfinite(r.x) || !std::isfinite(r.y) || !std::isfinite(r.z))
@@ -314,6 +326,82 @@ int vRequest(lua_State* L, Vm& vm, ViewRequest::Kind k) {
 int vNotice(lua_State* L, Vm& vm) { return vRequest(L, vm, ViewRequest::Notice); }
 int vEffect(lua_State* L, Vm& vm) { return vRequest(L, vm, ViewRequest::Effect); }
 int vSound(lua_State* L, Vm& vm) { return vRequest(L, vm, ViewRequest::Sound); }
+template<ViewRequest::Kind kind>
+int vPersistentFx(lua_State* L, Vm& vm) {
+    auto& im = viewOf(vm);
+    ViewRequest request;
+    request.kind = kind;
+    if (im.requests.size() >= 256) return fail(vm, "view particle request queue full");
+    if constexpr (kind == ViewRequest::StartFx) {
+        request.text = luaL_checkstring(L, 1);
+        if (im.nextFxHandle == INT64_MAX) return fail(vm, "view particle handles exhausted");
+        request.handle = im.nextFxHandle++;
+    } else request.handle = luaL_checkinteger(L, 1);
+    if constexpr (kind == ViewRequest::AttachFx) {
+        if (!argEntity(L, 2, request.entity) || !request.entity.valid()) return fail(vm, "view.attach_fx requires an entity");
+    }
+    if constexpr (kind == ViewRequest::StartFx || kind == ViewRequest::MoveFx || kind == ViewRequest::AttachFx) {
+        constexpr int first = kind == ViewRequest::AttachFx ? 3 : 2;
+        request.x = float(luaL_optnumber(L, first, 0));
+        request.z = float(luaL_optnumber(L, first + 1, 0));
+        request.y = float(luaL_optnumber(L, first + 2, 0));
+        request.direction = {float(luaL_optnumber(L, first + 3, 0)), float(luaL_optnumber(L, first + 4, 1)),
+                             float(luaL_optnumber(L, first + 5, 0))};
+        if (!std::isfinite(request.x) || !std::isfinite(request.y) || !std::isfinite(request.z) ||
+            !std::isfinite(request.direction.x) || !std::isfinite(request.direction.y) || !std::isfinite(request.direction.z))
+            return fail(vm, "view particle coordinates must be finite");
+    }
+    const auto handle = request.handle;
+    im.requests.push_back(std::move(request));
+    if constexpr (kind == ViewRequest::StartFx) { lua_pushinteger(L, handle); return 1; }
+    return 0;
+}
+
+int vSelection(lua_State* L, Vm& vm) {
+    const auto& selected = viewOf(vm).selection;
+    lua_createtable(L, int(selected.size()), 0);
+    int i = 0;
+    for (Entity e : selected) if (vm.sim && vm.sim->world().alive(e)) {
+        pushEntity(L, e);
+        lua_rawseti(L, -2, ++i);
+    }
+    return 1;
+}
+
+int vSelect(lua_State* L, Vm& vm) {
+    if (!lua_istable(L, 1)) return fail(vm, "view.select: array of entity handles expected");
+    const size_t count = lua_rawlen(L, 1);
+    if (count > 256) return fail(vm, "view.select: at most 256 handles");
+    std::vector<Entity> selected;
+    selected.reserve(count);
+    for (size_t i = 1; i <= count; ++i) {
+        lua_rawgeti(L, 1, lua_Integer(i));
+        Entity e;
+        const bool valid = argEntity(L, -1, e) && e.valid();
+        lua_pop(L, 1);
+        if (!valid) return fail(vm, "view.select: invalid entity handle");
+        if (std::find(selected.begin(), selected.end(), e) == selected.end()) selected.push_back(e);
+    }
+    auto& im = viewOf(vm);
+    im.selection = selected;
+    im.selectionRequest = std::move(selected);
+    im.selectionRequested = true;
+    return 0;
+}
+
+int vSelectAdd(lua_State* L, Vm& vm) {
+    Entity e;
+    if (!argEntity(L, 1, e) || !e.valid()) return fail(vm, "view.select_add: entity handle expected");
+    auto& im = viewOf(vm);
+    if (!im.selectionRequested) im.selectionRequest = im.selection;
+    if (im.selectionRequest.size() >= 256) return fail(vm, "view.select_add: at most 256 handles");
+    if (std::find(im.selectionRequest.begin(), im.selectionRequest.end(), e) == im.selectionRequest.end())
+        im.selectionRequest.push_back(e);
+    im.selection = im.selectionRequest;
+    im.selectionRequested = true;
+    return 0;
+}
+
 int vTargeting(lua_State* L, Vm& vm) {
     const auto& t=viewOf(vm).targeting;
     lua_newtable(L);
@@ -570,6 +658,7 @@ int vEntityFx(lua_State* L, Vm& vm) {
         };
         vec("scale", V::kScale, 3); vec("tint", V::kTint, 3); vec("team_mix", V::kTeamMix, 4); vec("shadow_scale", V::kShadowScale, 3);
         lua_pushnumber(L, cur.v[V::kOpacity]); lua_setfield(L, -2, "opacity");
+        lua_pushnumber(L, cur.v[V::kHitFlash]); lua_setfield(L, -2, "hit_flash");
         lua_pushnumber(L, cur.v[V::kTeamGlow]); lua_setfield(L, -2, "team_glow");
         lua_pushnumber(L, cur.v[V::kShadow]); lua_setfield(L, -2, "shadow");
         lua_pushnumber(L, cur.v[V::kLift]); lua_setfield(L, -2, "lift");
@@ -611,6 +700,7 @@ int vEntityFx(lua_State* L, Vm& vm) {
     field("opacity", V::kOpacity, 1, true, 0.0f, 1.0f);
     field("tint", V::kTint, 3, false, 0.0f, 64.0f);
     if (field("team_mix", V::kTeamMix, 4, false, 0.0f, 64.0f)) target.v[V::kTeamMix + 3] = std::clamp(target.v[V::kTeamMix + 3], 0.0f, 1.0f);
+    field("hit_flash", V::kHitFlash, 1, true, 0.0f, 64.0f);
     field("team_glow", V::kTeamGlow, 1, true, 0.0f, 64.0f);
     field("shadow", V::kShadow, 1, true, 0.0f, 1.0f);
     field("keep_shadow", V::kKeepShadow, 1, true, 0.0f, 1.0f);
@@ -694,6 +784,17 @@ Json toUiJson(lua_State* L, int idx, int depth = 0) {
     default: return Json();
     }
 }
+int vShakeCamera(lua_State* L, Vm& vm) {
+    if (!lua_istable(L, 1)) return fail(vm, "view.shake_camera expects a table");
+    auto& queue = viewOf(vm).requests;
+    if (queue.size() >= 256) return fail(vm, "view request queue full");
+    ViewRequest request;
+    request.kind = ViewRequest::ShakeCamera;
+    request.shake = toUiJson(L, 1);
+    queue.push_back(std::move(request));
+    return 0;
+}
+
 void pushUiJson(lua_State* L, const Json& j, int depth = 0) {
     luaL_checkstack(L, 4, "json too deep");
     switch (j.type()) {
@@ -807,8 +908,48 @@ int vProgressionReroll(lua_State* L, Vm& vm) { return vProgressionCmd(L, vm, kPr
 ViewScripts::ViewScripts() : impl_(std::make_unique<Impl>(*this)) {}
 ViewScripts::~ViewScripts() { detach(); }
 std::shared_ptr<render::PaintLayers> ViewScripts::paintLayers() const { return impl_->paint; }
+Json animationRuntimeStatus(const EntityFxStore* store) {
+    Json rows=Json::array();
+    if (!store) return rows;
+    std::vector<uint64_t> keys;
+    keys.reserve(store->animations.size());
+    for (const auto& [key,entry]:store->animations) keys.push_back(key);
+    const auto count=std::min<size_t>(256,keys.size());
+    std::partial_sort(keys.begin(),keys.begin()+count,keys.end());
+    for (size_t i=0;i<count;++i) {
+        const auto key=keys[i];
+        const auto& entry=store->animations.at(key);
+        const auto& c=entry.locomotion;
+        Json row=Json::object();
+        row.set("entity",Json::number(int64_t(key)));
+        row.set("entityId",Json::string(std::to_string(key)));
+        row.set("error",Json::string(entry.error));
+        row.set("climbing",Json::fromBool(c.active));
+        row.set("attached",Json::fromBool(c.attached));
+        row.set("stanceFeet",Json::number(int64_t(c.supports)));
+        row.set("steppingFeet",Json::number(int64_t(c.stepping)));
+        row.set("footError",Json::number(double(c.footError),6));
+        row.set("penetration",Json::number(double(c.penetration),6));
+        Json position=Json::array(),normal=Json::array();
+        for(float v:{c.position.x,c.position.y,c.position.z})position.push(Json::number(double(v),6));
+        for(float v:{c.normal.x,c.normal.y,c.normal.z})normal.push(Json::number(double(v),6));
+        row.set("bodyPosition",std::move(position));
+        row.set("surfaceNormal",std::move(normal));
+        rows.push(std::move(row));
+    }
+    return rows;
+}
+
 std::shared_ptr<EntityFxStore> ViewScripts::entityFx() const { return impl_->fx; }
 
+void ViewScripts::setSelection(const std::vector<Entity>& selected) { impl_->selection = selected; }
+bool ViewScripts::takeSelectionRequest(std::vector<Entity>& selected) {
+    if (!impl_->selectionRequested) return false;
+    selected = std::move(impl_->selectionRequest);
+    impl_->selectionRequest.clear();
+    impl_->selectionRequested = false;
+    return true;
+}
 void ViewScripts::setTargeting(const ViewTargeting& target) { impl_->targeting=target; }
 void ViewScripts::mapDragOffset(float& dx, float& dy) const { dx=impl_->dragDx; dy=impl_->dragDy; }
 void ViewScripts::setMapDragOffset(float dx, float dy) { impl_->dragDx=dx; impl_->dragDy=dy; }
@@ -871,8 +1012,10 @@ bool ViewScripts::load(Simulation& sim, const Json& rules, const Json& map, uint
     im.player = localPlayer;
     for (auto& [p, t] : rules["$scriptSources"].members()) vm.sources[p] = t.str();
     openGameApi(vm);
-    static const luaL_Reg funcs[] = {{"on", bind<vOn>}, {"on_frame", bind<vOnFrame>}, {"notice", bind<vNotice>},
-                                     {"effect", bind<vEffect>}, {"sound", bind<vSound>}, {"player", bind<vPlayer>}, {"screen", bind<vScreen>},
+    static const luaL_Reg funcs[] = {{"on", bind<vOn>}, {"on_frame", bind<vOnFrame>}, {"notice", bind<vNotice>}, {"shake_camera", bind<vShakeCamera>}, {"selection", bind<vSelection>}, {"select", bind<vSelect>}, {"select_add", bind<vSelectAdd>},
+                                     {"start_fx", bind<vPersistentFx<ViewRequest::StartFx>>}, {"move_fx", bind<vPersistentFx<ViewRequest::MoveFx>>},
+                                     {"attach_fx", bind<vPersistentFx<ViewRequest::AttachFx>>}, {"stop_fx", bind<vPersistentFx<ViewRequest::StopFx>>},
+                                     {"kill_fx", bind<vPersistentFx<ViewRequest::KillFx>>}, {"effect", bind<vEffect>}, {"sound", bind<vSound>}, {"player", bind<vPlayer>}, {"screen", bind<vScreen>},
                                      {"send", bind<vSend>}, {"state", bind<vState>}, {"ui_call", bind<vUiCall>},
                                      {"progression_choose", bind<vProgressionChoose>}, {"progression_reroll", bind<vProgressionReroll>},
                                      {"render_texture", bind<vRenderTexture>}, {"paint_layer", bind<vPaintLayer>}, {"targeting", bind<vTargeting>}, {"set_map_drag_offset", bind<vSetMapDragOffset>},
@@ -910,9 +1053,16 @@ void ViewScripts::attach(Simulation& sim) {
     });
 }
 
+void ViewScripts::queueLocalOrder(const SimEvent& event) {
+    if (impl_->collector && event.type == kViewEventOrder && impl_->handlers.count("order"))
+        impl_->collector->events.push_back(event);
+}
+
 void ViewScripts::detach() {
     if (impl_->collector) impl_->collector->enabled = false;
     impl_->collector.reset();
+    impl_->selectionRequest.clear();
+    impl_->selectionRequested = false;
 }
 
 void ViewScripts::update(Simulation& sim, float dt) {
@@ -965,12 +1115,38 @@ void ViewScripts::update(Simulation& sim, float dt) {
                 lua_pushinteger(L, ev.value); lua_setfield(L, -2, "value");
                 lua_pushnumber(L, ev.pos.x.toDouble()); lua_setfield(L, -2, "x");
                 lua_pushnumber(L, ev.pos.z.toDouble()); lua_setfield(L, -2, "z");
+                if (ev.type == kViewEventOrder) {
+                    lua_pushstring(L, ev.value == kCmdRepair ? "repair" : commandName(uint16_t(ev.value))); lua_setfield(L, -2, "kind");
+                    lua_pushnumber(L, ev.pos.y.toDouble()); lua_setfield(L, -2, "y");
+                    lua_pushboolean(L, (ev.flags & kCmdQueue) != 0); lua_setfield(L, -2, "queued");
+                    if (ev.b.valid()) { pushEntity(L, ev.b); lua_setfield(L, -2, "target"); }
+                }
                 const bool typed = ev.type == kEvDied || ev.type == kEvSpawned || ev.type == kEvBuildDone || ev.type == kEvTrainDone || ev.type == kEvUpgraded;
                 if (typed && ev.value >= 0 && size_t(ev.value) < r.types.size()) { lua_pushstring(L, r.types[size_t(ev.value)].id.c_str()); lua_setfield(L, -2, "unit_type"); }
-                if (ev.type == kEvHit) { lua_pushnumber(L, Fixed::fromRaw(ev.value).toDouble()); lua_setfield(L, -2, "amount"); }
+                if (ev.type == kEvHit || ev.type == kEvBounty) {
+                    lua_pushnumber(L, Fixed::fromRaw(ev.value).toDouble()); lua_setfield(L, -2, "amount");
+                }
+                if (ev.type == kEvHit) {
+                    lua_pushboolean(L, (ev.flags & kHitCritical) != 0); lua_setfield(L, -2, "critical");
+                }
+                if (ev.type == kEvBounty) {
+                    if (ev.resource < r.resources.size()) { lua_pushstring(L, r.resources[ev.resource].id.c_str()); lua_setfield(L, -2, "resource"); }
+                    if (ev.subjectType < r.types.size()) { lua_pushstring(L, r.types[ev.subjectType].id.c_str()); lua_setfield(L, -2, "unit_type"); }
+                    if (ev.subjectOwner <= UINT8_MAX) { lua_pushinteger(L, ev.subjectOwner); lua_setfield(L, -2, "victim_owner"); }
+                }
+                if (ev.type == kEvPlayerLeft) {
+                    lua_pushstring(L, controllerName(SeatController(ev.value))); lua_setfield(L, -2, "controller");
+                }
+                if (ev.type == kEvChat && ev.message) {
+                    lua_pushlstring(L, ev.message->text.data(), ev.message->text.size()); lua_setfield(L, -2, "text");
+                }
                 if (ev.type == kEvMessage) {
                     auto& msgs = im.vm.module->state(sim).trig.messages;
-                    if (ev.value >= 0 && size_t(ev.value) < msgs.size()) { lua_pushstring(L, msgs[size_t(ev.value)].c_str()); lua_setfield(L, -2, "text"); }
+                    if (ev.message) {
+                        lua_pushlstring(L, ev.message->text.data(), ev.message->text.size()); lua_setfield(L, -2, "text");
+                        lua_pushnumber(L, ev.message->duration); lua_setfield(L, -2, "duration");
+                        lua_pushstring(L, ev.message->style.c_str()); lua_setfield(L, -2, "style");
+                    } else if (ev.value >= 0 && size_t(ev.value) < msgs.size()) { lua_pushstring(L, msgs[size_t(ev.value)].c_str()); lua_setfield(L, -2, "text"); }
                 }
                 im.call(ref, 1);
             }

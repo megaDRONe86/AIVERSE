@@ -4283,3 +4283,22 @@ Tests: `prisma_new_effects` (GPU-free catalog/plans/cost/presets/shader contract
 halation haze fsr histogram` (phase 0 without, phase 1 with the effect; it must be
 encoded and change the frame in its direction), `prisma_style_presets_fresh`.
 Handoff: `docs/handoffs/prisma-stage-99-new-effects.md`.
+
+## Stage 153 — native GPU HDR volume renderer (source; QA deferred)
+
+SpectraGpuVolumeRenderer.h + SpectraVolumeRenderShaders.h consume current GpuGasGrid cells and solid mask directly, no CPU voxel readback. Compute uses existing TextureResources layout, separate RGBA16F storage output, matching opaque scene depth/color, inverse VP reconstruction and AABB clipping, camera-inside/ortho-compatible ray construction, trilinear fields, Beer-Lambert extinction, HDR temperature emission, ambient/sun Henyey-Greenstein scattering and bounded density self-shadowing, up to four explicit point lights. Bounds: 128 primary steps, 8 shadow steps, <=4,194,304 pixels; one volume per dispatch. Canonical Device ledger output (8 B/pixel) and fence retirement. PRISMA generic frame/view-scoped one-shot SceneHdrContributor callback after local fog before metering/bloom/tonemap; host owns renderer, no PRISMA volume shader or effect duplicate. HDR-capable native Metal/Vulkan only; no silent LDR fallback, no automatic host/Studio wiring yet, no scene shadow-map sampling, no unified overlapping media, no transparent-depth correctness or performance claims. Existing allocator fixture sources test HDR emission >1, opaque clipping, empty grid, allocation return and Vulkan shader compilation. CMake/CTest/shader/real GPU/visual acceptance NOT RUN. Next unified volume graph and Studio/scene host integration.
+
+
+## Authored frame compositor
+
+A game or map can supply `postfx.compositor`. In Studio open Post effects → Frame compositor, load the glow example, and wire an output port to an input port. Edit target names, resolution divisors, pass operations and parameters in Targets and passes. Save graph validates the complete document before replacing the current scope. A map inherits the game graph unless it replaces the postfx block, declares a graph, or disables it with `compositor:null`.
+
+Use the scene color as `scene`. To isolate objects, configure a LENS texture camera with a visibility mask, then add its target asset key to the consumer camera's reads. A compositor source such as `{"id":"selected","cameraInput":0}` reads that first declared dependency. The managed camera pipeline binds those textures per submission and camera. Standalone native hosts call `Prisma::setCompositorCameraInputs` during the frame before resolve. The full example is in `examples/prisma/camera-glow.json`.
+
+Declare 1–12 named targets and one producer per target. A target's optional divisor is 1, 2, 4 or 8. Declare one full-resolution output. A pass has an id, op, inputs and target. Supported operations are downsample, bright (amount is the threshold), blurX and blurY (amount is the radius multiplier), add (filtered first input multiplied by amount plus the second input), and shaderGraph (a nested postfx shader graph in graph, sampled primary input and optional asset textures). PRISMA compiles dependencies before drawing, and temporary targets with disjoint lifetimes share compatible storage. The graph executes after scene contributions and before screen-space lighting, metering and tonemapping. A missing camera source or shader preserves the incoming scene. `effectReport(viewId)->compositorPasses` reports encoded passes. Use `postfx_compositor_set` from MCP and `postfx_get` to read the stored document.
+
+## Display-space additive particles
+
+SpectraFX additive emitters and trails accept `blendSpace:"display"`; the default is `linear`. Renderer3D replays prepared particle geometry after PRISMA tone mapping and before HUD, using original scene depth. PRISMA remains the only tone-map owner. Source alpha, fog and opaque occlusion remain active; display contributions do not feed HDR bloom/exposure or temporal effects. Other blend modes reject display space. GPU-only execution must reject this mode; ordinary graph routing uses CPU presentation.
+
+Actual Metal pixel cases and the three-scene Metal/WebGL example are retained under `docs/evidence/issues-additive-metal-20261127` and `docs/evidence/issues-material-effects-{metal,web}-20261127`. Windows/Vulkan and mobile hardware remain unverified. Main integration and publication are separate final steps. See `demos/material-effects` and `docs/particles.md`.

@@ -11,13 +11,17 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <map>
 #include <string>
 #include <vector>
 #include "../gfx/Gfx.h"
 #include "Math3D.h"
+#include "MaterialTechnique.h"
+#include "MaterialBlend.h"
 #include "TextureCodec.h"
 #include "GpuOwnedMemory.h"
 #include "graph/ShaderGraph.h"
+#include "graph/TextureGraphImagePins.h"
 
 namespace aiverse::render {
 
@@ -26,7 +30,6 @@ class ModelTextureCache;
 struct GeometryData;
 struct GeometryPoolPage;
 
-enum class AlphaMode : uint8_t { Opaque, Mask, Blend };
 enum class ShadingModel : uint8_t { Pbr, Unlit, Skin, Eye, Hair };
 // Where the team (player) colour goes:
 //   Tint        whole material multiplied by the team colour (procedural shapes, simple models)
@@ -38,6 +41,7 @@ enum class TeamMode : uint8_t { None, Tint, Mask, BaseAlpha, VertexAlpha };
 struct Material {
     std::shared_ptr<const graph::Program> shaderGraph;
     int graphTextures[4] = {-1,-1,-1,-1};
+    std::array<GraphImagePin,4> graphSourcePins{}; // retained by material copies
     std::string name;
     ShadingModel shading = ShadingModel::Pbr;
     float4 baseColor{1, 1, 1, 1};          // linear
@@ -77,6 +81,9 @@ struct Material {
     // Optional layered eye: UV centre, iris radius, refractive depth in UV units.
     // z == 0 preserves legacy Eye shading. Only the colour pass uses parallax.
     float4 eyeOptics{0, 0, 0, 0};
+    // Immutable copy-on-write CPU pin set for published procedural bindings.
+    // Material copies (snapshots, camera packets, static caches) retain it.
+    GraphMaterialPins proceduralGraphPins;
 };
 
 struct Image {
@@ -84,6 +91,9 @@ struct Image {
     std::string textureKey;
     std::shared_ptr<int> textureLease;
     std::shared_ptr<const std::vector<uint8_t>> sharedRgba;
+    // File-authored linear HDR, independent of session-only graph provenance.
+    std::shared_ptr<const std::vector<uint16_t>> sharedRadiance16f;
+    bool importedLinearRadiance = false;
     std::string name;               // file name or "#index" for embedded images
     int width = 0, height = 0;
     std::vector<uint8_t> rgba;      // CPU copy, released after upload
@@ -93,7 +103,8 @@ struct Image {
     bool repeat = true, nearest = false;
     gfx::TextureHandle tex;
     bool borrowedTexture = false; // owner must outlive this image; never released here
-    bool gpuCompressed = false;     // uploaded as GPU blocks (KTX2)
+    bool gpuCompressed = false;     // uploaded as GPU blocks
+    bool gpuNormalXY = false;       // native BC5 normal, reconstruct positive Z
     // Opt-in VT base-colour coarse fallback. When >0, uploadImage() uploads
     // ONLY a downsampled RGBA8 version, not the full source texture.
     // Configure before the first GPU upload and after packing the source
@@ -111,6 +122,13 @@ struct Image {
     bool preserveAlphaCoverage = true;
     uint8_t alphaCoverageThreshold = 0;
     bool alphaCoverageMipmaps = false;
+    // Session-only procedural graph provenance. Retired slots remain empty
+    // tombstones: never shift indices. Only a certified retired slot may recycle.
+    bool proceduralGraphImage = false;
+    bool proceduralLinearRadiance = false; // owned float HDR image, linear color sampling
+    bool proceduralGraphRetired = false;
+    GraphImagePin proceduralGraphPin;
+    GraphImageSlotRetirement proceduralSlotRetirement;
 };
 
 // 60 bytes, one interleaved stream for every model (unskinned meshes leave joints/weights zero).
@@ -233,7 +251,9 @@ struct ModelLight {
     float innerCone = 0, outerCone = 0.785398163f;
 };
 
+struct BspVisibility;
 struct Model {
+    std::shared_ptr<const BspVisibility> bspVisibility;
     // Engine-wide model batching contract. All loaders / editors / games use the same
     // upload path, regardless of genre or asset naming. Rigid static merging is opt-in:
     // a model containing gameplay-controlled nodes cannot safely infer mutability
@@ -299,8 +319,10 @@ struct Model {
     std::vector<MeshDef> meshes;
     std::vector<Material> materials;   // never empty after loading (a default material is added)
     std::vector<Image> images;
+    std::map<std::string, int> imageAliases; // asset-authored names for texture and image references
     std::vector<Skin> skins;
     std::vector<AnimClip> clips;
+    MaterialTechniques materialTechniques;
     std::vector<std::string> variants; // KHR_materials_variants names
     std::vector<ModelVertex> vertices; // CPU copy, released after upload
     std::vector<uint32_t> indices;
@@ -329,12 +351,94 @@ struct Model {
 
     int findNode(const std::string& name) const;
     int findClip(const std::string& name) const;     // exact, then case-insensitive
+    int findImage(const std::string& name) const;
     int findMaterial(const std::string& name) const;
     int findVariant(const std::string& name) const;
     bool skinned() const { return !skins.empty(); }
     // Children lists, evaluation order, primitive and model bounds. Loaders call it.
     void finalize();
 };
+
+// Shared render-time resolution under the existing joined Model reader
+// contract. Ordinary imported images and legacy untracked graph images retain
+// their index semantics; tracked procedural images require the original pin.
+// The material itself retains that pin for the duration of the draw.
+inline constexpr size_t proceduralMaterialChannel(int Material::* slot) noexcept {
+    return slot==&Material::baseTex?0:slot==&Material::normalTex?1:
+           slot==&Material::mrTex?2:slot==&Material::occlusionTex?3:
+           slot==&Material::emissiveTex?4:slot==&Material::teamTex?5:6;
+}
+// Explicit authored/imported texture assignment never inherits a procedural
+// generation, even when a loader returns the same numerical index. Copies
+// of the previous material retain their immutable pin set.
+inline void setImportedMaterialImage(Material& material,int Material::* slot,int index){
+    const auto channel=proceduralMaterialChannel(slot);
+    if(channel>=6)throw std::invalid_argument("invalid imported material slot");
+    if(material.proceduralGraphPins&&(*material.proceduralGraphPins)[channel]){
+        auto pins=withGraphMaterialPin(material.proceduralGraphPins,channel,{});
+        bool any=false;
+        for(const auto& pin:*pins)if(pin){any=true;break;}
+        material.proceduralGraphPins=any?std::move(pins):GraphMaterialPins{};
+    }
+    material.*slot=index;
+}
+// Runtime generated images are never file-cache identities, even if a
+// malformed native descriptor supplies a file key or forgets its flag.
+inline bool runtimeGraphImage(const Image& image)noexcept{
+    return image.proceduralGraphImage||image.proceduralGraphRetired||
+           bool(image.proceduralGraphPin)||image.name.rfind("#texture-graph/",0)==0;
+}
+inline const Image* resolveMaterialImageIndex(const Model& model,int index,
+        const GraphImagePin* original=nullptr) noexcept {
+    if(index<0||size_t(index)>=model.images.size())return nullptr;
+    const auto& image=model.images[size_t(index)];
+    if(image.proceduralGraphRetired)return nullptr;
+    if(image.proceduralGraphPin&&(!original||!*original||
+       original->owner_before(image.proceduralGraphPin)||
+       image.proceduralGraphPin.owner_before(*original)))return nullptr;
+    return &image;
+}
+inline const Image* resolveMaterialImage(const Model& model,const Material& material,
+        int Material::* slot) noexcept {
+    const auto channel=proceduralMaterialChannel(slot);
+    if(channel>=6)return nullptr;
+    const auto* pin=material.proceduralGraphPins?&(*material.proceduralGraphPins)[channel]:nullptr;
+    const auto* image=resolveMaterialImageIndex(model,material.*slot,pin);
+    return image&&image->gpuNormalXY&&slot!=&Material::normalTex?nullptr:image;
+}
+inline bool resolvedLinearColor(const Model& model,const Material& material,int Material::* slot) noexcept {
+    const auto* image=resolveMaterialImage(model,material,slot);
+    return image&&image->tex.valid()&&(image->proceduralLinearRadiance||image->importedLinearRadiance);
+}
+inline bool resolvedBc5Normal(const Model& model,const Material& material) noexcept {
+    const auto* image=resolveMaterialImage(model,material,&Material::normalTex);
+    return image&&image->tex.valid()&&image->gpuNormalXY;
+}
+inline bool resolvedLinearEmissive(const Model& model,const Material& material) noexcept {
+    return resolvedLinearColor(model,material,&Material::emissiveTex);
+}
+inline bool resolvedLinearBaseColor(const Model& model,const Material& material) noexcept {
+    return resolvedLinearColor(model,material,&Material::baseTex);
+}
+inline gfx::TextureHandle resolvedMaterialTexture(const Model& model,const Material& material,
+        int Material::* slot,gfx::TextureHandle fallback={}) noexcept {
+    const auto* image=resolveMaterialImage(model,material,slot);
+    return image&&image->tex.valid()?image->tex:fallback;
+}
+// Explicit HDR graph slots retain the original generation pin. Imported
+// sources have no pin, and naked procedural indices never resolve.
+inline gfx::TextureHandle resolvedGraphSourceTexture(const Model& model,const Material& material,
+        size_t slot,gfx::TextureHandle fallback={}) noexcept {
+    const auto* image=slot<4?resolveMaterialImageIndex(model,material.graphTextures[slot],&material.graphSourcePins[slot]):nullptr;
+    if(image&&image->gpuNormalXY)return fallback;
+    if(image&&material.shaderGraph&&(material.shaderGraph->linearRadianceSlots&(1u<<slot))&&
+       !(image->proceduralLinearRadiance||image->importedLinearRadiance))return fallback;
+    return image&&image->tex.valid()?image->tex:fallback;
+}
+inline gfx::TextureHandle resolvedMaterialAlphaCoverage(const Model& model,const Material& material) noexcept {
+    const auto* image=resolveMaterialImage(model,material,&Material::baseTex);
+    return image?image->virtualAlphaMask:gfx::TextureHandle{};
+}
 
 using FileReader = std::function<bool(const std::string& path, std::string& out)>;
 
@@ -351,6 +455,7 @@ std::unique_ptr<Model> loadFbx(const std::string& path, const std::string& bytes
 std::unique_ptr<Model> loadVox(const std::string& path, const std::string& bytes, const FileReader& read, std::vector<std::string>* warnings);
 std::unique_ptr<Model> loadVxl(const std::string& path, const std::string& bytes, const FileReader& read, std::vector<std::string>* warnings);
 // Interchange: Stanford .ply (ASCII / binary), .stl (ASCII / binary), 3D Studio .3ds, Collada .dae.
+std::unique_ptr<Model> loadBsp(const std::string& path, const std::string& bytes, const FileReader& read, std::vector<std::string>* warnings);
 std::unique_ptr<Model> loadPly(const std::string& path, const std::string& bytes, const FileReader& read, std::vector<std::string>* warnings);
 std::unique_ptr<Model> loadStl(const std::string& path, const std::string& bytes, const FileReader& read, std::vector<std::string>* warnings);
 std::unique_ptr<Model> load3ds(const std::string& path, const std::string& bytes, const FileReader& read, std::vector<std::string>* warnings);
@@ -373,6 +478,10 @@ bool decodeDds(const std::string& bytes, Image& out);
 
 // PNG / JPEG / TGA from memory into RGBA8. Returns false on failure.
 bool decodeImage(const std::string& bytes, Image& out);
+// Explicit material loader preserves EXR/RGBE in linear half float; ordinary raster decoding stays unchanged.
+bool decodeMaterialImage(const std::string& bytes, Image& out);
+// Bounded standard raster decode; refuses non-PNG/JPEG and preflights extent before allocation.
+bool decodeTextureGraphRaster(const std::string& bytes, size_t maxPixels, Image& out);
 
 // Builds a model from named procedural parts (one node per part). Colors of the builder are
 // treated as sRGB and converted to linear vertex colors.

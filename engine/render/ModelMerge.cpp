@@ -22,7 +22,10 @@ float3 safeNormalize(float3 v, float3 fallback) { const float l = length(v); ret
 
 namespace {
 bool paletteStateEqual(const Material& a, const Material& b) {
-    if (a.shaderGraph || b.shaderGraph || a.alpha != AlphaMode::Opaque || b.alpha != AlphaMode::Opaque ||
+    // This palette contract has no Model parameter and compares raw slot
+    // indices. Procedural generations must use ordinary checked draws.
+    if (a.proceduralGraphPins || b.proceduralGraphPins ||
+        a.shaderGraph || b.shaderGraph || a.alpha != AlphaMode::Opaque || b.alpha != AlphaMode::Opaque ||
         a.transparent || b.transparent) return false;
     auto state = [](const Material& m) {
         return std::make_tuple(m.shading, m.normalScale, m.occlusionStrength,
@@ -51,8 +54,8 @@ bool materialBatchCompatible(const MeshDef& mesh, const MaterialBatch& batch, co
 }
 
 size_t prepareMaterialBatches(Model& m) {
-    if (m.vertices.empty() || m.indices.empty() || m.vb.valid() || m.ib.valid() || m.geometry ||
-        !m.variants.empty() || !m.skins.empty() || m.materials.size() > kMaxMaterialPalette) return 0;
+    if (m.bspVisibility || m.vertices.empty() || m.indices.empty() || m.vb.valid() || m.ib.valid() || m.geometry ||
+        !m.materialTechniques.bySource.empty() || !m.variants.empty() || !m.skins.empty() || m.materials.size() > kMaxMaterialPalette) return 0;
     // weights[0] is spare only in rigid models. Shared vertices may also belong to another mesh.
     for (const auto& mesh : m.meshes) {
         if (mesh.deformable || !mesh.materialBatches.empty()) return 0;
@@ -173,6 +176,8 @@ ModelMergeResult mergeStaticPrimitives(Model& m, const ModelMergeOptions& o) {
     auto skip = [&](const char* why) { r.reason = why; return r; };
     if (m.vertices.empty() || m.indices.empty()) return skip("no CPU geometry (merge before uploadModel)");
     if (!m.skins.empty() || !m.clips.empty()) return skip("skinned or animated");
+    if (m.bspVisibility) return skip("BSP visibility refers to original primitives");
+    if (!m.materialTechniques.bySource.empty()) return skip("material techniques");
     if (!m.variants.empty()) return skip("material variants");
     if (m.geometry) return skip("built geometry data (clusters, occluders)");
     const float3 extent = m.boundsMax - m.boundsMin;
@@ -201,7 +206,7 @@ ModelMergeResult mergeStaticPrimitives(Model& m, const ModelMergeOptions& o) {
     auto kept = [&](size_t index) { return protectedNodes[index]; };
     auto mergeable = [&](const Primitive& p) {
         const auto& mt = m.materials.at(size_t(p.material));
-        return mt.alpha != AlphaMode::Blend && !mt.transparent;   // blended parts keep their own depth sort
+        return !alphaBlended(mt.alpha) && !mt.transparent;   // blended parts keep their own depth sort
     };
     // Groups: material -> (node, primitive) pairs that become one primitive.
     std::map<int, std::vector<std::pair<int, int>>> groups;

@@ -1,0 +1,202 @@
+{
+  "schema": 1,
+  "id": "studio-simulation-profiler",
+  "owner": "Studio hosted game / simulation-profiler",
+  "changed_paths": [
+    "CMakeLists.txt",
+    "apps/studio-native/StudioGameSurface.cpp",
+    "apps/studio-native/StudioGameSurface.h",
+    "apps/studio-native/StudioHost.cpp",
+    "apps/studio-web/src/nestedDock.ts",
+    "apps/studio-web/src/panels/StudioPanelRenderer.tsx",
+    "apps/studio-web/src/panels/generated/SimulationProfilerPanel.css",
+    "apps/studio-web/src/panels/generated/SimulationProfilerPanel.tsx",
+    "apps/studio-web/src/types.ts",
+    "engine/sim/Simulation.cpp",
+    "engine/sim/Simulation.h",
+    "skills/editor/studio-ui/SKILL.md",
+    "tests/simulation_profile_test.cpp",
+    "apps/editor/core/StudioPlayTools.h",
+    "apps/editor/core/Workspace.cpp",
+    "apps/studio-native/StudioHost.h",
+    "apps/studio-native/StudioSession.cpp",
+    "apps/studio-native/tests/StudioSessionTests.cpp",
+    "docs/editor-native-ecs-inspector.md",
+    "apps/editor/core/StudioPlayTools.cpp"
+  ],
+  "traits": {
+    "editable": false,
+    "simulation": true,
+    "visible": true,
+    "runtime": true
+  },
+  "checks": {
+    "implementation": {
+      "status": "pass",
+      "note": "The native profiler measures Simulation steps and individual scheduled systems. Authenticated MCP started, queried and stopped a bounded capture against the paused actor authority, and the native panel displayed a completed eight-tick capture. The native profile fixture covered scheduling changes and checksum parity.",
+      "evidence": [
+        "docs/evidence/studio-actor-g1/verified-native-results.json",
+        "tests/simulation_profile_test.cpp",
+        "docs/evidence/studio-play-ad676e70c/simulation_profiler.png"
+      ]
+    },
+    "architecture": {
+      "status": "pass",
+      "note": "The native profiler measures Simulation steps and individual scheduled systems. Authenticated MCP started, queried and stopped a bounded capture against the paused actor authority, and the native panel displayed a completed eight-tick capture. The native profile fixture covered scheduling changes and checksum parity.",
+      "evidence": [
+        "docs/evidence/studio-actor-g1/verified-native-results.json",
+        "tests/simulation_profile_test.cpp",
+        "docs/evidence/studio-play-ad676e70c/simulation_profiler.png"
+      ]
+    },
+    "native_api": {
+      "status": "pass",
+      "note": "The production panel in a native Studio window rendered the completed eight-tick native capture with tick timings and individual system measurements. Compatibility review for issues #210–224: Simulation.h adds default-empty presentation event metadata; profiling ownership and timing API remain unchanged. Current simulation_profile_test and native studio_session passed, including existing simulation/checksum and session contracts.",
+      "evidence": [
+        "docs/evidence/studio-play-ad676e70c/simulation_profiler.png",
+        "apps/studio-native/StudioGameSurface.cpp",
+        "docs/evidence/issues-mac-quick-final-retained-20261127.json",
+        "docs/agent-handoffs/issues-20261127-verification.md"
+      ]
+    },
+    "skill": {
+      "status": "pass",
+      "note": "The Studio UI skill documents this panel and its native ownership. Its documented web suite, type checks and production build ran, and the strict skill catalog audit found zero errors.",
+      "evidence": [
+        "skills/editor/studio-ui/SKILL.md",
+        "docs/evidence/integration-acceptance-d5608fb7f.json"
+      ]
+    },
+    "mcp": {
+      "status": "pass",
+      "note": "The native profiler measures Simulation steps and individual scheduled systems. Authenticated MCP started, queried and stopped a bounded capture against the paused actor authority, and the native panel displayed a completed eight-tick capture. The native profile fixture covered scheduling changes and checksum parity.",
+      "evidence": [
+        "docs/evidence/studio-actor-g1/verified-native-results.json",
+        "tests/simulation_profile_test.cpp",
+        "docs/evidence/studio-play-ad676e70c/simulation_profiler.png"
+      ]
+    },
+    "studio": {
+      "status": "pass",
+      "note": "Verified in the production Studio web bundle inside native WKWebView, connected to the local game host. The profiler displayed the completed eight-tick capture and per-system timings.",
+      "evidence": [
+        "docs/evidence/studio-play-ad676e70c/simulation_profiler.png",
+        "docs/evidence/studio-play-ad676e70c/studio-undo.log.txt"
+      ]
+    },
+    "inspector": {
+      "status": "pass",
+      "note": "The production panel in a native Studio window rendered the completed eight-tick native capture with tick timings and individual system measurements.",
+      "evidence": [
+        "docs/evidence/studio-play-ad676e70c/simulation_profiler.png",
+        "apps/studio-native/StudioGameSurface.cpp"
+      ]
+    },
+    "persistence": {
+      "status": "pass",
+      "note": "A profiled and an unprofiled GameCore advanced from the same saved state. After two ticks both gameplay archives and checksums were identical. The two-tick native timing history was populated only for the profiled session.",
+      "evidence": [
+        "docs/agent-handoffs/studio-building-budget-archives-2026-11-25.md",
+        "tests/simulation_profile_test.cpp"
+      ]
+    },
+    "graphs": {
+      "status": "not_applicable",
+      "note": "This panel operates on the current hosted simulation. It does not own or edit a graph document.",
+      "evidence": [
+        "docs/agent-handoffs/feature-gate-native-integration-2026-11-25.md",
+        "apps/studio-native/StudioHost.cpp"
+      ]
+    },
+    "performance": {
+      "status": "pass",
+      "note": "Six 120-tick capture and baseline pairs on the 23-system mushrooms duel measured timing overhead, storage reuse, process memory and unchanged authoritative checksums.",
+      "evidence": [
+        "docs/agent-handoffs/studio-play-review-bulk-2026-11-25.md",
+        "tests/simulation_profile_test.cpp"
+      ]
+    },
+    "platforms": {
+      "status": "pass",
+      "note": "Scoped Mac acceptance: current merged-tree native simulation_profile_test and studio_session passed; previously recorded production WKWebView profiler capture establishes native panel behavior. Current Windows/Linux/mobile profiler runtime NOT RUN; no parity claim. Simulation.h change only adds default-empty presentation-event metadata.",
+      "evidence": [
+        "docs/evidence/issues-mac-quick-final-retained-20261127.json",
+        "docs/evidence/studio-play-ad676e70c/simulation_profiler.png",
+        "docs/evidence/studio-actor-g1/verified-native-results.json"
+      ]
+    },
+    "dependencies": {
+      "status": "pass",
+      "note": "The declared feature policy lists no prerequisite manifests. The integrated report resolved the dependency order and roadmap without policy errors.",
+      "evidence": [
+        "docs/agents/feature-policy.json",
+        "docs/evidence/integration-1209eaa44-policy.log.txt"
+      ]
+    },
+    "headless": {
+      "status": "pass",
+      "note": "The standalone MCP registry advertised the typed schema and rejected calls requiring a connected local Studio. Both native registries listed the feature tools.",
+      "evidence": [
+        "docs/evidence/integration-ad5786f5a-headless.log.txt",
+        "docs/evidence/integration-ad5786f5a-graphs.log.txt",
+        "docs/evidence/integration-ad5786f5a-linux.log.txt"
+      ]
+    },
+    "examples": {
+      "status": "pass",
+      "note": "The native profiler measures Simulation steps and individual scheduled systems. Authenticated MCP started, queried and stopped a bounded capture against the paused actor authority, and the native panel displayed a completed eight-tick capture. The native profile fixture covered scheduling changes and checksum parity.",
+      "evidence": [
+        "docs/evidence/studio-actor-g1/verified-native-results.json",
+        "tests/simulation_profile_test.cpp",
+        "docs/evidence/studio-play-ad676e70c/simulation_profiler.png"
+      ]
+    },
+    "tests": {
+      "status": "pass",
+      "note": "Current combined Mac quick gate: 587 passed, 5 explicit skips, 0 failures on 0a8ed3c9ef3858d539c1b38ade9036dd8391e64f. Simulation.h adds default-empty presentation event metadata; profiling ownership and timing API remain unchanged. Current simulation_profile_test and native studio_session passed, including existing simulation/checksum and session contracts.",
+      "evidence": [
+        "docs/evidence/issues-mac-quick-final-retained-20261127.json",
+        "docs/evidence/issues-mac-quick-final-raw-20261127/ctest.xml"
+      ]
+    },
+    "handoff": {
+      "status": "pass",
+      "note": "The owner handoff records the implementation, verification scope and follow-up work.",
+      "evidence": [
+        "docs/handoff/studio-html5/s2-simulation-profiler-2026-11-24.md"
+      ]
+    },
+    "documentation": {
+      "status": "pass",
+      "note": "The owner handoff describes the supported Studio workflow, bridge contract and limits.",
+      "evidence": [
+        "docs/handoff/studio-html5/s2-simulation-profiler-2026-11-24.md"
+      ]
+    },
+    "publishing": {
+      "status": "pass",
+      "note": "Prepared the bilingual Studio diary with real native editor captures. The site checker accepted 59 entries and the local builder generated both languages. The release-site contract documents the native editor tool exception for a separate browser demo. Public deployment follows main integration.",
+      "evidence": [
+        "docs/devlog/entries/2026-11-25-studio-local-play-inspection.json",
+        "docs/agents/contracts/release-site.md"
+      ]
+    }
+  },
+  "integrations": {
+    "skills": [
+      "studio-ui"
+    ],
+    "mcp_tools": [
+      "studio_runtime_profile"
+    ],
+    "studio_methods": [
+      "studio.gameProfile"
+    ],
+    "studio_panels": [
+      "simulation_profiler"
+    ]
+  },
+  "test_reports": [
+    "docs/evidence/issues-mac-quick-final-retained-20261127.json"
+  ]
+}

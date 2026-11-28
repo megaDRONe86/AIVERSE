@@ -37,7 +37,15 @@ bool sameUntextured(const Material& a,const Material& b){
 bool sameBoundMaterial(Material a,Material b,const std::vector<Image>& images){
     const int ai[]={a.baseTex,a.mrTex,a.normalTex,a.occlusionTex,a.emissiveTex,a.teamTex};
     const int bi[]={b.baseTex,b.mrTex,b.normalTex,b.occlusionTex,b.emissiveTex,b.teamTex};
-    for(int k=0;k<6;++k){if((ai[k]<0)!=(bi[k]<0))return false;if(ai[k]>=0){const auto x=images[size_t(ai[k])].tex,y=images[size_t(bi[k])].tex;if(!x.valid()||!(x==y))return false;}}
+    if(a.proceduralGraphPins||b.proceduralGraphPins)return false;
+    for(int k=0;k<6;++k){
+        if((ai[k]<0)!=(bi[k]<0))return false;
+        if(ai[k]>=0){
+            if(size_t(ai[k])>=images.size()||size_t(bi[k])>=images.size())return false;
+            const auto& x=images[size_t(ai[k])];const auto& y=images[size_t(bi[k])];
+            if(runtimeGraphImage(x)||runtimeGraphImage(y)||!x.tex.valid()||!(x.tex==y.tex))return false;
+        }
+    }
     a.baseTex=a.mrTex=a.normalTex=a.occlusionTex=a.emissiveTex=a.teamTex=-1;
     b.baseTex=b.mrTex=b.normalTex=b.occlusionTex=b.emissiveTex=b.teamTex=-1;
     return sameUntextured(a,b);
@@ -218,11 +226,11 @@ bool GeometryScene::planStrataView(const std::string& sourceKey,
 #endif
 }
 
-void GeometryScene::retireResident(gfx::Device& dev) {
-    // STRATA index pages and temporal GPU masks have not joined the
-    // deferred native retirement queue. Avoid in-flight destruction.
+void GeometryScene::retireResident(gfx::Device& dev,bool completedSubmission) {
+    // Without a covering completed-submission fence, STRATA sidecars
+    // require the existing idle barrier before destruction.
 #if defined(AIVERSE_STRATA_STAGING_ENABLED)
-    if ((!strataPortableSources_.empty() || strataGpuMetadata_ ||
+    if (!completedSubmission && (!strataPortableSources_.empty() || strataGpuMetadata_ ||
          strataGpuCulling_) && !dev.waitForResourceIdle())
         throw std::runtime_error(
             "geometry scene: STRATA GPU resources require idle before reload");
@@ -303,6 +311,45 @@ bool GeometryScene::recoverFailedStagesAfterGpuIdle(gfx::Device& dev) {
         it=failedStages_.erase(it);
     }
     return true;
+}
+bool GeometryScene::deferredShutdownEligible()const noexcept {
+    // Stage38 supports only ordinary GeometryScene Model GPU ownership.
+    // STRATA retains auxiliary index/culling/compact buffers which still
+    // demand a global idle barrier during retireResident().
+    return !strataStagingEnabled_ && !strataPortableRenderingEnabled_ &&
+           !strataGpuMetadataEnabled_ && !strataGpuCullingEnabled_ &&
+           failedStages_.empty() && !strataGpuMetadata_ &&
+           !strataGpuCulling_ && strataPortableSources_.empty() &&
+           strataCompactBuffers_.empty() && strataGlobalIndexLeases_.empty();
+}
+bool GeometryScene::beginDeferredShutdown(gfx::Device& dev) {
+    if(deferredShutdownStarted_)return true;
+    if(!deferredShutdownEligible())return false;
+    // No render submissions for this owner are allowed after this point.
+    // Model handles are moved into a fence-backed retirement queue.
+    retireResident(dev);
+    deferredShutdownStarted_=true;
+    return true;
+}
+bool GeometryScene::beginDeferredShutdownAfterFence(gfx::Device& dev,uint64_t lastUseFence) {
+    if(!lastUseFence||!dev.gpuHealthy()||dev.gpuCompletedFence()<lastUseFence)
+        return false;
+    if((strataPortableDevice_&&strataPortableDevice_!=&dev)||
+       (strataGpuDevice_&&strataGpuDevice_!=&dev))return false;
+    if(deferredShutdownStarted_)return true;
+    if(!failedStages_.empty()||strataGpuMetadata_||strataGpuCulling_||
+       strataGpuMetadataEnabled_||strataGpuCullingEnabled_)return false;
+    // The owner has detached all draws and aliases before the covering
+    // fence. Release sidecars, page reservations and borrowed aliases in
+    // the existing order; source Models still use the retirement queue.
+    retireResident(dev,true);
+    deferredShutdownStarted_=true;
+    return true;
+}
+bool GeometryScene::pollDeferredShutdown(gfx::Device& dev) {
+    if(!deferredShutdownStarted_)return false;
+    if(!retirement_.collectWithoutIdle(dev))return false;
+    return retirement_.pending()==0 && failedStages_.empty();
 }
 void GeometryScene::shutdown(gfx::Device& dev) {
     retireResident(dev);
@@ -906,8 +953,20 @@ void GeometryScene::loadImpl(gfx::Device& dev,const Json& json,const FileReader&
 std::unique_ptr<Model> GeometryScene::makeProxy(const std::vector<size_t>& ids,float& error){
     // Explicit baked surfaces own their switch threshold. Do not bypass it with a parent proxy.
     for(auto id:ids)if(instances_[id].surfaceProxy)return {};
-    // Transparent/masked/graph materials retain their original independent draws and sorting.
-    for(auto id:ids)for(auto& m:instances_[id].model->materials)if(m.alpha!=AlphaMode::Opaque||m.transparent||m.shaderGraph)return {};
+    // HLOD copies image descriptors into a separate Model. A procedural
+    // generation or tombstone cannot be copied/remapped into that owner.
+    // Keep the original draws (and their owner) even for unused graph slots.
+    for(auto id:ids){
+        const auto& source=*instances_[id].model;
+        for(const auto& image:source.images)if(runtimeGraphImage(image))return {};
+        for(const auto& material:source.materials){
+            if(material.proceduralGraphPins||material.alpha!=AlphaMode::Opaque||
+               material.transparent||material.shaderGraph)return {};
+            for(auto slot:{&Material::baseTex,&Material::mrTex,&Material::normalTex,
+                           &Material::occlusionTex,&Material::emissiveTex,&Material::teamTex})
+                if(material.*slot>=0&&!resolveMaterialImage(source,material,slot))return {};
+        }
+    }
     auto out=std::make_unique<Model>();out->path="geometry:hlod";
     out->meshes.emplace_back();Node node;node.mesh=0;out->nodes.push_back(node);
     std::map<std::pair<const Model*,int>,int> materials;
@@ -1138,6 +1197,18 @@ void GeometryScene::updateStrataStreamingBeforeDraw(Renderer3D& r){
 #else
     (void)r;
 #endif
+}
+void GeometryScene::drawExactPlaced(Renderer3D& r,const mat4& parent){
+    if(hlod_||strataStagingEnabled_||strataPortableRenderingEnabled_)
+        throw std::logic_error("GeometryScene exact placement requires unsimplified sources");
+    stats_.submitted=0;stats_.surfaceProxiesSubmitted=0;
+    for(const auto& i:instances_){
+        ModelDraw d;d.model=i.model;d.world=parent*i.world;d.layers=i.layers;
+        d.geometry=GeometryPolicy{};d.geometry.clusters=false;
+        d.geometry.shadowClusters=false;d.geometry.occluder=false;
+        d.staticCache=nullptr;
+        r.drawModel(d);++stats_.submitted;
+    }
 }
 void GeometryScene::draw(Renderer3D& r){
     // STRATA triangle budget: steer the pixel-error threshold so the STRATA

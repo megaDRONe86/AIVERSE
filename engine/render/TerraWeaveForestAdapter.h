@@ -98,6 +98,12 @@ public:
     // Far impostor atlas: rasterized from the near tree mesh and textures
     // (default) or the legacy skeleton disk/line silhouette. Before addPrototype.
     void setImpostorFromNearModel(bool on) {impostorFromNearModel_=on;}
+    // Override automatic shape selection for subsequently added prototypes.
+    void setImpostorContourBands(int bands) {
+        if (bands != 0 && bands != 1 && bands != 3 && bands != 8)
+            throw std::invalid_argument("expected 0, 1, 3 or 8 tree impostor bands");
+        impostorContourBands_ = bands;
+    }
     bool impostorFromNearModel() const {return impostorFromNearModel_;}
 
     void addPrototype(const TreeProfile& profile, uint64_t meshSeed,
@@ -151,6 +157,8 @@ public:
         auto impostor = makeArborImpostorAtlas(profile, meshSeed, impostorSettings);
         if(impostorFromNearModel_)
             bakeArborImpostorFromModel(impostor,*model,impostorSettings);
+        const int bands = impostorContourBands_.value_or(impostor.trimBakedLayers ? 1 : 0);
+        if (bands) trimArborImpostorCards(impostor, bands);
         models_.emplace(profile.speciesId, std::move(model));
         billboardMaterials_.emplace(profile.speciesId, std::move(impostor.viewMaterials));
         billboards_.emplace(profile.speciesId, std::move(impostor.model));
@@ -556,9 +564,27 @@ public:
             origin.x + static_cast<int64_t>(std::llround(relativeXcm)),
             origin.z + static_cast<int64_t>(std::llround(relativeZcm))
         };
+        if (renderer.windRigDebugView() != render::wind::WindDebugView::Skeleton) {
+            forEachDraw(batches, origin, [&](const render::ModelDraw& draw) {
+                renderer.drawModel(draw);
+            }, cameraCm);
+            return;
+        }
+        std::map<const render::Model*, std::optional<render::wind::ModelWindRigView>> rigs;
+        std::vector<render::wind::WindDebugLine> lines;
+        // Isolate branch lines from opaque foliage and bound dense-map debug geometry.
+        constexpr size_t maxLines = 16384;
         forEachDraw(batches, origin, [&](const render::ModelDraw& draw) {
-            renderer.drawModel(draw);
+            if (!draw.model || lines.size() + 4 > maxLines) return;
+            auto [it, inserted] = rigs.try_emplace(draw.model);
+            if (inserted) it->second = render::wind::findWindRig(*draw.model);
+            if (!it->second) return;
+            const auto params = render::wind::windRigParamsForDraw(renderer.sceneWind(), draw.world);
+            render::wind::windRigDebugLines(*it->second, draw.world, params, lines, 4,
+                                             (maxLines - lines.size()) / 4);
         }, cameraCm);
+        for (const auto& line : lines)
+            renderer.line({line.a.x,line.a.y,line.a.z}, {line.b.x,line.b.y,line.b.z}, line.rgba);
     }
 
 private:
@@ -681,6 +707,7 @@ private:
     std::map<uint32_t,uint64_t> prototypeSeeds_;
     PrototypeDecorator decorator_;
     bool impostorFromNearModel_=true;
+    std::optional<int> impostorContourBands_;
     ArborTreeGeometry treeGeometry_=ArborTreeGeometry::Auto;
     TreeLodSettings treeLod_;
     bool hierarchicalWind_=false;

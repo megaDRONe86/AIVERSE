@@ -47,6 +47,13 @@ if(AIVERSE_PLATFORM MATCHES "^(macos|windows|linux)$")
     set(AIVERSE_DESKTOP ON)
 endif()
 
+option(AIVERSE_BUILD_RENDER_SDK "Build desktop renderer language bindings" OFF)
+if(AIVERSE_BUILD_RENDER_SDK)
+    if(NOT AIVERSE_DESKTOP)
+        message(FATAL_ERROR "The headless renderer SDK requires a desktop target")
+    endif()
+    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+endif()
 option(AIVERSE_BUILD_TESTS "Build unit tests" ${AIVERSE_DESKTOP})
 # Languages must be enabled in the highest common directory of their targets.
 # VIVID's real Metal GPU test is Objective-C++ (.mm); enabling OBJCXX only
@@ -57,20 +64,31 @@ if(AIVERSE_PLATFORM STREQUAL "macos" AND AIVERSE_BUILD_TESTS)
 endif()
 option(AIVERSE_BUILD_HEADLESS "Build headless runner" ${AIVERSE_DESKTOP})
 option(AIVERSE_BUILD_CLIENT "Build the game client" ON)
-option(AIVERSE_BUILD_EDITOR "Build the map editor" ${AIVERSE_DESKTOP})
 option(AIVERSE_BUILD_TOOLS "Build aiversebuild packager" ${AIVERSE_DESKTOP})
 option(AIVERSE_BUILD_SERVER "Build the network game server and the network bot client" ${AIVERSE_DESKTOP})
 
 # Register Objective-C++ in the ROOT directory before creating any targets.
 # CMake does not propagate a language enabled only in a child directory back
 # to parent-scoped targets; otherwise it can fail with CMAKE_OBJCXX_COMPILE_OBJECT.
-# The HTML5 Studio is the main editor on macOS and Windows: built by default once its web bundle exists
+# Desktop builds prefer HTML5 Studio when the web bundle and platform dependencies exist
 # (studio_mac.command / studio_windows.cmd build the bundle first; -DAIVERSE_BUILD_STUDIO_HTML5=OFF skips it).
+set(AIVERSE_STUDIO_WEB_DIST "${PROJECT_SOURCE_DIR}/apps/studio-web/dist" CACHE PATH "Built Studio web assets")
 set(_aiverse_studio_default OFF)
-if((APPLE OR WIN32) AND NOT IOS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/apps/studio-web/dist/index.html")
+if(AIVERSE_PLATFORM MATCHES "^(macos|windows)$" AND EXISTS "${AIVERSE_STUDIO_WEB_DIST}/index.html")
     set(_aiverse_studio_default ON)
+elseif(AIVERSE_PLATFORM STREQUAL "linux" AND EXISTS "${AIVERSE_STUDIO_WEB_DIST}/index.html"
+       AND (NOT DEFINED AIVERSE_VULKAN OR AIVERSE_VULKAN))
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(STUDIO_GTK_DEFAULT QUIET webkit2gtk-4.1>=2.40)
+        find_package(SQLite3 QUIET)
+        if(STUDIO_GTK_DEFAULT_FOUND AND SQLite3_FOUND)
+            set(_aiverse_studio_default ON)
+        endif()
+    endif()
 endif()
-option(AIVERSE_BUILD_STUDIO_HTML5 "Build the HTML5 Studio (main editor; macOS and Windows)" ${_aiverse_studio_default})
+option(AIVERSE_BUILD_STUDIO_HTML5 "Build the HTML5 Studio desktop editor" ${_aiverse_studio_default})
+option(AIVERSE_BUILD_EDITOR "Build the legacy ImGui map editor for migration checks" OFF)
 if(APPLE AND AIVERSE_BUILD_STUDIO_HTML5)
     enable_language(OBJCXX)
 endif()
@@ -111,6 +129,9 @@ set(AIVERSE_TEMPLATES_DIR "${_aiverse_templates_default}" CACHE PATH "Installed 
 file(TO_CMAKE_PATH "${AIVERSE_TEMPLATES_DIR}" AIVERSE_TEMPLATES_DIR)
 option(AIVERSE_FETCH_TEMPLATES "Install the template packages at configure time when they are missing" ON)
 find_package(Python3 COMPONENTS Interpreter QUIET)
+if(AIVERSE_BUILD_TESTS)
+    file(GENERATE OUTPUT "${CMAKE_BINARY_DIR}/test-python.txt" CONTENT "$<$<BOOL:${Python3_Interpreter_FOUND}>:${Python3_EXECUTABLE}\n>")
+endif()
 if(AIVERSE_FETCH_TEMPLATES AND NOT EXISTS "${AIVERSE_TEMPLATES_DIR}/skirmish/game.json")
     if(Python3_Interpreter_FOUND)
         message(STATUS "Installing the template packages into ${AIVERSE_TEMPLATES_DIR}")
@@ -258,6 +279,10 @@ if(AIVERSE_ENABLE_PHYSICS)
     add_subdirectory(engine/physics)
 endif()
 add_subdirectory(engine/meta)
+# Small, portable Caverns CPU tests, independent of optional Box3D/RHI.
+if(AIVERSE_BUILD_TESTS AND NOT EMSCRIPTEN)
+    add_subdirectory(tests/caverns)
+endif()
 
 # The one gameplay host: grid systems (units, orders, economy, combat, garrisons, AI) and, on world-space maps, actor systems
 add_library(aiverse_game STATIC
@@ -300,6 +325,7 @@ add_library(aiverse_game STATIC
     engine/game/ComputerPlayerTactics.cpp)
 target_link_libraries(aiverse_game PUBLIC aiverse_fps aiverse_voxelgame)   # actor / voxel systems: engine/actor, engine/voxel CMakeLists
 target_link_libraries(aiverse_game PUBLIC aiverse_engine)
+# Shared recurring work policy for data-driven population decisions.
 # The one vehicle system of every host (docs/driving.md, AGENTS.md "no genre split"): components, the per-tick step,
 # the race adapter. The grid-map host (engine/game/Driving.cpp) and the metre-map host (engine/actor/ActorVehicles.cpp)
 # only implement its world queries.
@@ -425,6 +451,7 @@ elseif(AIVERSE_PLATFORM STREQUAL "web")
 elseif(UNIX AND NOT ANDROID)
     target_link_libraries(aiverse_pack PUBLIC ${CMAKE_DL_LIBS})
 endif()
+target_link_libraries(aiverse_pack PRIVATE aiverse_zstd_dec)
 target_include_directories(aiverse_pack PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 if(AIVERSE_BUILD_TOOLS OR AIVERSE_BUILD_TESTS)
     add_library(aiverse_pack_writer STATIC engine/pack/PackWriter.cpp engine/pack/Unpacker.cpp)
@@ -438,6 +465,7 @@ endif()
 add_library(aiverse_net STATIC
     engine/net/Loopback.cpp
     engine/net/Socket.cpp
+    engine/net/LanDiscovery.cpp
     engine/net/PlainHttp.cpp
     engine/net/Reliable.cpp
     engine/net/Udp.cpp
@@ -608,10 +636,10 @@ if(AIVERSE_OBJ)
 else()
     target_compile_definitions(aiverse_models PRIVATE AIVERSE_NO_OBJ=1)
 endif()
-option(AIVERSE_LEGACY_MODELS "Runtime VOX/VXL, PLY/STL, 3DS, DAE, MDX/MDL, 3DO and W3D import" ON)
+option(AIVERSE_LEGACY_MODELS "Runtime BSP, VOX/VXL, PLY/STL, 3DS, DAE, MDX/MDL, 3DO and W3D import" ON)
 if(AIVERSE_LEGACY_MODELS)
     target_sources(aiverse_models PRIVATE
-        engine/render/ModelVox.cpp engine/render/ModelPly.cpp
+        engine/render/ModelVox.cpp engine/render/ModelPly.cpp engine/render/ModelBsp.cpp
         engine/render/Model3ds.cpp engine/render/ModelDae.cpp
         engine/render/ModelMdx.cpp engine/render/ModelMdl.cpp
         engine/render/Model3do.cpp engine/render/ModelW3d.cpp)
@@ -633,9 +661,8 @@ if(AIVERSE_FBX)
 else()
     target_compile_definitions(aiverse_models PRIVATE AIVERSE_NO_FBX=1)
 endif()
-# KTX2 zstd supercompression: the decoder comes with aiverse_runtime (aiverse_zstd_dec) or, in host tools,
-# with aiverse_pack_writer (full zstd); linking aiverse_zstd_dec here would pull both into tests and tools.
-target_link_libraries(aiverse_models PUBLIC aiverse_engine)
+# TextureCodec reads KTX2 with the same decoder target used by resource packs.
+target_link_libraries(aiverse_models PUBLIC aiverse_engine PRIVATE aiverse_zstd_dec)
 
 # Programmable presentation animation graphs reuse the existing model sampler and IK.
 target_sources(aiverse_models PRIVATE engine/render/SurfaceLocomotion.cpp engine/render/AnimationContacts.cpp engine/render/FullBodyIK.cpp engine/render/AnimationGraph.cpp engine/render/AnimationRig.cpp engine/render/AnimationMotion.cpp)
@@ -657,6 +684,11 @@ if(AIVERSE_BUILD_TESTS)
     add_executable(aiverse_adaptive_shadow_resolution_tests tests/render/adaptive_shadow_resolution.cpp)
     target_include_directories(aiverse_adaptive_shadow_resolution_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     add_test(NAME adaptive_shadow_resolution COMMAND aiverse_adaptive_shadow_resolution_tests)
+    if(AIVERSE_LEGACY_MODELS)
+        add_executable(aiverse_quake3_bsp_tests tests/render/quake3_bsp.cpp)
+        target_link_libraries(aiverse_quake3_bsp_tests PRIVATE aiverse_models aiverse_zstd_dec)
+        add_test(NAME quake3_bsp COMMAND aiverse_quake3_bsp_tests)
+    endif()
     add_executable(aiverse_model_batching_policy_tests tests/render/model_batching_policy.cpp)
     target_link_libraries(aiverse_model_batching_policy_tests PRIVATE aiverse_models aiverse_zstd_dec)
     add_test(NAME model_batching_policy COMMAND aiverse_model_batching_policy_tests)
@@ -767,6 +799,8 @@ endif()
 if((AIVERSE_BUILD_TOOLS OR AIVERSE_BUILD_TESTS) AND NOT EMSCRIPTEN AND NOT ANDROID AND NOT IOS)
     add_executable(aiverse_root_motion_bake tools/animation/root_motion_bake.cpp)
     target_link_libraries(aiverse_root_motion_bake PRIVATE AIVERSE::animation_ecs aiverse_zstd_dec)
+    add_executable(aiverse_sdf_bake tools/spectrafx/sdf_bake.cpp)
+    target_link_libraries(aiverse_sdf_bake PRIVATE aiverse_models aiverse_zstd_dec)
 endif()
 if(AIVERSE_BUILD_TESTS)
     add_executable(aiverse_root_motion_bake_tests tests/animation/root_motion_bake.cpp)
@@ -1053,6 +1087,9 @@ endif()
 
 # MotionWeave core: sampling, blend/sync, morph-free path, IK, rig, motion matching, foot slide.
 if(AIVERSE_BUILD_TESTS)
+    add_executable(aiverse_motionweave_walk_generator_tests tests/animation/walk_generator.cpp)
+    target_link_libraries(aiverse_motionweave_walk_generator_tests PRIVATE AIVERSE::MotionWeave aiverse_zstd_dec)
+    add_test(NAME motionweave_walk_generator COMMAND aiverse_motionweave_walk_generator_tests)
     add_executable(aiverse_motionweave_core_tests tests/animation/motionweave_core.cpp)
     target_link_libraries(aiverse_motionweave_core_tests PRIVATE AIVERSE::MotionWeave aiverse_zstd_dec)
     add_test(NAME motionweave_core COMMAND aiverse_motionweave_core_tests)
@@ -1269,7 +1306,7 @@ target_link_libraries(aiverse_shader_graph PUBLIC aiverse_engine)
 
 # Canonical post-processing implementation: PRISMA.
 # Keep existing aiverse_postfx_data target alive for older native targets.
-add_library(aiverse_postfx_data STATIC engine/render/PrismaData.cpp engine/render/PrismaVolumeData.cpp)
+add_library(aiverse_postfx_data STATIC engine/render/PrismaData.cpp engine/render/PrismaVolumeData.cpp engine/render/PrismaCompositor.cpp)
 add_library(aiverse_prisma_data ALIAS aiverse_postfx_data)
 add_library(AIVERSE::prisma_data ALIAS aiverse_postfx_data)
 target_link_libraries(aiverse_postfx_data PUBLIC aiverse_engine aiverse_shader_graph)
@@ -1481,6 +1518,13 @@ elseif(AIVERSE_PLATFORM STREQUAL "windows")
     target_link_libraries(aiverse_runtime PUBLIC opengl32 user32 gdi32 shell32)
 else()
     target_link_libraries(aiverse_runtime PUBLIC X11 EGL GLESv2)
+    find_path(AIVERSE_XCURSOR_INCLUDE X11/Xcursor/Xcursor.h)
+    find_library(AIVERSE_XCURSOR_LIB Xcursor)
+    if(AIVERSE_XCURSOR_INCLUDE AND AIVERSE_XCURSOR_LIB)
+        target_include_directories(aiverse_runtime PRIVATE ${AIVERSE_XCURSOR_INCLUDE})
+        target_compile_definitions(aiverse_runtime PRIVATE AIVERSE_WITH_XCURSOR=1)
+        target_link_libraries(aiverse_runtime PRIVATE ${AIVERSE_XCURSOR_LIB})
+    endif()
 endif()
 
 # Shared presentation visibility field; independent of game genre.
@@ -1509,15 +1553,18 @@ add_library(aiverse_game_view STATIC engine/view/game/GameView.cpp engine/view/g
     engine/view/game/GamePlanetRender.cpp engine/view/game/GamePlanetView.cpp engine/view/game/GamePlanetGroundFx.cpp engine/view/game/GamePlanetFlora.cpp)
 # visual terrain detail surface (agent-terrain): shared by the view and the editor core (sculpt, validate)
 # + the planet surface maths (GamePlanet*: float cube-sphere surface, detail grid synthesis; editor planet detail ops)
-add_library(aiverse_terrain_detail STATIC engine/view/game/GameTerrainDetail.cpp engine/view/game/GamePlanet.cpp engine/view/game/GamePlanetDetail.cpp)
+add_library(aiverse_terrain_detail STATIC engine/view/game/GameTerrainLook.cpp engine/view/game/GameTerrainDetail.cpp engine/view/game/GamePlanet.cpp engine/view/game/GamePlanetDetail.cpp)
 target_link_libraries(aiverse_terrain_detail PUBLIC aiverse_game)
 target_link_libraries(aiverse_game_view PUBLIC aiverse_game aiverse_models aiverse_imgui aiverse_roads_view)
+# Public Caverns visual host headers expose the Box3D geometry types.
+target_include_directories(aiverse_game_view INTERFACE "${PROJECT_SOURCE_DIR}/third_party/box3d/include")
 target_link_libraries(aiverse_game_view PUBLIC aiverse_terrain_detail)
 target_link_libraries(aiverse_game_view PUBLIC aiverse_view_visibility)
 # Transitional host adapter consumes the engine View. The dependency points
 # from the game module into the engine, never back into an RTS implementation.
 target_link_libraries(aiverse_game_view PUBLIC AIVERSE::view)
 target_link_libraries(aiverse_game_view PUBLIC aiverse_world)   # GameWaterNereid.h: NEREID manifest parsing (engine/world)
+target_include_directories(aiverse_game_view PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/libraries/include)
 
 # Helper: package content + platform metadata around an executable.
 include(platform/cmake/ThirdPartyNotices.cmake)
@@ -1584,14 +1631,14 @@ function(aiverse_package_app target)
             add_custom_command(TARGET ${target} POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E make_directory "${res_dir}/content"
                 COMMAND ${CMAKE_COMMAND} -E copy "${AIVERSE_CONTENT_PACK}" "${res_dir}/content/content.rpak"
-                COMMENT "Bundling content pack")
+                COMMENT "Bundling content pack" VERBATIM)
         elseif(AIVERSE_CLIENT_BUNDLE_CONTENT)
             add_custom_command(TARGET ${target} POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E make_directory "${res_dir}"
                 COMMAND ${CMAKE_COMMAND} -E copy_directory "${AIVERSE_CONTENT_DIR}" "${res_dir}/content"
                 COMMAND ${CMAKE_COMMAND} -E rm -rf "${res_dir}/content/Builds" "${res_dir}/content/logs" ${_aiverse_rm_bundle}   # project outputs, project file
                 COMMAND ${CMAKE_COMMAND} -E copy_directory "${AIVERSE_ENGINE_ASSETS}" "${res_dir}/content/engine"
-                COMMENT "Bundling content")
+                COMMENT "Bundling content" VERBATIM)
         endif()
         if(AIVERSE_PRECOMPILE_METAL AND AIVERSE_PLATFORM STREQUAL "macos" AND target STREQUAL "aiverse_client")
             if(AIVERSE_CONTENT_PACK)
@@ -1671,6 +1718,8 @@ if(AIVERSE_BUILD_CLIENT)
     elseif(AIVERSE_PLATFORM STREQUAL "android")
         add_library(main SHARED apps/client/main.cpp)
         target_link_libraries(main PRIVATE aiverse_client_runtime aiverse_game_view aiverse_i18n AIVERSE::InputFlow)
+        # Android game client is SHARED, not covered by the executable host scan.
+        target_link_libraries(main PRIVATE AIVERSE::native_modules)
         target_link_libraries(main PRIVATE aiverse_game_audio)
         # Keep ANativeActivity_onCreate from the glue library.
         set_target_properties(main PROPERTIES LINK_FLAGS "-u ANativeActivity_onCreate")
@@ -1730,7 +1779,7 @@ endif()
 # Light baker (agent-lightbake): offline CPU path tracer (BVH, threads) for lightmaps + light probes,
 # automatic lightmap UVs (xatlas, MIT), bake folder writer. Host only: editor, MCP, tests.
 # ---------------------------------------------------------------------------
-if(AIVERSE_BUILD_EDITOR OR AIVERSE_BUILD_TOOLS OR AIVERSE_BUILD_TESTS)
+if(AIVERSE_BUILD_EDITOR OR AIVERSE_BUILD_TOOLS OR AIVERSE_BUILD_TESTS OR AIVERSE_BUILD_STUDIO_HTML5)
     find_package(Threads REQUIRED)
     add_library(aiverse_xatlas STATIC third_party/xatlas/xatlas.cpp)
     target_include_directories(aiverse_xatlas PUBLIC third_party/xatlas)
@@ -1738,7 +1787,7 @@ if(AIVERSE_BUILD_EDITOR OR AIVERSE_BUILD_TOOLS OR AIVERSE_BUILD_TESTS)
         target_compile_options(aiverse_xatlas PRIVATE -w)
     endif()
     add_library(aiverse_bake STATIC engine/bake/Bvh.cpp engine/bake/Baker.cpp engine/bake/BakerProbes.cpp
-        engine/bake/BakeScene.cpp engine/bake/LightmapUnwrap.cpp engine/bake/LightmapWrite.cpp engine/bake/Denoise.cpp)
+        engine/bake/BakeScene.cpp engine/bake/CapturedBake.cpp engine/bake/LightmapUnwrap.cpp engine/bake/LightmapWrite.cpp engine/bake/Denoise.cpp)
     target_link_libraries(aiverse_bake PUBLIC aiverse_models aiverse_xatlas Threads::Threads)
     target_include_directories(aiverse_bake PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 endif()
@@ -1749,16 +1798,18 @@ if(AIVERSE_BUILD_TESTS)
     add_test(NAME bake_tests COMMAND aiverse_bake_tests)
 endif()
 
-if(AIVERSE_BUILD_EDITOR OR AIVERSE_BUILD_TOOLS)
+if(AIVERSE_BUILD_EDITOR OR AIVERSE_BUILD_TOOLS OR AIVERSE_BUILD_STUDIO_HTML5)
     # Editor core: project/map documents and the operation registry shared by the editor and aiversemcp.
-    add_library(aiverse_editor_core STATIC apps/editor/core/MapDoc.cpp apps/editor/core/MapDocPlanet.cpp apps/editor/core/Workspace.cpp apps/editor/core/Net.cpp apps/editor/core/McpInstall.cpp apps/editor/core/Projects.cpp
+    add_library(aiverse_editor_core STATIC apps/editor/core/MapDoc.cpp apps/editor/core/MapDocPlanet.cpp apps/editor/core/Workspace.cpp apps/editor/core/StudioPlayTools.cpp apps/editor/core/Net.cpp apps/editor/core/McpInstall.cpp apps/editor/core/Projects.cpp
     apps/editor/core/DataOps.cpp apps/editor/core/BalanceOps.cpp
     apps/editor/core/SimTools.cpp apps/editor/core/ScenarioOps.cpp apps/editor/core/SchemaOps.cpp apps/editor/core/PruneOps.cpp apps/editor/core/CampaignOps.cpp apps/editor/core/StrategicOps.cpp
     apps/editor/core/ToolchainOps.cpp apps/editor/core/WorldInspect.cpp)   # scenario_run, rules_lint, rules_schema keys
-    target_link_libraries(aiverse_editor_core PUBLIC aiverse_game)
+    target_link_libraries(aiverse_editor_core PUBLIC aiverse_game aiverse_pack) # Studio history uses shared SHA-256
+    target_sources(aiverse_editor_core PRIVATE apps/editor/core/ProjectFileEdits.cpp apps/editor/core/ProjectHistoryPersistence.cpp apps/editor/core/MapHistoryPersistence.cpp)
     target_link_libraries(aiverse_editor_core PUBLIC AIVERSE::lib_nereid_water)   # erosion zone ops (NereidErosion soils)
     target_link_libraries(aiverse_editor_core PUBLIC aiverse_i18n)   # editor messages (editorText)
     target_link_libraries(aiverse_editor_core PUBLIC aiverse_postfx_data)   # postfx_* ops (postfx agent)
+    target_link_libraries(aiverse_editor_core PRIVATE AIVERSE::lib_work_budget)
     target_sources(aiverse_editor_core PRIVATE apps/editor/core/PrismaOps.cpp)
     target_sources(aiverse_editor_core PRIVATE apps/editor/core/LightBakeOps.cpp)   # lightbake_* ops (agent-lightbake)
     target_sources(aiverse_editor_core PRIVATE apps/editor/core/HumanCreatorOps.cpp)   # human_* ops (VIVID Human Creator)
@@ -1782,6 +1833,12 @@ if(AIVERSE_BUILD_EDITOR)
     file(GLOB AIVERSE_EDITOR_WINDOWS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/apps/editor/windows/*.cpp)
     add_executable(aiverse_editor apps/editor/main.cpp apps/editor/Editor.cpp apps/editor/EditorShell.cpp apps/editor/EditorAgent.cpp apps/editor/EditorPlayOps.cpp apps/editor/EditorTheme.cpp apps/editor/EditorProjects.cpp apps/editor/EditorNativeBuild.cpp apps/editor/EditorGameWizard.cpp apps/editor/EditorMcpConnect.cpp apps/editor/EditorWorld.cpp apps/editor/DetailsPanel.cpp
                    ${AIVERSE_EDITOR_WINDOWS} $<TARGET_OBJECTS:aiverse_runtime>)
+    set(type_blocks_file "${CMAKE_CURRENT_SOURCE_DIR}/apps/editor/core/type-blocks.json")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${type_blocks_file}")
+    file(READ "${type_blocks_file}" type_blocks_json)
+    file(CONFIGURE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/generated/aiverse_type_blocks.h"
+        CONTENT [=[constexpr char kTypeBlockTemplatesJson[] = R"aiverse(@type_blocks_json@)aiverse";]=] @ONLY)
+    target_include_directories(aiverse_editor PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
     target_link_libraries(aiverse_editor PRIVATE aiverse_runtime aiverse_game_view aiverse_editor_core)
     target_link_libraries(aiverse_editor PRIVATE aiverse_game_fx AIVERSE::InputFlow)
     target_compile_definitions(aiverse_editor PRIVATE AIVERSE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
@@ -1841,6 +1898,9 @@ if(AIVERSE_BUILD_TOOLS)
     if(TARGET aiverse_editor)
         add_dependencies(aiverse_editor aiversebuild)
     endif()
+endif()
+
+if(AIVERSE_BUILD_TOOLS OR AIVERSE_BUILD_STUDIO_HTML5)
     # MCP server for AI agents: drives the running editor live, or edits project files directly.
     add_executable(aiversemcp tools/mcp/main.cpp)
     target_link_libraries(aiversemcp PRIVATE aiverse_editor_core)
@@ -1886,13 +1946,62 @@ if(AIVERSE_BUILD_TOOLS)
     target_link_libraries(aiversebuild PRIVATE aiverse_modelconv)
 endif()
 
+# Native Windows offscreen targets for engine integration and render probes.
+if(WIN32)
+    add_library(aiverse_gfx_direct3d STATIC engine/gfx/d3d/Direct3D.cpp engine/gfx/d3d/GfxDirect3D.cpp)
+    target_include_directories(aiverse_gfx_direct3d PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(aiverse_gfx_direct3d PRIVATE d3d11 d3d9 user32 d3dcompiler)
+    if(AIVERSE_BUILD_TESTS)
+        add_executable(aiverse_direct3d_device_tests tests/render/direct3d_device.cpp)
+        target_link_libraries(aiverse_direct3d_device_tests PRIVATE aiverse_gfx_direct3d d3dcompiler)
+        add_test(NAME render_direct3d11_warp COMMAND aiverse_direct3d_device_tests 11)
+        add_test(NAME render_direct3d9_hal COMMAND aiverse_direct3d_device_tests 9)
+        add_executable(aiverse_direct3d_rhi_tests tests/render/direct3d_rhi.cpp)
+        target_link_libraries(aiverse_direct3d_rhi_tests PRIVATE aiverse_gfx_direct3d)
+        add_test(NAME render_direct3d11_rhi COMMAND aiverse_direct3d_rhi_tests 11)
+        add_test(NAME render_direct3d9_rhi COMMAND aiverse_direct3d_rhi_tests 9)
+        add_test(NAME render_direct3d11_window COMMAND aiverse_direct3d_rhi_tests 11 --window)
+        add_test(NAME render_direct3d9_window COMMAND aiverse_direct3d_rhi_tests 9 --window)
+        set_tests_properties(render_direct3d9_hal render_direct3d9_rhi render_direct3d9_window render_direct3d11_window PROPERTIES LABELS "GPU")
+    endif()
+endif()
+
+# Self-contained headless software device. Native consumers opt in explicitly.
+add_library(aiverse_gfx_cpu STATIC engine/gfx/cpu/GfxCpu.cpp)
+target_include_directories(aiverse_gfx_cpu PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+if((AIVERSE_BUILD_TOOLS OR AIVERSE_BUILD_RENDER_SDK) AND AIVERSE_DESKTOP)
+    add_library(aiverse_headless_model_frame STATIC engine/render/HeadlessModelFrame.cpp)
+    target_link_libraries(aiverse_headless_model_frame PUBLIC aiverse_models PRIVATE aiverse_gfx_cpu aiverse_zstd_dec)
+    if(WIN32)
+        target_link_libraries(aiverse_headless_model_frame PRIVATE aiverse_gfx_direct3d)
+    endif()
+endif()
+if(AIVERSE_BUILD_TOOLS AND AIVERSE_DESKTOP)
+    add_executable(aiverse_cpu_capture apps/modelview/cpu_capture.cpp)
+    add_library(aiverse_headless_model_capture STATIC apps/modelview/HeadlessModelCapture.cpp)
+    target_link_libraries(aiverse_headless_model_capture PRIVATE aiverse_headless_model_frame)
+    target_link_libraries(aiverse_cpu_capture PRIVATE aiverse_headless_model_capture)
+endif()
+if(AIVERSE_BUILD_RENDER_SDK)
+    add_subdirectory(sdk/render)
+endif()
+if(AIVERSE_BUILD_TESTS AND NOT EMSCRIPTEN)
+    add_executable(aiverse_cpu_device_tests tests/render/cpu_device.cpp)
+    target_link_libraries(aiverse_cpu_device_tests PRIVATE aiverse_gfx_cpu)
+    add_test(NAME render_cpu_device COMMAND aiverse_cpu_device_tests)
+    if(TARGET aiverse_cpu_capture AND Python3_Interpreter_FOUND AND AIVERSE_OBJ)
+        add_test(NAME render_cpu_textured_model
+                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/render/headless_model_capture.py $<TARGET_FILE:aiverse_cpu_capture>)
+    endif()
+endif()
+
 # Model viewer (models agent): models, materials, clips and quality tiers as the game renders them.
 if(AIVERSE_BUILD_TOOLS AND AIVERSE_DESKTOP)
     add_executable(aiverse_modelview
         apps/modelview/main.cpp apps/modelview/Gallery.cpp
         apps/modelview/NativeScenePreview.cpp
         $<TARGET_OBJECTS:aiverse_runtime>)
-    target_link_libraries(aiverse_modelview PRIVATE aiverse_runtime aiverse_game_view AIVERSE::View AIVERSE::libraries)
+    target_link_libraries(aiverse_modelview PRIVATE aiverse_headless_model_capture aiverse_runtime aiverse_game_view AIVERSE::View AIVERSE::libraries)
 endif()
 
 # Catalog preview (docs/packages.md § Web viewer): materials / models of catalog packages through
@@ -1907,7 +2016,7 @@ if(AIVERSE_BUILD_CATALOGVIEW AND (AIVERSE_DESKTOP OR EMSCRIPTEN))
         target_link_options(aiverse_catalogview PRIVATE
             "--shell-file=${CMAKE_CURRENT_SOURCE_DIR}/apps/catalogview/shell.html"
             "-sFORCE_FILESYSTEM=1"
-            "-sEXPORTED_FUNCTIONS=['_main','_cv_select','_cv_shape','_cv_lod','_cv_wire','_cv_clusters','_cv_zoom']"
+            "-sEXPORTED_FUNCTIONS=['_main','_cv_select','_cv_shape','_cv_lod','_cv_wire','_cv_clusters','_cv_zoom','_cv_bsp_layers']"
             "-sEXPORTED_RUNTIME_METHODS=['FS','ccall','UTF8ToString']")
         set_property(TARGET aiverse_catalogview APPEND PROPERTY LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/apps/catalogview/shell.html")
     endif()
@@ -2058,7 +2167,9 @@ if(AIVERSE_BUILD_TESTS)
     add_test(NAME camera_hdr_resolve COMMAND aiverse_camera_hdr_resolve_tests)
     add_executable(aiverse_camera_client_adapter_tests tests/render/camera_client_adapter.cpp)
     target_include_directories(aiverse_camera_client_adapter_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-    target_link_libraries(aiverse_camera_client_adapter_tests PRIVATE aiverse_runtime aiverse_content_reader)
+    # Native host registration injects gen/NativeRegistry.cpp into runtime-linked
+    # executables; the NativeRegistrar implementation belongs to aiverse_game.
+    target_link_libraries(aiverse_camera_client_adapter_tests PRIVATE aiverse_runtime aiverse_game aiverse_content_reader)
     add_test(NAME camera_client_adapter COMMAND aiverse_camera_client_adapter_tests)
     add_executable(aiverse_camera_model_snapshot_tests tests/render/camera_model_snapshot.cpp)
     aiverse_keep_test_asserts(aiverse_camera_model_snapshot_tests)
@@ -2134,6 +2245,9 @@ foreach(t ${AIVERSE_GAME_CLIENT_TARGETS})
     if(TARGET ${t})
         target_sources(${t} PRIVATE apps/client/ClientUi.cpp apps/client/ClientActions.cpp apps/client/ClientScript.cpp apps/client/ClientScriptCmd.cpp apps/client/ClientScriptUi.cpp apps/client/Minimap.cpp apps/client/Lobby.cpp apps/client/ClientPlanet.cpp apps/client/MinimapPlanet.cpp)
         target_link_libraries(${t} PRIVATE aiverse_ui aiverse_net)
+        if(NOT EMSCRIPTEN)
+            target_link_libraries(${t} PRIVATE aiverse_net_server)
+        endif()
         if(AIVERSE_CLIENT_WITH_FX)
             target_sources(${t} PRIVATE apps/client/ClientFx.cpp)
             target_link_libraries(${t} PRIVATE aiverse_game_fx)
@@ -2192,6 +2306,7 @@ endif()
 if(TARGET aiverse_editor_core) # lighting agent: light_* / lighting_set operations
     target_sources(aiverse_editor_core PRIVATE apps/editor/core/LightOps.cpp apps/editor/core/PhysisOps.cpp)
     target_sources(aiverse_editor_core PRIVATE apps/editor/core/PlanetOps.cpp apps/editor/core/PlanetDetailOps.cpp)   # planet-render agent: planet sculpt / paint
+    target_include_directories(aiverse_editor_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/libraries/include) # shared planetary forest document validator
 endif()
 if(TARGET aiverse_tests) # lighting agent: GPU-free lighting logic under test
     target_sources(aiverse_tests PRIVATE engine/view/game/GameLightsData.cpp engine/render/QualityGovernor.cpp)
@@ -2234,7 +2349,7 @@ if(AIVERSE_BUILD_TESTS)
     endif()
 endif()
 if(TARGET aiverse_editor_core)
-    target_sources(aiverse_editor_core PRIVATE apps/editor/core/FxOps.cpp apps/editor/core/FxTemplates.cpp)
+    target_sources(aiverse_editor_core PRIVATE apps/editor/core/FxOps.cpp apps/editor/core/FxTemplates.cpp apps/editor/core/SpectraGpuFileOps.cpp)
     target_link_libraries(aiverse_editor_core PUBLIC aiverse_game_fx)
 endif()
 if(TARGET aiverse_editor)
@@ -2276,7 +2391,7 @@ if(TARGET aiverse_client AND AIVERSE_PLATFORM STREQUAL "ios" AND AIVERSE_GEN_DIR
     set_property(TARGET aiverse_client APPEND PROPERTY RESOURCE "${AIVERSE_GEN_DIR}/LaunchScreen.storyboard")
     set(AIVERSE_IOS_LAUNCH_STORYBOARD "<key>UILaunchStoryboardName</key><string>LaunchScreen</string>")
 endif()
-if(AIVERSE_BUILD_TOOLS OR AIVERSE_BUILD_TESTS)
+if(AIVERSE_BUILD_TOOLS OR AIVERSE_BUILD_TESTS OR TARGET aiverse_editor_core)
     add_library(aiverse_branding STATIC tools/branding/BrandImage.cpp tools/branding/Icons.cpp tools/branding/Splash.cpp)
     target_include_directories(aiverse_branding PRIVATE third_party/stb_image_write)
     target_link_libraries(aiverse_branding PUBLIC aiverse_splash)
@@ -2312,8 +2427,8 @@ endif()
 # Material library and procedural textures (models agent): material_* / texture_* editor operations
 # (materials.json, rules view "materials" / "assign"); the Materials window previews them.
 if(TARGET aiverse_editor_core)
-    target_sources(aiverse_editor_core PRIVATE apps/editor/core/AnimationOps.cpp apps/editor/core/AnimationDocument.cpp apps/editor/core/MaterialOps.cpp apps/editor/core/ShaderGraphOps.cpp apps/editor/core/GeometryOps.cpp)
-    target_link_libraries(aiverse_editor_core PUBLIC aiverse_models)
+    target_sources(aiverse_editor_core PRIVATE apps/editor/core/AnimationOps.cpp apps/editor/core/AnimationDocument.cpp apps/editor/core/MaterialOps.cpp apps/editor/core/ShaderGraphOps.cpp apps/editor/core/GeometryOps.cpp tools/aiversebuild/TextureCompress.cpp)
+    target_link_libraries(aiverse_editor_core PUBLIC aiverse_models aiverse_pack)
 endif()
 if(TARGET aiversemcp)   # KTX2 zstd in aiverse_models: aiversemcp links no pack writer, so it takes the decoder
     target_link_libraries(aiversemcp PRIVATE aiverse_models aiverse_zstd_dec)
@@ -2485,6 +2600,12 @@ endif()
 
 # builds-branch tooling: index.json, and a packaged aiversemcp run from an unpacked tools-only Linux zip
 if(AIVERSE_BUILD_TESTS AND Python3_Interpreter_FOUND)
+    if(TARGET aiversemcp)
+        add_test(NAME selection_targeting_mcp COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/editor/selection_targeting_mcp.py
+            $<TARGET_FILE:aiversemcp> ${CMAKE_CURRENT_SOURCE_DIR})
+        add_test(NAME terraweave_meadow_mcp COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/terraweave_meadow_mcp.py $<TARGET_FILE:aiversemcp> ${CMAKE_CURRENT_SOURCE_DIR})
+    endif()
     if(TARGET aiversemcp AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
         add_test(NAME release_tools COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/release/test_release.py $<TARGET_FILE:aiversemcp>)
     else()
@@ -2540,15 +2661,24 @@ set(AIVERSE_CLIENT_CORE_SOURCES apps/client/ClientLoading.cpp apps/client/GameCl
 foreach(t ${AIVERSE_GAME_CLIENT_TARGETS})
     if(TARGET ${t})
         target_link_libraries(${t} PRIVATE aiverse_content_reader)   # streamed world: worker-thread project reader
+        # GameClient uses Caverns payload types even with optional physics disabled.
+        target_include_directories(${t} PRIVATE "${PROJECT_SOURCE_DIR}/third_party/box3d/include")
         target_sources(${t} PRIVATE apps/client/GameClient.cpp)
         target_sources(${t} PRIVATE apps/client/ClientBaked.cpp)   # agent-lightbake
     endif()
 endforeach()
 # Editor: play the project as in the game client, hosted in the Game window or in AiverseGame (apps/editor/EditorClientPlay.cpp)
-if(TARGET aiverse_editor OR AIVERSE_BUILD_STUDIO_HTML5)
+set(_aiverse_test_hosted_view OFF)
+if(AIVERSE_BUILD_TESTS AND (AIVERSE_PLATFORM STREQUAL "linux" OR AIVERSE_PLATFORM STREQUAL "macos"))
+    set(_aiverse_test_hosted_view ON)
+endif()
+if(TARGET aiverse_editor OR AIVERSE_BUILD_STUDIO_HTML5 OR _aiverse_test_hosted_view)
     # Shared game runtime host; editor shells own controls and native surfaces.
     # Existing in-game overlay rendering remains inside GameClient, not Studio UI.
     add_library(aiverse_hosted_client STATIC apps/client/HostedClient.cpp ${AIVERSE_CLIENT_CORE_SOURCES})
+    if(NOT EMSCRIPTEN)
+        target_link_libraries(aiverse_hosted_client PRIVATE aiverse_net_server)
+    endif()
     target_include_directories(aiverse_hosted_client PUBLIC "${PROJECT_SOURCE_DIR}")
     target_link_libraries(aiverse_hosted_client PUBLIC aiverse_runtime aiverse_game_view
         aiverse_net_city aiverse_splash aiverse_net aiverse_game_audio aiverse_atlas
@@ -2558,12 +2688,20 @@ if(TARGET aiverse_editor)
     target_sources(aiverse_editor PRIVATE apps/editor/EditorClientPlay.cpp)
     target_link_libraries(aiverse_editor PRIVATE aiverse_hosted_client)
 endif()
-if(AIVERSE_BUILD_TESTS AND (AIVERSE_PLATFORM STREQUAL "linux" OR AIVERSE_PLATFORM STREQUAL "macos"))
+if(_aiverse_test_hosted_view)
     add_executable(aiverse_hosted_view_tests tests/hosted_view.cpp $<TARGET_OBJECTS:aiverse_runtime>)
     target_link_libraries(aiverse_hosted_view_tests PRIVATE aiverse_runtime)
     if(TARGET aiverse_hosted_client)
         target_link_libraries(aiverse_hosted_view_tests PRIVATE aiverse_hosted_client)
         target_compile_definitions(aiverse_hosted_view_tests PRIVATE AIVERSE_TEST_HOSTED_CLIENT=1)
+    endif()
+    if(AIVERSE_PLATFORM STREQUAL "macos" AND TARGET aiverse_hosted_client)
+        add_executable(aiverse_client_controls_frame tests/render/client_controls_frame.cpp)
+        target_link_libraries(aiverse_client_controls_frame PRIVATE aiverse_client_runtime aiverse_hosted_client)
+        add_test(NAME client_controls_frame COMMAND aiverse_client_controls_frame
+            "${PROJECT_SOURCE_DIR}/demos/client-command-controls" "${PROJECT_SOURCE_DIR}/engine/assets")
+        set_tests_properties(client_controls_frame PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE
+            ENVIRONMENT "AIVERSE_BACKGROUND=1;AIVERSE_AUDIO=off;AIVERSE_SHADOWS=off")
     endif()
     add_test(NAME aiverse_hosted_view_tests COMMAND aiverse_hosted_view_tests)
 endif()
@@ -2573,6 +2711,9 @@ if(AIVERSE_BUILD_TESTS)
     add_executable(aiverse_library_tests tests/libraries/tests.cpp)
     target_link_libraries(aiverse_library_tests PRIVATE AIVERSE::libraries)
     add_test(NAME aiverse_library_tests COMMAND aiverse_library_tests)
+    add_executable(aiverse_library_noise_tests tests/libraries/noise_tests.cpp)
+    target_link_libraries(aiverse_library_noise_tests PRIVATE AIVERSE::lib_noise)
+    add_test(NAME library_noise COMMAND aiverse_library_noise_tests)
 endif()
 
 # Meta-game policies: CPU-only tests, usable independently of a game or GPU.
@@ -2644,6 +2785,15 @@ endif()
 
 # FPS is an independent GameModule; RTS lockstep remains available unchanged.
 add_subdirectory(engine/actor)
+
+# Live ECS region attachment and authority-crossing fixture, without game assets.
+if(AIVERSE_BUILD_TESTS AND TARGET aiverse_engine AND TARGET aiverse_world)
+    add_executable(aiverse_region_ecs_bridge_test tests/world/region_ecs_bridge_test.cpp)
+    target_link_libraries(aiverse_region_ecs_bridge_test PRIVATE aiverse_engine aiverse_world)
+    add_test(NAME region_ecs_bridge_test COMMAND aiverse_region_ecs_bridge_test)
+    set_tests_properties(region_ecs_bridge_test PROPERTIES LABELS "World;ECS")
+endif()
+
 
 # Host-only offline TerraWeave atlas baker: not linked into any game module.
 # Uses the same optional WorldScene Horizon manifest and pure C++20 bake API.
@@ -2840,6 +2990,49 @@ if(AIVERSE_BUILD_TESTS AND NOT EMSCRIPTEN)
     add_executable(aiverse_ecs_native_persistence_test tests/ecs_native_persistence_test.cpp)
     target_link_libraries(aiverse_ecs_native_persistence_test PRIVATE aiverse_engine)
     add_test(NAME ecs_native_persistence_test COMMAND aiverse_ecs_native_persistence_test)
+    # Optional ECHO zone/portal hearing: persistent ECS and dual-native-host regression.
+    add_executable(aiverse_ecs_echo_acoustics_test tests/ecs_echo_acoustics_test.cpp)
+    target_link_libraries(aiverse_ecs_echo_acoustics_test PRIVATE aiverse_engine AIVERSE::libraries)
+    add_test(NAME ecs_echo_acoustics_test COMMAND aiverse_ecs_echo_acoustics_test)
+    # FRACTURE structural support uses shared ECS authority; no genre-host dependency.
+    add_executable(aiverse_ecs_fracture_structure_test tests/ecs_fracture_structure_test.cpp)
+    target_link_libraries(aiverse_ecs_fracture_structure_test PRIVATE aiverse_engine AIVERSE::libraries)
+    add_test(NAME ecs_fracture_structure_test COMMAND aiverse_ecs_fracture_structure_test)
+    # AETHER persistent ECS gas species / PHYSIS bridge acceptance.
+    add_executable(aiverse_ecs_aether_gas_test tests/ecs_aether_gas_test.cpp)
+    target_link_libraries(aiverse_ecs_aether_gas_test PRIVATE aiverse_engine AIVERSE::libraries)
+    add_test(NAME ecs_aether_gas_test COMMAND aiverse_ecs_aether_gas_test)
+    if(AIVERSE_ENABLE_PHYSICS)
+        add_executable(aiverse_evolve_forest_demo examples/world/world_processes_native/EvolveForestDemo.cpp)
+        target_link_libraries(aiverse_evolve_forest_demo PRIVATE aiverse_engine AIVERSE::libraries AIVERSE::physics)
+    endif()
+    add_executable(aiverse_world_processes_inspector_test tests/world_processes_inspector_test.cpp)
+    target_link_libraries(aiverse_world_processes_inspector_test PRIVATE aiverse_engine AIVERSE::libraries)
+    add_test(NAME world_processes_inspector_test COMMAND aiverse_world_processes_inspector_test)
+    add_executable(aiverse_world_processes_authoring_test tests/world_processes_authoring_test.cpp)
+    target_link_libraries(aiverse_world_processes_authoring_test PRIVATE aiverse_engine AIVERSE::libraries)
+    add_test(NAME world_processes_authoring_test COMMAND aiverse_world_processes_authoring_test)
+    add_executable(aiverse_world_processes_map_hydration_test tests/world_processes_map_hydration_test.cpp)
+    target_link_libraries(aiverse_world_processes_map_hydration_test PRIVATE aiverse_engine AIVERSE::libraries)
+    add_test(NAME world_processes_map_hydration_test COMMAND aiverse_world_processes_map_hydration_test)
+    add_executable(aiverse_world_processes_linked_test tests/world_processes_linked_test.cpp)
+    target_link_libraries(aiverse_world_processes_linked_test PRIVATE aiverse_engine AIVERSE::libraries)
+    add_test(NAME world_processes_linked_test COMMAND aiverse_world_processes_linked_test)
+    # Optional real native game host, using the same fixture as the existing native RTS tests.
+    add_executable(aiverse_world_processes_gamecore_native_test tests/world_processes_gamecore_native_test.cpp)
+    target_link_libraries(aiverse_world_processes_gamecore_native_test PRIVATE aiverse_game AIVERSE::libraries)
+    if(TARGET AIVERSE::physics)
+        target_link_libraries(aiverse_world_processes_gamecore_native_test PRIVATE AIVERSE::physics)
+        target_compile_definitions(aiverse_world_processes_gamecore_native_test PRIVATE AIVERSE_PLANET_FOREST_PHYSICS_HOST=1)
+    endif()
+    target_compile_definitions(aiverse_world_processes_gamecore_native_test PRIVATE AIVERSE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME world_processes_gamecore_native_test COMMAND aiverse_world_processes_gamecore_native_test)
+    add_executable(aiverse_terraweave_caverns_planet_authority_test
+        tests/terraweave_caverns_planet_authority_test.cpp)
+    target_link_libraries(aiverse_terraweave_caverns_planet_authority_test PRIVATE aiverse_game aiverse_world)
+    add_test(NAME terraweave_caverns_planet_authority
+        COMMAND aiverse_terraweave_caverns_planet_authority_test)
+    set_tests_properties(terraweave_caverns_planet_authority PROPERTIES LABELS "TerraWeave;Caverns;ECS;CPU")
     add_executable(aiverse_ecs_cross_genre_timed_mechanics_test
         tests/ecs_cross_genre_timed_mechanics_test.cpp)
     target_link_libraries(aiverse_ecs_cross_genre_timed_mechanics_test PRIVATE
@@ -2954,6 +3147,67 @@ if(AIVERSE_BUILD_TESTS)
     target_link_libraries(aiverse_library_building_tests PRIVATE AIVERSE::lib_building_gen)
     add_test(NAME library_building_gen COMMAND aiverse_library_building_tests)
 endif()
+# Universal functional building properties (doors, large/small gates, retractable roof)
+# do not depend on any genre module, Studio, GPU or legacy factory/barracks preset.
+if(AIVERSE_BUILD_TESTS)
+    add_executable(aiverse_library_building_feature_tests tests/libraries/building_feature_tests.cpp)
+    target_link_libraries(aiverse_library_building_feature_tests PRIVATE AIVERSE::lib_building_style)
+    add_test(NAME library_building_features COMMAND aiverse_library_building_feature_tests ${PROJECT_SOURCE_DIR})
+    add_executable(aiverse_building_surface_pattern_tests tests/libraries/building_surface_pattern_tests.cpp)
+    target_link_libraries(aiverse_building_surface_pattern_tests PRIVATE AIVERSE::lib_building_style)
+    add_test(NAME library_building_surface_patterns COMMAND aiverse_building_surface_pattern_tests)
+endif()
+# Pure StructureGraph: functional layout without engine, renderer, material
+# catalog or Studio dependencies; standalone C++20 compilation contract.
+if(AIVERSE_BUILD_TESTS)
+    add_executable(aiverse_building_structure_graph_tests tests/libraries/building_structure_graph_tests.cpp)
+    target_compile_features(aiverse_building_structure_graph_tests PRIVATE cxx_std_20)
+    target_include_directories(aiverse_building_structure_graph_tests PRIVATE ${PROJECT_SOURCE_DIR})
+    add_test(NAME library_building_structure_graph COMMAND aiverse_building_structure_graph_tests)
+endif()
+# Genre-neutral native integration executable: actual Simulation, world
+# collision, native navigation and admitted generic Replica loopback.
+if((AIVERSE_BUILD_TOOLS OR AIVERSE_BUILD_TESTS) AND NOT EMSCRIPTEN AND
+   NOT ANDROID AND NOT IOS AND TARGET aiverse_world AND TARGET aiverse_net_replica)
+    add_executable(aiverse_building_world_example examples/world/runtime-building/main.cpp)
+    target_link_libraries(aiverse_building_world_example PRIVATE
+        AIVERSE::lib_building_style aiverse_engine aiverse_world
+        aiverse_models aiverse_zstd_dec aiverse_net_replica)
+    if(AIVERSE_BUILD_TESTS)
+        add_test(NAME building_native_world_replica
+            COMMAND aiverse_building_world_example ${PROJECT_SOURCE_DIR})
+        set_tests_properties(building_native_world_replica PROPERTIES LABELS "ECS;NETWORK")
+        add_test(NAME building_native_world_lockstep
+            COMMAND aiverse_building_world_example ${PROJECT_SOURCE_DIR} --lockstep)
+        set_tests_properties(building_native_world_lockstep PROPERTIES LABELS "ECS;NETWORK;PERSISTENCE")
+    endif()
+    if(TARGET aiverse_physics)
+        target_link_libraries(aiverse_building_world_example PRIVATE AIVERSE::physics)
+        target_compile_definitions(aiverse_building_world_example PRIVATE AIVERSE_BUILDING_PHYSIS_EXAMPLE=1)
+        if(AIVERSE_BUILD_TESTS)
+            add_test(NAME building_native_world_physis
+                COMMAND aiverse_building_world_example ${PROJECT_SOURCE_DIR} --physis)
+            set_tests_properties(building_native_world_physis PROPERTIES LABELS "PHYSIS")
+        endif()
+    endif()
+endif()
+# building-style (settings of generated buildings as style files) and its .glb exporter.
+if(AIVERSE_BUILD_TESTS)
+    add_executable(aiverse_library_building_style_tests tests/libraries/building_style_tests.cpp)
+    target_link_libraries(aiverse_library_building_style_tests PRIVATE AIVERSE::lib_building_style)
+    add_test(NAME library_building_style COMMAND aiverse_library_building_style_tests ${PROJECT_SOURCE_DIR})
+endif()
+# Runtime generation uses the SAME header-only CPU library in packaged games.
+# This targeted test has no Studio, renderer, modelviewer or filesystem runtime dependency.
+if(AIVERSE_BUILD_TESTS)
+    add_executable(aiverse_library_building_runtime_tests tests/libraries/building_runtime_tests.cpp)
+    target_link_libraries(aiverse_library_building_runtime_tests PRIVATE AIVERSE::lib_building_style)
+    add_test(NAME library_building_runtime COMMAND aiverse_library_building_runtime_tests ${PROJECT_SOURCE_DIR})
+endif()
+if((AIVERSE_BUILD_TOOLS OR AIVERSE_BUILD_TESTS) AND NOT EMSCRIPTEN AND NOT ANDROID AND NOT IOS)
+    add_executable(aiverse_building_export tools/buildings/building_style_export.cpp)
+    target_link_libraries(aiverse_building_export PRIVATE AIVERSE::lib_building_style)
+endif()
 # gear-tiers (protective gear slots, absorption, wear, capacity).
 if(AIVERSE_BUILD_TESTS)
     add_executable(aiverse_library_gear_tests tests/libraries/gear_tests.cpp)
@@ -3056,6 +3310,9 @@ if(AIVERSE_BUILD_TESTS)
     add_test(NAME prisma_volume COMMAND aiverse_prisma_volume_tests)
     # 2026-11-22 effects (AO, SSR, lens flare, SMAA, distortion, streaks, halation, haze,
     # FSR 1, DLSS route, histogram metering, stylization graphs): GPU-free contract test.
+    add_executable(aiverse_prisma_compositor_tests tests/render/prisma_compositor.cpp)
+    target_link_libraries(aiverse_prisma_compositor_tests PRIVATE aiverse_postfx_data)
+    add_test(NAME prisma_compositor COMMAND aiverse_prisma_compositor_tests)
     add_executable(aiverse_prisma_new_effects_tests tests/render/prisma_new_effects.cpp)
     target_link_libraries(aiverse_prisma_new_effects_tests PRIVATE aiverse_postfx_data)
     add_test(NAME prisma_new_effects COMMAND aiverse_prisma_new_effects_tests)
@@ -3140,9 +3397,9 @@ endif()
 
 # Host authoring: shared by the editor, MCP and CPU tests.
 if(AIVERSE_DESKTOP AND (TARGET aiverse_editor_core OR AIVERSE_BUILD_TESTS))
-    add_library(aiverse_modeling STATIC tools/modeling/Cable.cpp tools/modeling/Geometry.cpp tools/modeling/Boolean.cpp tools/modeling/Advanced.cpp
+    add_library(aiverse_modeling STATIC tools/modeling/VolumeCsg.cpp tools/modeling/Cable.cpp tools/modeling/Geometry.cpp tools/modeling/Boolean.cpp tools/modeling/Advanced.cpp
         tools/modeling/Document.cpp tools/modeling/Export.cpp tools/modeling/Clips.cpp tools/modeling/Recipes.cpp)
-    target_link_libraries(aiverse_modeling PUBLIC aiverse_models AIVERSE::cables)
+    target_link_libraries(aiverse_modeling PUBLIC aiverse_models AIVERSE::cables PRIVATE AIVERSE::lib_noise)
     target_include_directories(aiverse_modeling PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 endif()
 
@@ -3160,6 +3417,9 @@ endif()
 if(TARGET aiverse_editor_core AND AIVERSE_BUILD_TOOLS)
     add_executable(aiverse_modeling_cli tools/modeling/main.cpp)
     set_target_properties(aiverse_modeling_cli PROPERTIES OUTPUT_NAME aiverse_modeling)
+    if(AIVERSE_BUILD_TESTS AND Python3_Interpreter_FOUND)
+        add_test(NAME modeling_volume_csg COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/modeling/volume_csg.py $<TARGET_FILE:aiverse_modeling_cli>)
+    endif()
     target_link_libraries(aiverse_modeling_cli PRIVATE aiverse_editor_core aiverse_modeling aiverse_models aiverse_zstd_dec)
 endif()
 if(TARGET aiverse_modeling AND NOT MSVC)
@@ -3169,6 +3429,11 @@ endif()
 # Optional standalone physics example; normal RTS/FPS clients do not create a physics world.
 if(AIVERSE_ENABLE_PHYSICS)
     option(AIVERSE_BUILD_PHYSICS_DEMO "Build the interactive Box3D sandbox" ${AIVERSE_DESKTOP})
+    option(AIVERSE_BUILD_CAVERNS_PLANET_DEMO "Build the optional native planetary Caverns chamber" OFF)
+    option(AIVERSE_CAVERNS_PLANET_DEMO_SMOKE "Register graphical Caverns scenario tests (requires display)" OFF)
+    if(AIVERSE_CAVERNS_PLANET_DEMO_SMOKE AND (NOT AIVERSE_BUILD_CAVERNS_PLANET_DEMO OR NOT AIVERSE_DESKTOP OR NOT AIVERSE_BUILD_TESTS))
+        message(FATAL_ERROR "Caverns demo smoke requires desktop demo and tests")
+    endif()
     if(AIVERSE_BUILD_TESTS)
         add_executable(aiverse_physics_tests tests/physics/tests.cpp)
         target_link_libraries(aiverse_physics_tests PRIVATE AIVERSE::physics)
@@ -3179,6 +3444,38 @@ if(AIVERSE_ENABLE_PHYSICS)
             target_compile_options(aiverse_physics_scene_tests PRIVATE -Wall -Wextra)
         endif()
         add_test(NAME physics_scene COMMAND aiverse_physics_scene_tests ${PROJECT_SOURCE_DIR}/examples/physics/scene.json)
+        add_executable(aiverse_world_processes_planet_host_test tests/world_processes_planet_host_test.cpp)
+        target_link_libraries(aiverse_world_processes_planet_host_test PRIVATE aiverse_game aiverse_world aiverse_models aiverse_zstd_dec AIVERSE::libraries AIVERSE::physics)
+        add_test(NAME world_processes_planet_host_test COMMAND aiverse_world_processes_planet_host_test)
+        set_tests_properties(world_processes_planet_host_test PROPERTIES LABELS "PHYSICS;WorldProcesses")
+        add_executable(aiverse_planet_forest_visual_test tests/planet_forest_visual_test.cpp)
+        target_link_libraries(aiverse_planet_forest_visual_test PRIVATE aiverse_game_view aiverse_zstd_dec AIVERSE::libraries)
+        add_test(NAME planet_forest_visual COMMAND aiverse_planet_forest_visual_test)
+        set_tests_properties(planet_forest_visual PROPERTIES LABELS "WorldProcesses;TerraWeave")
+        add_executable(aiverse_terraweave_caverns_planet_collision_test
+            tests/terraweave_caverns_planet_collision_test.cpp)
+        target_link_libraries(aiverse_terraweave_caverns_planet_collision_test PRIVATE
+            aiverse_game_view aiverse_models aiverse_world AIVERSE::physics)
+        add_test(NAME terraweave_caverns_planet_collision
+            COMMAND aiverse_terraweave_caverns_planet_collision_test)
+        set_tests_properties(terraweave_caverns_planet_collision PROPERTIES
+            LABELS "TerraWeave;Caverns;PHYSICS")
+    endif()
+    if(AIVERSE_BUILD_CAVERNS_PLANET_DEMO AND AIVERSE_DESKTOP)
+        add_executable(aiverse_caverns_planet_demo examples/world/terraweave_native/PlanetCavernsDemo.cpp $<TARGET_OBJECTS:aiverse_runtime>)
+        target_link_libraries(aiverse_caverns_planet_demo PRIVATE aiverse_runtime aiverse_game_view aiverse_models aiverse_world AIVERSE::physics)
+        if(AIVERSE_CAVERNS_PLANET_DEMO_SMOKE)
+            find_package(Python3 COMPONENTS Interpreter REQUIRED)
+            foreach(scenario IN ITEMS chamber portal swim moving_restore portal_restore swim_restore)
+                add_test(NAME terraweave_caverns_demo_${scenario}
+                    COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/tests/caverns/native_demo_smoke.py"
+                        "$<TARGET_FILE:aiverse_caverns_planet_demo>" "${scenario}"
+                        "${CMAKE_BINARY_DIR}/caverns-demo-reports")
+                set_tests_properties(terraweave_caverns_demo_${scenario} PROPERTIES
+                    LABELS "TerraWeave;Caverns;PHYSICS;Renderer3D;NativeDemo"
+                    TIMEOUT 900 RESOURCE_LOCK caverns_native_display)
+            endforeach()
+        endif()
     endif()
     if(AIVERSE_BUILD_PHYSICS_DEMO AND AIVERSE_DESKTOP)
         add_executable(aiverse_physics_demo examples/physics/main.cpp $<TARGET_OBJECTS:aiverse_runtime>)
@@ -3726,9 +4023,16 @@ if(AIVERSE_BUILD_HDR_TESTS AND AIVERSE_DESKTOP)
     target_link_libraries(aiverse_shadow_batches PRIVATE aiverse_runtime)
 endif()
 
-if(AIVERSE_BUILD_HDR_TESTS AND AIVERSE_DESKTOP)
+# CPU material palette regression is part of ordinary desktop CTest.
+# The visual A/B mode remains a separate manual GPU check.
+if(AIVERSE_DESKTOP AND (AIVERSE_BUILD_HDR_TESTS OR AIVERSE_BUILD_TESTS))
     add_executable(aiverse_material_batches tests/render/material_batches.cpp $<TARGET_OBJECTS:aiverse_runtime>)
-    target_link_libraries(aiverse_material_batches PRIVATE aiverse_runtime)
+    # NativeRegistry.cpp is injected for runtime executables; link its existing owner.
+    target_link_libraries(aiverse_material_batches PRIVATE aiverse_runtime aiverse_game)
+    if(AIVERSE_BUILD_TESTS)
+        add_test(NAME material_batches_unit COMMAND aiverse_material_batches --unit)
+        set_tests_properties(material_batches_unit PROPERTIES LABELS "Renderer3D;TEXTURE_GRAPH" TIMEOUT 60)
+    endif()
 endif()
 
 # Split rules files from Python tools: rules_io (read / write back) and split_rules.
@@ -4231,6 +4535,23 @@ if(AIVERSE_BUILD_TESTS AND AIVERSE_PLATFORM STREQUAL "macos")
         SKIP_RETURN_CODE 77)
 endif()
 
+# Production GPU-owned allocator acceptance (Stages 110–115).
+if(AIVERSE_BUILD_TESTS AND AIVERSE_PLATFORM STREQUAL "macos")
+    add_executable(aiverse_spectrafx_metal_allocator_test
+        tests/spectrafx_metal_allocator.mm $<TARGET_OBJECTS:aiverse_runtime>)
+    target_include_directories(aiverse_spectrafx_metal_allocator_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_options(aiverse_spectrafx_metal_allocator_test PRIVATE "-fobjc-arc")
+    target_link_libraries(aiverse_spectrafx_metal_allocator_test PRIVATE
+        aiverse_runtime aiverse_fx aiverse_render2d)
+    add_test(NAME spectrafx_metal_allocator COMMAND aiverse_spectrafx_metal_allocator_test)
+    add_test(NAME spectrafx_metal_volumetric_scene
+        COMMAND aiverse_spectrafx_metal_allocator_test --volumetric-scene)
+    set_tests_properties(spectrafx_metal_allocator PROPERTIES
+        LABELS "SpectraFX;MetalGPU;RHI" SKIP_RETURN_CODE 77 TIMEOUT 300)
+    set_tests_properties(spectrafx_metal_volumetric_scene PROPERTIES
+        LABELS "SpectraFX;MetalGPU;Volumetrics" SKIP_RETURN_CODE 77 TIMEOUT 300)
+endif()
+
 # Data-driven entity effects shared by every host (table + presenter).
 if(AIVERSE_BUILD_TESTS AND AIVERSE_DESKTOP)
     add_executable(aiverse_spectrafx_entity_effects_tests
@@ -4317,6 +4638,30 @@ if(AIVERSE_BUILD_TESTS)
     add_test(NAME lens_sprite_gpu_faults COMMAND aiverse_lens_sprite_gpu_faults)
     set_tests_properties(lens_sprite_gpu_faults PROPERTIES LABELS "LENS;RHI")
     if(AIVERSE_PLATFORM STREQUAL "macos")
+        add_executable(aiverse_material_technique_frame tests/render/material_technique_frame.cpp)
+        add_executable(aiverse_additive_blend_frame tests/render/additive_blend_frame.cpp)
+        target_link_libraries(aiverse_additive_blend_frame PRIVATE aiverse_client_runtime aiverse_fx)
+        add_test(NAME additive_blend_frame COMMAND aiverse_additive_blend_frame)
+        set_tests_properties(additive_blend_frame PROPERTIES LABELS "Material;SpectraFX;GPU;Metal" TIMEOUT 90 RUN_SERIAL TRUE ENVIRONMENT "AIVERSE_BACKGROUND=1")
+        target_include_directories(aiverse_material_technique_frame PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        target_link_libraries(aiverse_material_technique_frame PRIVATE aiverse_client_runtime)
+        add_test(NAME material_technique_frame COMMAND aiverse_material_technique_frame ${CMAKE_CURRENT_SOURCE_DIR}/demos/material-techniques)
+        set_tests_properties(material_technique_frame PROPERTIES LABELS "Material;GPU;Metal" SKIP_RETURN_CODE 77 TIMEOUT 90)
+        if(TARGET aiverse_modeling)
+            add_executable(aiverse_model_triplanar_frame tests/render/model_triplanar_frame.cpp)
+            target_link_libraries(aiverse_model_triplanar_frame PRIVATE aiverse_client_runtime aiverse_modeling)
+            add_test(NAME model_triplanar_frame COMMAND aiverse_model_triplanar_frame)
+            set_tests_properties(model_triplanar_frame PROPERTIES LABELS "Material;GPU;Metal" SKIP_RETURN_CODE 77 TIMEOUT 90)
+        endif()
+        add_executable(aiverse_prisma_compositor_metal tests/render/prisma_compositor_metal.cpp)
+        target_link_libraries(aiverse_prisma_compositor_metal PRIVATE aiverse_runtime aiverse_content_reader)
+        add_test(NAME prisma_compositor_metal COMMAND aiverse_prisma_compositor_metal)
+        set_tests_properties(prisma_compositor_metal PROPERTIES LABELS "PRISMA;GPU;Metal" SKIP_RETURN_CODE 77 TIMEOUT 90)
+        add_executable(aiverse_bsp_metal_frame tests/render/quake3_bsp_frame.cpp)
+        target_include_directories(aiverse_bsp_metal_frame PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        target_link_libraries(aiverse_bsp_metal_frame PRIVATE aiverse_runtime aiverse_content_reader)
+        add_test(NAME quake3_bsp_frame COMMAND aiverse_bsp_metal_frame)
+        set_tests_properties(quake3_bsp_frame PROPERTIES LABELS "BSP;GPU;Metal" SKIP_RETURN_CODE 77 TIMEOUT 120)
         add_executable(aiverse_lens_metal_frame tests/render/lens_metal_frame.cpp)
         target_include_directories(aiverse_lens_metal_frame PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
         target_link_libraries(aiverse_lens_metal_frame PRIVATE aiverse_runtime aiverse_game_view aiverse_content_reader)
@@ -4334,7 +4679,7 @@ endif()
 if(AIVERSE_BUILD_TESTS AND TARGET aiverse_editor_core)
     add_executable(aiverse_vfx_ops_tests tests/vfx_graph_ops_test.cpp)
     target_include_directories(aiverse_vfx_ops_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-    target_link_libraries(aiverse_vfx_ops_tests PRIVATE aiverse_editor_core aiverse_fx)
+    target_link_libraries(aiverse_vfx_ops_tests PRIVATE aiverse_editor_core aiverse_fx aiverse_zstd_dec)
     add_test(NAME vfx_graph_ops COMMAND aiverse_vfx_ops_tests)
     set_tests_properties(vfx_graph_ops PROPERTIES LABELS "SpectraFX")
 endif()
@@ -4361,6 +4706,13 @@ if(AIVERSE_BUILD_TESTS)
     target_link_libraries(aiverse_vfx_gpu_tests PRIVATE aiverse_fx)
     add_test(NAME vfx_gpu_backend COMMAND aiverse_vfx_gpu_tests)
     set_tests_properties(vfx_gpu_backend PROPERTIES LABELS "SpectraFX")
+    if(TARGET aiverse_gfx_vulkan)
+        add_executable(aiverse_spectrafx_vulkan_allocator_test tests/spectrafx_vulkan_allocator.cpp)
+        target_include_directories(aiverse_spectrafx_vulkan_allocator_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        target_link_libraries(aiverse_spectrafx_vulkan_allocator_test PRIVATE aiverse_fx aiverse_gfx_vulkan)
+        add_test(NAME spectrafx_vulkan_allocator COMMAND aiverse_spectrafx_vulkan_allocator_test)
+        set_tests_properties(spectrafx_vulkan_allocator PROPERTIES LABELS "SpectraFX;VulkanGPU;RHI" SKIP_RETURN_CODE 77 TIMEOUT 300)
+    endif()
 endif()
 
 # PHYSIS authoritative environment simulation is independent of all genre modules.
@@ -4765,7 +5117,7 @@ if(AIVERSE_BUILD_TESTS AND NOT EMSCRIPTEN)
         target_compile_definitions(aiverse_terraweave_native_micro_physics_compile_test
             PRIVATE AIVERSE_TERRAWEAVE_SMOKE_WITH_PHYSICS=1)
         target_link_libraries(aiverse_terraweave_native_micro_physics_compile_test
-            PRIVATE aiverse_models aiverse_world aiverse_zstd_dec AIVERSE::physics)
+            PRIVATE aiverse_client_runtime aiverse_models aiverse_world aiverse_zstd_dec AIVERSE::physics)
         target_compile_options(aiverse_terraweave_native_micro_physics_compile_test
             PRIVATE $<$<CXX_COMPILER_ID:AppleClang,Clang,GNU>:-UNDEBUG>)
         add_test(NAME terraweave_native_micro_physics_compile
@@ -4796,6 +5148,10 @@ if(AIVERSE_BUILD_TESTS AND NOT EMSCRIPTEN)
     target_link_libraries(aiverse_terraweave_model_test PRIVATE aiverse_models aiverse_zstd_dec)
     aiverse_keep_test_asserts(aiverse_terraweave_model_test)
     add_test(NAME terraweave_model COMMAND aiverse_terraweave_model_test)
+    add_executable(aiverse_terraweave_grass_meadow_test tests/terraweave_grass_meadow_test.cpp)
+    target_link_libraries(aiverse_terraweave_grass_meadow_test PRIVATE aiverse_engine aiverse_models aiverse_zstd_dec)
+    aiverse_keep_test_asserts(aiverse_terraweave_grass_meadow_test)
+    add_test(NAME terraweave_grass_meadow COMMAND aiverse_terraweave_grass_meadow_test)
     add_executable(aiverse_terraweave_heightmap_test tests/terraweave_heightmap_test.cpp)
     target_link_libraries(aiverse_terraweave_heightmap_test PRIVATE aiverse_engine)
     aiverse_keep_test_asserts(aiverse_terraweave_heightmap_test)
@@ -4913,10 +5269,36 @@ if(TARGET aiverse_editor_core)
 endif()
 
 if(AIVERSE_BUILD_TESTS AND TARGET aiversemcp AND Python3_EXECUTABLE)
+    add_test(NAME studio_animation_preview COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/animation/preview_session.py
+        $<TARGET_FILE:aiversemcp> ${CMAKE_CURRENT_SOURCE_DIR})
+    set_tests_properties(studio_animation_preview PROPERTIES TIMEOUT 60 LABELS "EDITOR")
     add_test(NAME lens_mcp_stdio COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/lens_mcp_test.py
         $<TARGET_FILE:aiversemcp> ${CMAKE_CURRENT_SOURCE_DIR})
     set_tests_properties(lens_mcp_stdio PROPERTIES TIMEOUT 60)
+    add_test(NAME native_simulation_checks_mcp COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/native_simulation_checks_mcp.py
+        $<TARGET_FILE:aiversemcp> ${CMAKE_CURRENT_SOURCE_DIR})
+    set_tests_properties(native_simulation_checks_mcp PROPERTIES LABELS "MCP" TIMEOUT 120)
+    add_test(NAME order_upgrade_mcp COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/order_upgrade_mcp.py
+        $<TARGET_FILE:aiversemcp> ${CMAKE_CURRENT_SOURCE_DIR})
+    set_tests_properties(order_upgrade_mcp PROPERTIES LABELS "MCP" TIMEOUT 60)
+    add_test(NAME simulation_budget_mcp COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/simulation_budget_mcp_test.py
+        $<TARGET_FILE:aiversemcp> ${CMAKE_CURRENT_SOURCE_DIR})
+    set_tests_properties(simulation_budget_mcp PROPERTIES LABELS "MCP;World" TIMEOUT 60)
+    if(UNIX AND NOT CMAKE_CROSSCOMPILING)
+        add_test(NAME planet_forest_mcp_stdio COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/editor/planet_forest_mcp.py
+            --binary $<TARGET_FILE:aiversemcp> --engine ${CMAKE_CURRENT_SOURCE_DIR})
+        set_tests_properties(planet_forest_mcp_stdio PROPERTIES TIMEOUT 180 LABELS "MCP;WorldProcesses")
+    endif()
+    add_test(NAME world_persistence_mcp_stdio COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/world/world_persistence_mcp_test.py
+        $<TARGET_FILE:aiversemcp> ${CMAKE_CURRENT_SOURCE_DIR})
+    set_tests_properties(world_persistence_mcp_stdio PROPERTIES LABELS "World;PERSISTENCE;MCP" TIMEOUT 120)
 endif()
 
 if(AIVERSE_BUILD_TESTS AND TARGET aiverse_editor_core AND AIVERSE_BUILD_STRATA)
@@ -5169,13 +5551,45 @@ if(AIVERSE_BUILD_TESTS AND TARGET aiverse_renderbench)
 endif()
 
 # ---------------------------------------------------------------------------
-# Experimental HTML5 Studio host. Production editor still uses its existing UI.
+# Desktop HTML5 Studio host.
 # ---------------------------------------------------------------------------
 if(AIVERSE_BUILD_STUDIO_HTML5)
-    if((APPLE OR WIN32) AND TARGET aiverse_editor_core)
+    if((APPLE AND NOT IOS) OR WIN32 OR AIVERSE_PLATFORM STREQUAL "linux")
         add_subdirectory(apps/studio-native)
     else()
-        message(WARNING "AIVERSE Studio HTML5 requires macOS or Windows and aiverse_editor_core (AIVERSE_BUILD_TOOLS or AIVERSE_BUILD_EDITOR)")
+        message(WARNING "AIVERSE Studio HTML5 requires macOS, Windows or Linux")
+    endif()
+endif()
+
+# Verification scripts build the editor shipped for the configured target platform.
+if(TARGET aiverse_studio)
+    add_custom_target(aiverse_desktop_editor DEPENDS aiverse_studio)
+endif()
+
+if(AIVERSE_BUILD_TESTS AND AIVERSE_PLATFORM STREQUAL "linux" AND EXISTS "${AIVERSE_STUDIO_WEB_DIST}/index.html")
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(STUDIO_WEBKITGTK QUIET IMPORTED_TARGET webkit2gtk-4.1>=2.40)
+    endif()
+    if(TARGET PkgConfig::STUDIO_WEBKITGTK)
+        add_executable(aiverse_studio_linux_web_assets_tests apps/studio-native/tests/StudioLinuxWebAssets.cpp)
+        target_include_directories(aiverse_studio_linux_web_assets_tests PRIVATE "${PROJECT_SOURCE_DIR}")
+        target_link_libraries(aiverse_studio_linux_web_assets_tests PRIVATE PkgConfig::STUDIO_WEBKITGTK)
+        add_test(NAME studio_linux_web_assets COMMAND aiverse_studio_linux_web_assets_tests "${AIVERSE_STUDIO_WEB_DIST}")
+        set_tests_properties(studio_linux_web_assets PROPERTIES LABELS "EDITOR;HTML" SKIP_RETURN_CODE 77 TIMEOUT 45)
+    endif()
+endif()
+
+# Exercise Studio's private renderer even on Linux builds without a desktop shell.
+if(AIVERSE_BUILD_TESTS AND TARGET aiverse_gfx_vulkan AND AIVERSE_PLATFORM MATCHES "^(linux|windows|macos)$")
+    add_executable(aiverse_studio_vulkan_panel_tests apps/studio-native/tests/StudioBuildingPreviewTests.cpp)
+    target_compile_definitions(aiverse_studio_vulkan_panel_tests PRIVATE AIVERSE_TEST_PANEL_VULKAN=1)
+    target_include_directories(aiverse_studio_vulkan_panel_tests PRIVATE "${PROJECT_SOURCE_DIR}")
+    target_link_libraries(aiverse_studio_vulkan_panel_tests PRIVATE aiverse_runtime aiverse_gfx_vulkan AIVERSE::libraries)
+    add_test(NAME studio_vulkan_panel COMMAND aiverse_studio_vulkan_panel_tests "${PROJECT_SOURCE_DIR}")
+    set_tests_properties(studio_vulkan_panel PROPERTIES LABELS "EDITOR;GPU;Vulkan" SKIP_RETURN_CODE 77 TIMEOUT 120)
+    if(TARGET aiverse_studio_verification)
+        add_dependencies(aiverse_studio_verification aiverse_studio_vulkan_panel_tests)
     endif()
 endif()
 
@@ -5243,6 +5657,133 @@ if(AIVERSE_BUILD_TESTS)
     endif()
 endif()
 
+# Dynamic open-world ownership ledger: ECS v10 persistence, rollback, deterministic transfer.
+# This is an independent correctness test; no external game project required.
+if(AIVERSE_BUILD_TESTS AND TARGET aiverse_engine)
+    add_executable(aiverse_region_entity_ledger_test tests/world/region_entity_ledger_test.cpp)
+    target_link_libraries(aiverse_region_entity_ledger_test PRIVATE aiverse_engine aiverse_pack)
+    add_test(NAME region_entity_ledger_test COMMAND aiverse_region_entity_ledger_test)
+    set_tests_properties(region_entity_ledger_test PROPERTIES LABELS "World;ECS")
+endif()
+
+# Bounded shared simulation profiling, deterministic clock fixture.
+if(AIVERSE_BUILD_TESTS AND TARGET aiverse_engine)
+    add_executable(aiverse_simulation_profile_test tests/simulation_profile_test.cpp)
+    target_link_libraries(aiverse_simulation_profile_test PRIVATE aiverse_engine)
+    add_test(NAME simulation_profile_test COMMAND aiverse_simulation_profile_test)
+    set_tests_properties(simulation_profile_test PROPERTIES LABELS "ECS;EDITOR")
+endif()
+
+# W1.3: opted-in region cold-store roundtrip of real ECS component pools.
+# This fixture has no external game/genre dependency.
+if(AIVERSE_BUILD_TESTS AND TARGET aiverse_engine)
+    add_executable(aiverse_region_cold_store_test tests/world/region_cold_store_test.cpp)
+    target_link_libraries(aiverse_region_cold_store_test PRIVATE aiverse_engine)
+    add_test(NAME region_cold_store_test COMMAND aiverse_region_cold_store_test)
+    set_tests_properties(region_cold_store_test PROPERTIES LABELS "World;ECS")
+endif()
+
+# S4: paused runtime vital adapter, independent native fixture.
+if(AIVERSE_BUILD_TESTS AND NOT EMSCRIPTEN AND TARGET aiverse_game)
+    add_executable(aiverse_runtime_vitals_test tests/runtime_vitals_test.cpp)
+    target_link_libraries(aiverse_runtime_vitals_test PRIVATE aiverse_game)
+    add_test(NAME runtime_vitals_test COMMAND aiverse_runtime_vitals_test)
+    set_tests_properties(runtime_vitals_test PROPERTIES LABELS "ECS;EDITOR")
+endif()
+
+# W1.4: real GameCore/NativeModule command -> shared region authority runtime.
+# Game map content comes from the normal external template package, not this repo.
+if(AIVERSE_BUILD_TESTS AND NOT EMSCRIPTEN AND TARGET aiverse_game)
+    add_executable(aiverse_region_gamecore_integration_test
+        tests/world/region_gamecore_integration_test.cpp)
+    target_link_libraries(aiverse_region_gamecore_integration_test PRIVATE aiverse_game)
+    target_compile_definitions(aiverse_region_gamecore_integration_test PRIVATE
+        AIVERSE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME region_gamecore_integration_test
+        COMMAND aiverse_region_gamecore_integration_test)
+    set_tests_properties(region_gamecore_integration_test PROPERTIES LABELS "World;ECS")
+endif()
+
+# W1.5: real GameCore world-space admission waits for published collision and
+# rebuilds derived bot navigation before the first authoritative simulation tick.
+if(AIVERSE_BUILD_TESTS AND NOT EMSCRIPTEN AND TARGET aiverse_authority)
+    add_executable(aiverse_actor_navigation_stream_gate_test
+        tests/world/actor_navigation_stream_gate_test.cpp)
+    target_link_libraries(aiverse_actor_navigation_stream_gate_test PRIVATE aiverse_authority)
+    add_test(NAME actor_navigation_stream_gate_test
+        COMMAND aiverse_actor_navigation_stream_gate_test)
+    set_tests_properties(actor_navigation_stream_gate_test PROPERTIES LABELS "World;ECS;NETWORK")
+endif()
+
+# W1.6: shared VehicleDrive/VehicleOccupant region grouping and actual
+# world-space ActorHost seat-slot adapter, no external game dependency.
+if(AIVERSE_BUILD_TESTS AND NOT EMSCRIPTEN AND TARGET aiverse_engine)
+    add_executable(aiverse_vehicle_region_group_test
+        tests/world/vehicle_region_group_test.cpp)
+    target_link_libraries(aiverse_vehicle_region_group_test PRIVATE aiverse_engine)
+    add_test(NAME vehicle_region_group_test COMMAND aiverse_vehicle_region_group_test)
+    set_tests_properties(vehicle_region_group_test PROPERTIES LABELS "World;ECS;Vehicles")
+endif()
+if(AIVERSE_BUILD_TESTS AND NOT EMSCRIPTEN AND TARGET aiverse_game AND TARGET aiverse_fps)
+    add_executable(aiverse_actor_vehicle_region_group_test
+        tests/world/actor_vehicle_region_group_test.cpp)
+    target_link_libraries(aiverse_actor_vehicle_region_group_test PRIVATE aiverse_game aiverse_fps)
+    add_test(NAME actor_vehicle_region_group_test COMMAND aiverse_actor_vehicle_region_group_test)
+    set_tests_properties(actor_vehicle_region_group_test PROPERTIES LABELS "World;ECS;Vehicles")
+endif()
+
+# W1.7: actual world-space ActorHost positions (CharacterBody, Vehicle)
+# share the generic W1 ledger without adding duplicate Transform components.
+if(AIVERSE_BUILD_TESTS AND NOT EMSCRIPTEN AND TARGET aiverse_game AND TARGET aiverse_fps)
+    add_executable(aiverse_actor_region_position_test
+        tests/world/actor_region_position_test.cpp)
+    target_link_libraries(aiverse_actor_region_position_test PRIVATE aiverse_game aiverse_fps)
+    add_test(NAME actor_region_position_test COMMAND aiverse_actor_region_position_test)
+    set_tests_properties(actor_region_position_test PROPERTIES LABELS "World;ECS;Vehicles")
+endif()
+
+# W1.8: post-tick world-space actor region ownership, occupied car group
+# migration and dynamic loot tombstones. No external game content.
+if(AIVERSE_BUILD_TESTS AND NOT EMSCRIPTEN AND TARGET aiverse_game AND TARGET aiverse_fps)
+    add_executable(aiverse_actor_region_lifecycle_test
+        tests/world/actor_region_lifecycle_test.cpp)
+    target_link_libraries(aiverse_actor_region_lifecycle_test PRIVATE aiverse_game aiverse_fps)
+    add_test(NAME actor_region_lifecycle_test COMMAND aiverse_actor_region_lifecycle_test)
+    set_tests_properties(actor_region_lifecycle_test PROPERTIES LABELS "World;ECS;Vehicles")
+endif()
+
+# W1.9: staged movement admission. Real ActorHost/CollisionStream must refuse
+# a tick until all requested destination collision is resident.
+if(AIVERSE_BUILD_TESTS AND NOT EMSCRIPTEN AND TARGET aiverse_authority)
+    add_executable(aiverse_actor_region_admission_test
+        tests/world/actor_region_admission_test.cpp)
+    target_link_libraries(aiverse_actor_region_admission_test PRIVATE aiverse_authority)
+    add_test(NAME actor_region_admission_test
+        COMMAND aiverse_actor_region_admission_test)
+    set_tests_properties(actor_region_admission_test PROPERTIES LABELS "World;ECS;NETWORK")
+endif()
+
+# W1.11: shared VehicleRace race-grid and checkpoint respawn targets,
+# consumed by the existing ActorHost pre-tick streamed collision gate.
+if(AIVERSE_BUILD_TESTS AND TARGET aiverse_vehicles)
+    add_executable(aiverse_race_region_respawn_gate_test
+        tests/world/race_region_respawn_gate_test.cpp)
+    target_link_libraries(aiverse_race_region_respawn_gate_test PRIVATE aiverse_vehicles)
+    add_test(NAME race_region_respawn_gate_test
+        COMMAND aiverse_race_region_respawn_gate_test)
+    set_tests_properties(race_region_respawn_gate_test PROPERTIES LABELS "World;Vehicles")
+endif()
+
+# W1.15: opt-in deterministic ECS lifecycle dirtiness and rollback-safe
+# coalescing. Gameplay actors still retain legacy correctness scans.
+if(AIVERSE_BUILD_TESTS AND NOT EMSCRIPTEN AND TARGET aiverse_engine)
+    add_executable(aiverse_region_dirty_queue_test
+        tests/world/region_dirty_queue_test.cpp)
+    target_link_libraries(aiverse_region_dirty_queue_test PRIVATE aiverse_engine)
+    add_test(NAME region_dirty_queue_test COMMAND aiverse_region_dirty_queue_test)
+    set_tests_properties(region_dirty_queue_test PROPERTIES LABELS "World;ECS")
+endif()
+
 # Warcraft III source importer: no game data or StormLib is required for these
 # synthetic format/parser/map-writer acceptance cases. Native integration is a
 # separate acceptance gate when a licensed Warcraft III map is available.
@@ -5255,4 +5796,172 @@ if(AIVERSE_BUILD_TESTS)
                 -p "test_warcraft3*.py" -v)
         set_tests_properties(warcraft3_importer_python PROPERTIES LABELS "TOOLS;IMPORT")
     endif()
+endif()
+
+if(AIVERSE_BUILD_TESTS AND NOT EMSCRIPTEN)
+    add_executable(aiverse_texture_graph_pipeline_cache_tests tests/render/texture_graph_pipeline_cache.cpp)
+    target_include_directories(aiverse_texture_graph_pipeline_cache_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_features(aiverse_texture_graph_pipeline_cache_tests PRIVATE cxx_std_20)
+    add_test(NAME texture_graph_pipeline_cache COMMAND aiverse_texture_graph_pipeline_cache_tests)
+    add_executable(aiverse_texture_graph_shared_scratch_tests tests/render/texture_graph_shared_scratch.cpp)
+    target_include_directories(aiverse_texture_graph_shared_scratch_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_features(aiverse_texture_graph_shared_scratch_tests PRIVATE cxx_std_20)
+    add_test(NAME texture_graph_shared_scratch COMMAND aiverse_texture_graph_shared_scratch_tests)
+endif()
+
+if(AIVERSE_BUILD_TESTS AND NOT EMSCRIPTEN)
+    add_executable(aiverse_texture_graph_liveness_tests tests/render/texture_graph_liveness.cpp)
+    target_include_directories(aiverse_texture_graph_liveness_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_features(aiverse_texture_graph_liveness_tests PRIVATE cxx_std_20)
+    add_test(NAME texture_graph_liveness COMMAND aiverse_texture_graph_liveness_tests)
+endif()
+
+if(AIVERSE_BUILD_TESTS AND NOT EMSCRIPTEN)
+    add_executable(aiverse_texture_graph_pass_schedule_tests tests/render/texture_graph_pass_schedule.cpp)
+    target_include_directories(aiverse_texture_graph_pass_schedule_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_features(aiverse_texture_graph_pass_schedule_tests PRIVATE cxx_std_20)
+    add_test(NAME texture_graph_pass_schedule COMMAND aiverse_texture_graph_pass_schedule_tests)
+endif()
+
+if(AIVERSE_BUILD_TESTS AND NOT EMSCRIPTEN)
+    add_executable(aiverse_texture_graph_dag_lowering_tests tests/render/texture_graph_dag_lowering.cpp)
+    target_include_directories(aiverse_texture_graph_dag_lowering_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_features(aiverse_texture_graph_dag_lowering_tests PRIVATE cxx_std_20)
+    add_test(NAME texture_graph_dag_lowering COMMAND aiverse_texture_graph_dag_lowering_tests)
+    add_executable(aiverse_texture_graph_output_reuse_tests tests/render/texture_graph_output_reuse.cpp)
+    target_include_directories(aiverse_texture_graph_output_reuse_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_features(aiverse_texture_graph_output_reuse_tests PRIVATE cxx_std_20)
+    add_test(NAME texture_graph_output_reuse COMMAND aiverse_texture_graph_output_reuse_tests)
+    add_executable(aiverse_texture_graph_image_pins_tests tests/render/texture_graph_image_pins.cpp)
+    target_include_directories(aiverse_texture_graph_image_pins_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_features(aiverse_texture_graph_image_pins_tests PRIVATE cxx_std_20)
+    add_test(NAME texture_graph_image_pins COMMAND aiverse_texture_graph_image_pins_tests)
+    add_executable(aiverse_texture_graph_group_profile_tests tests/render/texture_graph_group_profile.cpp)
+    target_include_directories(aiverse_texture_graph_group_profile_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_features(aiverse_texture_graph_group_profile_tests PRIVATE cxx_std_20)
+    add_test(NAME texture_graph_group_profile COMMAND aiverse_texture_graph_group_profile_tests)
+    add_executable(aiverse_vulkan_scope_timing_tests tests/render/vulkan_scope_timing.cpp)
+    target_include_directories(aiverse_vulkan_scope_timing_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_features(aiverse_vulkan_scope_timing_tests PRIVATE cxx_std_20)
+    add_test(NAME vulkan_scope_timing COMMAND aiverse_vulkan_scope_timing_tests)
+    add_executable(aiverse_texture_graph_request_queue_tests tests/render/texture_graph_request_queue.cpp)
+    target_include_directories(aiverse_texture_graph_request_queue_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_features(aiverse_texture_graph_request_queue_tests PRIVATE cxx_std_20)
+    add_test(NAME texture_graph_request_queue COMMAND aiverse_texture_graph_request_queue_tests)
+endif()
+
+if(AIVERSE_BUILD_TESTS AND NOT EMSCRIPTEN)
+    add_executable(aiverse_texture_graph_kernel_source_tests tests/render/texture_graph_kernel_source.cpp)
+    target_include_directories(aiverse_texture_graph_kernel_source_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_features(aiverse_texture_graph_kernel_source_tests PRIVATE cxx_std_20)
+    add_test(NAME texture_graph_kernel_source COMMAND aiverse_texture_graph_kernel_source_tests)
+endif()
+
+if(AIVERSE_BUILD_TESTS AND NOT EMSCRIPTEN)
+    add_executable(aiverse_texture_graph_materialized_dispatch_tests tests/render/texture_graph_materialized_dispatch.cpp)
+    target_include_directories(aiverse_texture_graph_materialized_dispatch_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_features(aiverse_texture_graph_materialized_dispatch_tests PRIVATE cxx_std_20)
+    add_test(NAME texture_graph_materialized_dispatch COMMAND aiverse_texture_graph_materialized_dispatch_tests)
+endif()
+
+if(AIVERSE_BUILD_TESTS AND NOT EMSCRIPTEN)
+    add_executable(aiverse_texture_graph_gpu_resource_cache_tests tests/render/texture_graph_gpu_resource_cache.cpp)
+    target_include_directories(aiverse_texture_graph_gpu_resource_cache_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_features(aiverse_texture_graph_gpu_resource_cache_tests PRIVATE cxx_std_20)
+    add_test(NAME texture_graph_gpu_resource_cache COMMAND aiverse_texture_graph_gpu_resource_cache_tests)
+    set_tests_properties(texture_graph_gpu_resource_cache PROPERTIES LABELS "TEXTURE_GRAPH;RHI")
+endif()
+
+if(AIVERSE_BUILD_TESTS AND NOT EMSCRIPTEN)
+    add_executable(aiverse_texture_graph_fusion_tests tests/render/texture_graph_fusion.cpp)
+    target_include_directories(aiverse_texture_graph_fusion_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_features(aiverse_texture_graph_fusion_tests PRIVATE cxx_std_20)
+    add_test(NAME texture_graph_fusion COMMAND aiverse_texture_graph_fusion_tests)
+    set_tests_properties(texture_graph_fusion PROPERTIES LABELS "TEXTURE_GRAPH;RHI")
+endif()
+
+if(AIVERSE_BUILD_TESTS AND NOT EMSCRIPTEN)
+    add_executable(aiverse_texture_graph_gpu_texture_transfer_tests tests/render/texture_graph_gpu_texture_transfer.cpp)
+    target_include_directories(aiverse_texture_graph_gpu_texture_transfer_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_features(aiverse_texture_graph_gpu_texture_transfer_tests PRIVATE cxx_std_20)
+    add_test(NAME texture_graph_gpu_texture_transfer COMMAND aiverse_texture_graph_gpu_texture_transfer_tests)
+    set_tests_properties(texture_graph_gpu_texture_transfer PROPERTIES LABELS "TEXTURE_GRAPH;RHI")
+endif()
+
+option(AIVERSE_TEXTURE_GRAPH_GPU_COPY_TESTS "Opt-in real GPU-only storage buffer to texture acceptance" OFF)
+if(AIVERSE_BUILD_TESTS AND AIVERSE_TEXTURE_GRAPH_GPU_COPY_TESTS)
+    if(TARGET aiverse_gfx_vulkan)
+        add_executable(aiverse_texture_graph_gpu_copy_vulkan_test tests/render/texture_graph_gpu_copy_vulkan.cpp)
+        target_link_libraries(aiverse_texture_graph_gpu_copy_vulkan_test PRIVATE aiverse_gfx_vulkan Threads::Threads)
+        target_compile_features(aiverse_texture_graph_gpu_copy_vulkan_test PRIVATE cxx_std_20)
+        add_test(NAME texture_graph_gpu_copy_vulkan COMMAND aiverse_texture_graph_gpu_copy_vulkan_test)
+        set_tests_properties(texture_graph_gpu_copy_vulkan PROPERTIES LABELS "TEXTURE_GRAPH;GPU;Vulkan" TIMEOUT 120 RUN_SERIAL TRUE)
+    endif()
+    if(AIVERSE_PLATFORM STREQUAL "macos")
+        add_executable(aiverse_texture_graph_gpu_copy_metal_test tests/render/texture_graph_gpu_copy_metal.mm engine/gfx/metal/GfxMetal.mm)
+        target_include_directories(aiverse_texture_graph_gpu_copy_metal_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        target_compile_options(aiverse_texture_graph_gpu_copy_metal_test PRIVATE "-fobjc-arc")
+        target_compile_features(aiverse_texture_graph_gpu_copy_metal_test PRIVATE cxx_std_20)
+        target_link_libraries(aiverse_texture_graph_gpu_copy_metal_test PRIVATE Threads::Threads "-framework Metal" "-framework QuartzCore" "-framework Foundation")
+        add_test(NAME texture_graph_gpu_copy_metal COMMAND aiverse_texture_graph_gpu_copy_metal_test)
+        set_tests_properties(texture_graph_gpu_copy_metal PROPERTIES LABELS "TEXTURE_GRAPH;GPU;Metal" TIMEOUT 120 RUN_SERIAL TRUE)
+    endif()
+    if(NOT TARGET aiverse_texture_graph_gpu_copy_vulkan_test AND NOT TARGET aiverse_texture_graph_gpu_copy_metal_test)
+        message(FATAL_ERROR "GPU texture copy acceptance requested but neither Metal nor Vulkan was configured")
+    endif()
+endif()
+
+if(AIVERSE_BUILD_TESTS AND NOT EMSCRIPTEN)
+    add_executable(aiverse_texture_graph_gpu_texture_budget_tests tests/render/texture_graph_gpu_texture_budget.cpp)
+    target_include_directories(aiverse_texture_graph_gpu_texture_budget_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_features(aiverse_texture_graph_gpu_texture_budget_tests PRIVATE cxx_std_20)
+    add_test(NAME texture_graph_gpu_texture_budget COMMAND aiverse_texture_graph_gpu_texture_budget_tests)
+    set_tests_properties(texture_graph_gpu_texture_budget PROPERTIES LABELS "TEXTURE_GRAPH;RHI")
+endif()
+
+if(AIVERSE_BUILD_TESTS AND NOT EMSCRIPTEN)
+    add_executable(aiverse_live_appearance_material_target_tests tests/view/live_appearance_material_target.cpp)
+    target_include_directories(aiverse_live_appearance_material_target_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_features(aiverse_live_appearance_material_target_tests PRIVATE cxx_std_20)
+    add_test(NAME view_live_appearance_material_target COMMAND aiverse_live_appearance_material_target_tests)
+endif()
+
+# Opt-in hardware/driver acceptance of the production native texture graph owner.
+# A requested backend without a device is a failure, never a green skip.
+# Public native graph API, header-only; the host supplies its graphics device.
+add_library(aiverse_texture_graph_gpu INTERFACE)
+add_library(AIVERSE::texture_graph_gpu ALIAS aiverse_texture_graph_gpu)
+target_include_directories(aiverse_texture_graph_gpu INTERFACE "${PROJECT_SOURCE_DIR}")
+target_compile_features(aiverse_texture_graph_gpu INTERFACE cxx_std_20)
+target_link_libraries(aiverse_texture_graph_gpu INTERFACE aiverse_models AIVERSE::View aiverse_zstd_dec)
+
+option(AIVERSE_TEXTURE_GRAPH_GPU_TESTS "Opt-in native texture graph GPU acceptance" OFF)
+if(AIVERSE_BUILD_TESTS AND AIVERSE_TEXTURE_GRAPH_GPU_TESTS)
+    if(TARGET aiverse_gfx_vulkan)
+        add_executable(aiverse_texture_graph_vulkan_gpu_test tests/render/texture_graph_gpu_acceptance_vulkan.cpp)
+        target_link_libraries(aiverse_texture_graph_vulkan_gpu_test PRIVATE AIVERSE::texture_graph_gpu aiverse_gfx_vulkan Threads::Threads)
+        target_compile_features(aiverse_texture_graph_vulkan_gpu_test PRIVATE cxx_std_20)
+        add_test(NAME texture_graph_vulkan_gpu COMMAND aiverse_texture_graph_vulkan_gpu_test)
+        set_tests_properties(texture_graph_vulkan_gpu PROPERTIES LABELS "TEXTURE_GRAPH;GPU;Vulkan" TIMEOUT 240 RUN_SERIAL TRUE)
+        add_test(NAME texture_graph_vulkan_offscreen COMMAND aiverse_texture_graph_vulkan_gpu_test --offscreen)
+        set_tests_properties(texture_graph_vulkan_offscreen PROPERTIES LABELS "TEXTURE_GRAPH;GPU;Vulkan;EDITOR" TIMEOUT 240 RUN_SERIAL TRUE)
+    endif()
+    if(AIVERSE_PLATFORM STREQUAL "macos")
+        add_executable(aiverse_texture_graph_metal_gpu_test tests/render/texture_graph_gpu_acceptance_metal.mm engine/gfx/metal/GfxMetal.mm)
+        target_compile_options(aiverse_texture_graph_metal_gpu_test PRIVATE "-fobjc-arc")
+        target_compile_features(aiverse_texture_graph_metal_gpu_test PRIVATE cxx_std_20)
+        target_link_libraries(aiverse_texture_graph_metal_gpu_test PRIVATE AIVERSE::texture_graph_gpu Threads::Threads "-framework Metal" "-framework QuartzCore" "-framework Foundation")
+        add_test(NAME texture_graph_metal_gpu COMMAND aiverse_texture_graph_metal_gpu_test)
+        set_tests_properties(texture_graph_metal_gpu PROPERTIES LABELS "TEXTURE_GRAPH;GPU;Metal" TIMEOUT 240 RUN_SERIAL TRUE)
+        add_test(NAME texture_graph_metal_offscreen COMMAND aiverse_texture_graph_metal_gpu_test --offscreen)
+        set_tests_properties(texture_graph_metal_offscreen PROPERTIES LABELS "TEXTURE_GRAPH;GPU;Metal;EDITOR" TIMEOUT 240 RUN_SERIAL TRUE ENVIRONMENT "AIVERSE_TEXTURE_GRAPH_REQUIRE_GPU_TIMINGS=1")
+    endif()
+    if(NOT TARGET aiverse_texture_graph_vulkan_gpu_test AND NOT TARGET aiverse_texture_graph_metal_gpu_test)
+        message(FATAL_ERROR "Texture graph GPU acceptance requested but no Metal or Vulkan backend was configured")
+    endif()
+endif()
+
+# Stage55: full native Caverns fixtures use the same CTest entry point.
+if(AIVERSE_BUILD_TESTS AND AIVERSE_DESKTOP AND NOT EMSCRIPTEN)
+    include(tests/caverns/IntegrationTests.cmake)
 endif()

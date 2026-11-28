@@ -1,4 +1,6 @@
 #include "PrismaOps.h"
+#include "engine/render/PrismaCompositor.h"
+#include "engine/render/PrismaVolumeData.h"
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
@@ -251,6 +253,8 @@ void registerPrismaOps(Workspace& ws) {
         "with cost per device class (ms per frame, passes, fps at 60) and warnings.",
         "{}", [w](const Json&) {
             Json r = okJson();
+            r.set("gameVolumes", Json::string(w->project.manifest["prismaVolumes"].dump()));
+            r.set("mapVolumes", Json::string(w->map.data.extra["prismaVolumes"].dump()));
             r.set("game", w->project.manifest["postfx"]);
             r.set("map", w->map.data.extra["postfx"]);
             r.set("chain", chainReport(*w));
@@ -277,6 +281,55 @@ void registerPrismaOps(Workspace& ws) {
             return changeAnswer(*w, {parsed}, std::string("Постэффект ") + prismaType(parsed.type).label + (scope == "map" ? " (карта)" : ""));
         });
 
+    add("postfx_volumes_set", "Validate and save camera volumes for the game or the open map. Pass expected from postfx_get gameVolumes/mapVolumes to detect concurrent edits.",
+        std::string(R"({"properties":{"block":{"type":"object"},"expected":{"type":"string"},)") + kScope + R"(},"required":["block","expected"]})",
+        [w](const Json& p) {
+            if (w->project.dir.empty()) throw std::runtime_error("Open a project first");
+            const bool map = scopeOf(p) == "map";
+            Json& owner = map ? w->map.data.extra : w->project.manifest;
+            const Json before = owner["prismaVolumes"];
+            if (!p["expected"].isString() || p.getStr("expected") != before.dump())
+                throw std::runtime_error("The volume list changed. Reload it before applying.");
+            const Json& block = p["block"];
+            if (!block.isObject() || !block["volumes"].isArray())
+                throw std::runtime_error("Expected a camera volume list");
+            std::vector<std::string> issues;
+            parsePrismaVolumes(map ? Json() : block, map ? block : Json(), &issues);
+            if (!issues.empty()) throw std::runtime_error(issues.front());
+            if (before == block) return okJson();
+            if (map) w->map.beginEdit();
+            const bool existed = owner.has("prismaVolumes");
+            owner.set("prismaVolumes", block);
+            if (map) {
+                w->map.touched();
+                w->note({Change::Map, 0, 0, -1, -1, -1, "Camera volumes"});
+            } else {
+                std::string error;
+                if (!w->project.saveManifest(&error)) {
+                    if (existed) owner.set("prismaVolumes", before); else owner.erase("prismaVolumes");
+                    throw std::runtime_error(error);
+                }
+                w->note({Change::Project, 0, 0, -1, -1, -1, "game.json: camera volumes"});
+            }
+            return okJson();
+        });
+    add("postfx_compositor_set", "Validate and save a named-target frame compositor. Set graph to null to disable it, or inherit=true to remove an override.",
+        std::string(R"({"properties":{"graph":{"type":["object","null"]},"inherit":{"type":"boolean"},"expectedGraph":{"type":["object","null"]},)") + kScope + "}}",
+        [w](const Json& p) {
+            const std::string scope = scopeOf(p);
+            Json block = prismaBlock(*w, scope);
+            if (!block.isObject()) block = withEffects(block, effectsArray(block));
+            if (p.has("expectedGraph") && !(p["expectedGraph"] == block["compositor"]))
+                throw std::runtime_error("The saved compositor changed. Reload it before saving.");
+            if (p.getBool("inherit")) block.erase("compositor");
+            else {
+                if (!p.has("graph")) throw std::runtime_error("postfx_compositor_set: graph is required");
+                if (!p["graph"].isNull()) PrismaCompositor::compile(p["graph"]);
+                block.set("compositor", p["graph"]);
+            }
+            setPrismaBlock(*w, scope, block);
+            return chainReport(*w);
+        });
     add("postfx_set", "Change parameters of a post-processing effect already in the block (omitted parameters are kept); "
         "same warnings as postfx_add. On scope 'map' with no map entry yet, the map gets an override of that effect.",
         std::string(R"({"properties": {"type": {"type": "string"}, "params": {"type": "object"}, "minQuality": {"type": "string", "enum": ["low", "medium", "high"]},
@@ -387,7 +440,7 @@ void registerPrismaOps(Workspace& ws) {
         "weak phones (low) or strong devices (high) get; scene=false hides effects in the Scene view (Game view keeps them). "
         "Combine with view_screenshot to compare tiers.",
         R"({"properties": {"quality": {"type": "string", "enum": ["off", "low", "medium", "high"]}, "scene": {"type": "boolean"}}})",
-        [](const Json&) -> Json { throw std::runtime_error("this tool needs the editor window (start aiverse_editor)"); }, true);
+        [](const Json&) -> Json { throw std::runtime_error("Open HTML5 Studio and connect its agent link to use this tool"); }, true);
 }
 
 } // namespace aiverse::editor

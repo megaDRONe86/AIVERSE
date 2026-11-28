@@ -62,6 +62,8 @@ tablets are always fullscreen, the web build fills the page). Editor: **Сбор
 | `macos`, `windows`, `linux` | objects with any of the keys above that override them on that platform |
 
 Runs with `AIVERSE_EXIT_AFTER_FRAMES` (screenshots, CI) and `--size WxH` stay windowed at the asked size.
+On macOS `AIVERSE_BACKGROUND=1` keeps such a run out of the way: no Dock icon, no activation or focus, the window is
+placed off every screen (it still renders and captures) and window modes are not applied; it gets no input.
 Code: `engine/platform/WindowSettings.h` (parser, checks), `AppConfig` window fields, `AppCallbacks::configure`.
 
 Optional `"ui"` block: how the in-game UI (RmlUi documents) blends.
@@ -101,10 +103,11 @@ editor reads it. Details: docs/editor-world-tree.md § Game hooks.
 | key | meaning |
 |---|---|
 | `supplyCap` | max supply/population (default 200) |
+| `minUnitSpeed`, `maxUnitSpeed` | Optional nonnegative final speed-stat limits for types with positive base movement speed, after upgrades, buffs, statuses, fields, environment, native and progression modifiers. If both are present, min must not exceed max. Absent bounds are unrestricted; movement permissions and physical/path constraints remain separate. |
 | `modes`, `matchModes`, `timedRules`, `matchStats`, `ruleSets` | match modes (domination, king of the hill, time limit, sudden death, battle-royal zones), presets picked by map `matchMode`, player statuses by time slots, match statistics: see "Match modes" |
 | `ai` | `{"controller":"builtin"}` (default) or `{"controller":"scripted"}`. Scripted control makes the generic ComputerPlayer submit no commands in client, editor and headless. The game must provide its own controller; Lua handlers, human/network commands, combat, production and victory remain enabled. This is not the `waves` player flag and does not exempt players from defeat. |
 | `maxQueue` | production queue length (5) |
-| `costModel` | `"upfront"` (pay when ordering) or `"progressive"` (Total Annihilation: pay while building; stalls when short) |
+| `costModel` | `"upfront"` (pay when ordering) or `"progressive"` (Total Annihilation: pay while building; stalls when short). In the client, choosing a building checks its immediate charge and reports the missing resource before showing the placement ghost. Goods delivered to the site and progressive costs are excluded from this check. |
 | `sellRefund` | fraction refunded when selling a structure (0.5) |
 | `buildRadius` | >0: structures only within N cells of own structures with `extendsBase` |
 | `levelHeight` | visual height of one cliff level |
@@ -113,7 +116,7 @@ editor reads it. Details: docs/editor-world-tree.md § Game hooks.
 | `victory` | `"noStructures"` (default), `"noUnits"`, `"noEntities"`, `"keyUnits"` (lose when all `key` objects die), or an object: `{"mode": "tickets", "tickets": 500, "drain": 1}`, `{"mode": "survive", "seconds": 600}`, `{"mode": "score", "seconds": 240, "keyLoses": true}`, `{"mode": "territory", "share": 0.9}` (a team owning that share of all claimable cells wins; a player with no territory is out) |
 | `fogOfWar` | `{"mode": "full"}` — fog of war: `full` (default: unexplored black, explored dim), `explored` (the whole map starts explored, enemies only in sight), `none` (no fog, everyone sees everything); `shareAllies` (true); `lineOfSight` (false: 3D visibility by heights and blockers, see "3D line of sight"); `rockHeight` (2: undug rock as an occluder). A map may override `mode`. The other keys are visual, see "Fog of war look" |
 | `heights` | `{"blockVision": true, "missUphill": 0.3, "rangePerLevel": 1, "damagePerLevel": 0.1}` — cliff levels: lower ground can't see up, shots uphill can miss, higher ground adds range and damage. With `terrain.model: "heightfield"` the advantage is the height difference / `levelHeight` (fractional), `missUphill` scales with it (full chance from one level below) and vision follows real line of sight |
-| `targeting` | `{"overkill": false}` — `overkill: true` (StarCraft II): automatic targeting skips enemies whose hp + shields are already covered by shots in flight and by the next shots of units that chose them earlier in the same pass, so a volley spreads over several targets. Manual attack orders are not affected; the estimate uses the weapon's raw damage (before armor) |
+| `targeting` | `{"overkill": false}` — `overkill: true` (StarCraft II): automatic targeting skips enemies whose hp + shields are already covered by shots in flight and by the next shots of units that chose them earlier in the same pass, so a volley spreads over several targets. Manual attack orders are not affected; the estimate uses the weapon's raw damage (before armor)  `acquireOrder` accepts `nearest` (default, distance plus four cells for unarmed candidates) or `rowMajor` (armed candidates first, then map cells by row and column, then packed entity ID within a cell). Off-grid candidates follow mapped cells in their group. |
 | `terrain` | `{"model": "heightfield", "maxSlope": {"ground": 0.8, "sand": 0.6}, "buildSlope": 0.35, "uphillSpeed": 0.5, "downhillSpeed": 0.2, "eyeHeight": 1, "targetHeight": 0.5}` — terrain model, see "Heightfield terrain". `model`: `"levels"` (default: cliff levels + ramps), `"flat"` (levels ignored), `"heightfield"`. Other keys of this block are visual (view) and ignored by the simulation |
 | `regions` | `{"claimCost": {"food": 100}, "claimCostGrowth": 0.5, "buildOnlyOwned": true, "productionPerRegion": 0.1}` — territory (Northgard; with flags: Z) |
 | `upkeep` | `[{"supply": 50, "gatherMult": 0.7}, {"supply": 80, "gatherMult": 0.4}]` — gathering yields less with a big army (Warcraft III) |
@@ -132,6 +135,56 @@ editor reads it. Details: docs/editor-world-tree.md § Game hooks.
 | `movement.magicBox` | `true` (radius 8) or a radius in cells, default off — StarCraft II "magic box": a group of ground (and, separately, air) units whose members are all within the radius of the group centre, ordered to move or attack-move to a point outside the group, keeps its shape: each unit goes to the point plus its offset from the centre. A wider group, a goal inside the group, an attack on a unit, formations and flow-field groups move as before |
 | `lanes` | `{"left": 4, "right": 2, "spacing": 0.35}` — Mushroom Wars 2 lanes between garrison buildings (replaces map `roads` for sends) |
 | `ai` | `{"towers": 1, "scouts": 1, "invasionSize": 6, "escalateSeconds": 300, "climbWeight": 24, "exposureWeight": 12, "terrain": true, "workersPerBase": 14, "firstAttackArmy": 8, "armyGrowth": 4, "maxAttackArmy": 16}` — computer player knobs, every key optional (defaults shown): `towers` defensive structures at the chokepoint toward the enemy once the base was raided (0 = none); `scouts` units holding a watch post on high ground along the attack route; `invasionSize` orbit units gathered before a fleet transfers to another body (planets); `escalateSeconds` no enemy structure destroyed for this long (after 8 min) raises the stalemate level (bigger waves, a little more range in the unit mix, economy targets, alternate routes, at level 3 no retreat); `climbWeight` / `exposureWeight` route cost per level climbed / per level of higher ground overlooking a cell (10 = one cell); `terrain: false` turns the terrain analysis off (direct attack-moves). See "Computer player" |
+
+### Fractional weapon cadence
+
+A positive weapon `cooldown` in seconds uses fractional timing by default. The shared fixed-point cadence policy carries a crossed-zero remainder into the next accepted shot and permits multiple targeted shots during one simulation tick. It discards unused credit at the tick boundary (idle, invalid target, stun, or blocked fire) and limits each weapon to 32 accepted shots per tick. Accuracy is subject to the existing fixed-point simulation timestep and that safety budget. Charged weapons retain their existing charging gate and are limited to one shot per tick. Set `"preciseCooldown": false` to use whole-tick timing. Zero-period weapons retain their original cadence. The existing Combat cooldown array stores the next remaining time; precise weapon slots are also included in the checksum. Targeted combat and TopDown free-fire share one pre-movement cadence advance for precise slots. Arsenal has one shared hand cooldown across weapon selection and uses the same policy, with finite ammo and held-fire burst limits; a queued single tap authorizes one shot. Its fractional save extension is tagged ACW1. The loader also accepts older hand tables and preserves the pending ready tick. Native ECS Weapon Launch can opt in with `WeaponParametersComponent.firePeriod` (positive seconds); the owner persists and hashes `WeaponStateComponent.remainingCooldown`. A single native intent authorizes the current tick's burst; zero period keeps integer `fireInterval`. ActorModule's separate FPS firing adapter remains integer-based.
+
+### Fitted weapon projectile arcs
+
+```json
+{"projectileSpeed":12,"flight":{"arc":true,"arcHeightPerDistance":0.3,"homing":true,"maxDistance":60}}
+```
+
+A weapon flight can opt in to a target-fitted arc without manually calculating gravity. `arcHeight` sets a constant apex offset, `arcHeightPerDistance` sets a proportional offset, and both may be added together. The default ratio is 0.25 if no constant is specified. Flight fits to the initial ground distance and effective projectile speed, with a minimum duration of 0.1 s. Homing updates the aim while keeping the original deadline. Swept collisions and range/lifetime limits can end the flight sooner. Flat maps and same-body planetary surfaces use the existing projectile program; no new save layout is needed. See docs/projectile-programs.md for branch and compatibility behavior.
+
+### Weapon-scaled damage and healing
+
+Damage and heal effects can use `weaponDamage` instead of a fixed `amount` or `percent`. It is a nonnegative multiplier (0–1000) of the selected weapon's authored damage times the caster's current authoritative Damage stat. Optional `weaponIndex` selects an authored weapon slot, zero-based (default 0; not the implicitly equipped/triggering weapon). Example:
+
+```json
+{"type":"damage","weaponDamage":1.5,"radius":4,"affects":"enemies"}
+```
+
+```json
+{"type":"heal","weaponDamage":0.5,"weaponIndex":1,"affects":"allies"}
+```
+
+The effect is resolved when applied, not when cast or launched; tech, hero, buff, status, native and progression modifiers in the existing stat pipeline therefore affect delayed payloads too. The existing effect context scale (chain falloff) multiplies the result once. Target-specific armor, class bonuses, height and hit RNG are not part of this source amount; normal target damage resolution still applies afterward. If the caster entity or selected weapon no longer exists, the scaled effect does nothing rather than falling back to an invented stat. Status ticks use the caster entity already supplied by their effect context. Native code can query `GameHost::currentWeaponDamage(sim,caster,slot)` (optional Fixed). No new mutable state or save format.
+
+### Multishot weapon targeting
+
+Set `extraTargets` to an integer 0–16 on a targeted weapon. One accepted attack selects the primary enemy plus up to that many distinct secondary enemies at release. Secondary selection uses contact distance and stable Entity handle as tie-breaker; the ordinary weapon layer/tag/range/sensor restrictions remain in effect. Optional `extraTargetTags` and `extraIgnoreTags` further constrain only secondary targets. For example:
+
+```json
+{"damage":10,"range":8,"cooldown":1,"projectileSpeed":12,"extraTargets":3,"extraTargetTags":["organic"],"extraIgnoreTags":["immune"]}
+```
+
+Each selected secondary receives an independent full-strength shot (or instant hit), with its own weapon on-hit roll, projectile state and existing splash/impact path. The existing fireCount perk still duplicates bullets on the primary target only. One attack event, cooldown, and existing attack-level acceptance per release; no duplicate windup or muzzle animation per secondary. Planets require the same body. Normal selection uses a spatial query and bounded nearest-candidate storage; height-dependent range uses a full entity scan for correctness. The new configuration has no additional persistent combat state; projectile state remains owned by the existing projectile pipeline. This stage covers targeted GameCore combat; free-fire target selection and generic ECS/FPS adapters are not yet connected. Instant secondary tracer visualization is not separately wired.
+
+### Weapon attack windup and backswing
+
+Weapon entries can specify `windup` and `backswing` (seconds, each 0–60). The targeted GameCore combat adapter starts a per-slot attack phase after cooldown and targeting checks; windup progresses within eligible tick time, scaled by attack speed (whole-tick mode starts progress on subsequent ticks). At release the existing damage/projectile path, ammo/weapon acceptance, cooldown, sound and muzzle effects run once. A stun, disarm, invalid target/range, blocked release or replacing an order cancels a pending windup without spending cooldown. Recovery runs concurrently with the post-release cooldown and prevents another start for that weapon until both are ready; it does not lock movement. With `preciseCooldown`, uncharged phased weapons carry unused Fixed time through windup and concurrent cooldown/recovery, allowing another windup in the same tick. The shared limit is 32 releases per tick. Whole-tick timing remains available with `preciseCooldown:false`; a separate `chargeTime` keeps its pre-windup lock-on gate and one-release limit.
+
+Events: `attack` starts the attack. With a positive windup, `attack_start` marks the same tick and `attack_release` marks the damage point. Instantaneous attacks deliver their shot on `attack`. Other timing events are `attack_cancelled` and `attack_recovery_end`. All carry attacker, target and weapon slot. The GameView attack event adapter avoids restarting a clip on the corresponding release and only emits tracers on release. Clip speed/marker matching and explicit cancellation blending are not automated in this stage. Native code can use `AttackTimingState` in `engine/mechanics/AttackTiming.h`. Save extension ATP1 persists phase, target and remaining time for projects with phased weapons. TopDown free-fire, Arsenal, generic weapon launch and ActorModule are separate adapters and do not yet consume these fields.
+
+### Strongest-wins timed stat modifier groups
+
+Set `"stackingGroup": "movement_slow"` on a timed buff effect (including an aura) or a status `mods[]` entry. For each stat and group, the active candidate with the greatest absolute change to the authored/script base wins: `abs((base + add) * mul - base)`. Equal strength is resolved by larger add, then larger mul. Only one add/mul contribution applies per group, even if a grouped status has multiple stacks; different groups and ordinary modifiers still combine. Unit buffs, unit statuses and player statuses compete in the same group. Other status effects (flags, shields, periodic payloads) retain their existing stacking rules. Expired candidates do not participate; weaker active candidates become effective when the stronger one expires. Use separate groups for haste and slow when both should apply. Names are case-sensitive, 1–128 bytes, at most 64 groups per ruleset. Grouped modifiers support add/mul only, not lerp/floor. The optional versioned save block is bound to the group's name table; old saves for ungrouped projects retain their existing format.
+
+### Weapon and effect target tags
+
+Weapon entries accept optional `targetTags` (match at least one listed tag) and `ignoreTags` (reject any listed tag). Both are arrays of known unit type tag names. Layer targeting still applies. With neither field, existing weapon targeting is unchanged. Effect filters support `ignoreTags` alongside their existing `tags` include list, including chain and area targets. Exclusion wins. Filters restrict eligible targets; incidental legacy splash damage is a separate policy.
 
 ## Splitting rules.json
 
@@ -279,6 +332,7 @@ any tag in `deficitDisables`).
 | block | meaning |
 |---|---|
 | `structure` | `{"footprint": [w, h], "on": "geyser", "takesOverNode": true, "terrain": "rock"\|"creep"\|"any", "extendsBase": true}` — `on`: must be built exactly on an object of that type (refinery on a geyser, TA extractor on a metal spot); `takesOverNode` inherits its resource |
+| `selectable` | Boolean, default `true`. With `false`, pointer hits pass through the unit and selection shortcuts and drag selection skip it. The unit still participates in the simulation. |
 | `invulnerable` | can't be damaged (trees, mines, decorations) |
 | `collider` | `true`: map entities of this type are static circles (`move.radius`, the type's layer), not units: no ECS cost, no model. Walkers treat them as ORCA obstacles and never step into one, separation pushes overlapping units out, top-down heroes and cars are stopped by them like any body that never moves. For thousands of invisible bollards / benches / flower beds. Needs `move.radius`, no `structure`; not for things scripts query or damage (`engine/game/Colliders.h`) |
 | `energy` | `{"max": 200, "regen": 0.5, "start": 50}` — mana for abilities |
@@ -467,6 +521,9 @@ stays silent.
                             "weapons": {"sword": {"hit": "clang_heavy"}}, "abilities": {"roar": "roar"}}}
 }
 ```
+
+In `audio.json`, `types.scout.repeatSelect` can be `{"sound":"annoyed","count":3,"window":2}`. The third click on the same scout within two seconds and subsequent qualifying clicks use the repeat sound in place of its selection voice. Switching units, clearing selection or issuing an order resets the sequence. Bind a sound with variants to use the audio bank's normal variant selection.
+For ordered annoyed lines, use `{"sound":"annoyed","count":3,"order":"sequential","cycle":true}`. The variants play in file order from the third click, then the next click returns to the normal selection voice and starts the sequence again. A sequential sequence has no timeout unless `window` is positive; `window:0` also disables the timeout. Without `order:"sequential"`, the existing random-variant behavior remains.
 
 `volume`: mix level per bus, 0..4 (default 1); the player's own volume settings multiply on top
 (client data model: `volume` master, `music`, `sfx` = every bus but music, percent; `musicOn` / `sfxOn` 1 / 0 switch
@@ -1255,6 +1312,8 @@ slot fails outside the window and inside only `every` can enable it), `every` / 
 `levelBehind` N (with `resource`: the player's level is exactly N below the best player's), `everyAbilities` N (the
 player's ability uses are a positive multiple of N). Rules that need more than a status (command filters, custom
 upgrade rules, scripted casts) belong to a native module of the game (docs/native-modules.md § Hooks).
+
+Resource `hudLabelFormat` optionally customizes the built-in top bar label. Use `"{value}"` for a number alone or `"{name} {value}/{cap}"` for a capacity resource. For capacity, value means used and cap means provided. Stock and flow expose current stock and storage cap. Omitted or empty formats retain the default label.
 
 Resource `levels` (tiers of a stock, e.g. morale stars):
 
@@ -2427,6 +2486,14 @@ art is generated by `tools/art2d/make_samples.py`):
 - **3D terrain + sprites** (Knights and Merchants): the normal terrain (levels, ramps, heights),
   `camera` at a fixed angle (`pitch: 50`), billboard sprites standing on the ground.
 
+### game.json `selectionOutline`
+
+Set `"selectionOutline": false` to hide model silhouettes on selected and hovered objects during gameplay. The standalone client defaults to enabled. Custom selection rings and hover overlays remain independently configurable.
+
+### game.json `edgeScroll`
+
+Desktop pointer scrolling accepts `"edgeScroll":{"zonePx":16,"delaySeconds":0.2,"speed":1.5}`. Width is in logical window pixels on each edge. Speed multiplies camera pan speed. The default is 3 pixels, immediate activation and speed 1. Set zonePx or speed to zero to disable pointer scrolling. Moving away from an edge restarts its delay.
+
 ### game.json `camera`
 
 | key | meaning |
@@ -2434,6 +2501,7 @@ art is generated by `tools/art2d/make_samples.py`):
 | `projection` | `"ortho"` or `"perspective"` (default) |
 | `pitch`, `yaw`, `fov` | degrees; pitch 90 = straight down, yaw 0 = north up |
 | `zoom`, `zoomMin`, `zoomMax` | start/limits: visible map cells vertically (ortho) or camera distance (perspective); without `zoom` the game frames the map |
+| `designAspect` | positive width/height ratio of the authored frame. For example, 1.333333 projects a 4:3 view across the full window. Omit it or use 0 for the viewport aspect. Applies to perspective and orthographic cameras. |
 | `pixelsPerCell` | ortho: start zoom so that one world unit is that many screen pixels (pixel-perfect sprites drawn with the same `pixelsPerCell`) |
 | `rotate` | allow camera rotation (default: false for ortho) |
 | `bounds` | `[xMin, zMin, xMax, zMax]`: the camera target stays inside this box in map cells, also while the player drags the map; equal min and max lock an axis (a vertical-only scroller: `[8, 10, 8, 54]`) |
@@ -2786,10 +2854,27 @@ explored never show resources / territory.
 "owner": "enemy", "types": [...], "max": 32}`: every matching simulation event spawns a popup at its
 position for `lifetime` seconds, rising `rise` units / s, rings / icons growing `grow` / s. `by` =
 relation of the player who caused it, `owner` = of the object it happened to, `types` = its type.
-Events: `hit`, `died`, `spawned`, `attack`, `gathered`, `delivered`, `produced`, `ability`, `cast`,
+Events: `hit`, `died`, `bounty`, `spawned`, `attack`, `gathered`, `delivered`, `produced`, `ability`, `cast`,
 `impact`, `miss`, `built`, `placed`, `trained`, `researched`, `levelup`, `captured`, `sold`,
 `upgraded`, `alert` (under attack), `status`, `area`, `claimed`, `wave`, `message`, `ping` (pings of
-the client / editor). Popups never appear in cells the local player cannot see.
+the client / editor), and `order` (local movement or target orders). Order markers use the local
+input position even in unexplored cells. Other popups require local visibility. Use the
+`local_order_ring` overlay template to get an animated order point. In an order popup `{value}`
+is the submitted numeric command ID.
+
+For hit popups, `event.critical: true` selects critical hits and `false` selects normal hits; omit it to keep both. The critical flag is the result of the existing Progression critical roll, not a second random roll. `{critical}` formats 1 or 0; `{value}` still formats final damage. Use two overlays with different styles:
+
+```json
+{"id":"critical_damage","event":{"on":"hit","critical":true,"rise":1.5},"shape":{"type":"text","text":"CRIT -{value}","size":1.4},"style":{"color":"#ff9850ff"}}
+```
+
+For actual kill rewards, `event.on: "bounty"` emits a popup per resource credited to the recipient after conversion and storage caps. `by: "own"` filters the recipient; `owner` still describes the victim. `{amount}` and `{resource}` show the actual amount and resource name. On a `died` popup, `{bounty}` lists all credited resources, while `{bounty:gold}` formats the credited gold (0 if none). `bountyResource: "gold"` restricts either event to positive credits of the selected resource. Death `{value}` and `by` retain legacy meaning (victim type and owner); choose the bounty event for recipient filtering. The death popup associates reward events in the same received event batch, using the original generation-aware victim identity. Kill rewards outside the authored type bounty (e.g. XP, score or gainKill) are not included. Critical and bounty templates are available through the existing overlay authoring interface.
+
+```json
+{"id":"gold_reward","event":{"on":"died","bountyResource":"gold"},"shape":{"type":"text","text":"+{bounty:gold} gold","size":1.1},"style":{"color":"#ffd84aff"}}
+```
+
+Simulation and view scripts expose `critical` on damage events and `bounty` events with `amount`, `resource`, `unit_type` and `victim_owner`.
 
 **Quality tiers** (renderer material quality; `AIVERSE_OVERLAYS=low|medium|high` for testing): game
 overlays are capped per overlay (48 / 192 / 1024 elements), per grid / cells shape (600 / 3000 /
@@ -2966,3 +3051,87 @@ Weapons and projectile deliveries accept an optional `flight` object with ordere
 Fly Through and scalar modifiers. See [Projectile programs](projectile-programs.md) for the schema,
 inheritance rules, collision boundaries, save version and executable example. Legacy projectiles
 are unchanged when this block is absent.
+
+Unit type `view.hitFlash` controls the additive highlight on a hit. Set it to `false` to disable it, or set `"hitFlash":{"strength":0.2,"duration":0.15,"color":[0.3,0.6,1]}`. Duration is in seconds. Linear RGB components are in [0,1]. With no override, the warm highlight starts at 0.3 strength and decays for 0.3 seconds. The scene light uses the separate hitLight setting.
+
+For a painted flat minimap, set `"minimapBackground":"maps/valley-overview.png"` in the map or in game.json. A map value overrides the game default, and an empty string selects terrain colours. The image spans the map rectangle with its top left at grid (0,0). Transparent pixels reveal terrain colours. Fog, units, overlay marks and the camera frame are drawn above it. Missing or unreadable images fall back to terrain colours.
+CPU image consumers resolve logical content paths through the shared image loader, which reconstructs packed atlas regions (including trimming and rotation) or decodes standalone files. Minimap backgrounds use this same path.
+
+Set `hotkey` in a unit type or technology to show and activate its build, train, upgrade or research card action. Example: `"hotkey":"F5"`. If multiple enabled production buttons use the same key, the first in card order wins. Script commands take precedence.
+
+In audio.json, `events.menuClick`, `events.topClick` and `events.cardClick` override the generic `click` sound for each HUD area. Bind `error` for rejected buttons and invalid placements. Alt-click a flat world or minimap to emit a local overlay ping and play `events.ping`. Rally orders use `rally` (per type or global) with `move` as fallback.
+
+Set `types.<type>.constructionLoop` in audio.json to a sound name. A visible construction site plays that sound at its world position until construction finishes, the site disappears, or the match ends. The voice fades out over 0.15 seconds.
+
+To put a unit shortcut beside the minimap, set `"selectionShortcut":{"type":"builder","label":"@hud.builder","image":"icons/builder.png","hotkey":"F5"}` in game.json. Only the type is required. Alternatively use `{"idleWorker":true}` to select an own worker with an empty order queue; combine both keys to restrict the worker type. Clicking or pressing the optional hotkey a second time with that unit selected centers the camera. Custom HUDs can bind `selectionShortcuts[]` and call `act(a.id)`.
+
+The game.json camera block accepts a shakes array. For example, `"shakes":[{"event":"unit_died","type":"fortress","amplitude":0.6,"frequency":10,"duration":0.5,"radius":30}]`. Events use view-script names. An ability event may filter by ability ID. The radius uses horizontal distance from the camera focus to the event.
+
+### Mouse cursors
+
+In `game.json`, map pointer states to project images. A hotspot is a pixel position measured from the top left. Put frames in display order. Each frame may be up to 256 × 256 pixels.
+
+```json
+{
+  "cursors": {
+    "normal": {"image":"cursors/arrow.png","hotspot":[1,1]},
+    "ability": {"frames":["cursors/cast1.png","cursors/cast2.png"],"fps":6,"hotspot":[12,12]},
+    "invalid": {"image":"cursors/blocked.png","hotspot":[12,12]},
+    "edgeEast": "cursors/scroll-right.png",
+    "pointer": "cursors/hand.png"
+  }
+}
+```
+
+The client selects `normal`, `attack`, `ability`, `place`, `invalid`, `enemy` or `ally` over the world. Active edge scrolling uses `edgeNorth`, `edgeSouth`, `edgeEast`, `edgeWest` or a diagonal such as `edgeNorthWest`. Over the HUD, an RmlUi cursor name selects the matching entry. Unconfigured states fall back to `normal`. Linux builds with libXcursor support full colour. Base X11 builds use a monochrome pointer.
+
+
+### Minimap visibility and planar bounds
+
+Set a unit type's `view.minimap` to `false` to hide its marker, or `true` to
+explicitly show it (including small neutral resource nodes hidden by the legacy
+default). The flag applies to flat and planetary maps and does not reveal objects
+hidden by visibility/fog.
+
+Flat maps accept `minimap` settings in the map or game.json; each map setting
+overrides its corresponding game default:
+
+```json
+"minimap": {
+  "bounds": [10, 20, 90, 70],
+  "cameraFrame": "rectangle"
+}
+```
+
+`bounds` is `[left, top, right, bottom]` in world X/Z coordinates. It is clipped
+to the grid and must have a nonempty intersection. Omit it for the whole grid,
+or use `"camera"` for the map's authored `screen` coverage: screen center plus
+half-size and allowed center displacement. This requires an enabled map screen.
+The background image still spans the whole grid: cropping samples the matching
+part of that image rather than stretching the entire image into the crop.
+Terrain, fog, markers, overlays and pointer actions use the same cropped area.
+`cameraFrame` is `"frustum"` by default; `"rectangle"` draws the axis-aligned
+bounding rectangle of the camera footprint. These planar settings do not change
+the planetary globe projection.
+
+
+### Portrait background
+
+`ui.portrait.background` in game.json supplies the default portrait clear colour;
+`types.<id>.view.portrait.background` overrides it for one type. Use RGB or RGBA
+components in `[0,1]`, or `"player"` to use the selected subject owner's colour.
+Malformed values retain the inherited background. With neither setting, the
+existing grey-blue background remains. The same background applies to static
+and animated world-model portrait paths. `yaw`, `zoom` and `focusHeight` follow
+the same per-type-over-project precedence.
+
+
+Set `view.portrait.model` to an alternate model asset path, for example
+`"portrait": {"model":"models/portrait.glb", "background":"player"}`.
+`ui.portrait.model` supplies a project default; an explicit empty string on a
+type restores its world model. The separate model uses its own bounds, the
+portrait camera settings and owner tint. It loops `Idle`, then `Stand`, or the
+first available clip; assets without clips use their bind pose. Animation runs
+through the shared View/MotionWeave presentation world. A missing or rejected
+asset falls back to the subject's existing world-model portrait. Switching back
+to a different source starts that preview's animation anew.

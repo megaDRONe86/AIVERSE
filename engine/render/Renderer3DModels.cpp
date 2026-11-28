@@ -1,6 +1,7 @@
 // Renderer3D: models (PBR materials, GPU skinning, alpha modes) — shader permutations, culling,
 // sorting and the per-draw uniform blocks. See ModelShaders.h for the uniform layouts.
 #include "Renderer3D.h"
+#include "BspVisibility.h"
 #include "../gfx/GpuTier.h"
 #include "ModelMerge.h"
 #include "GpuMaterialState.h"
@@ -42,14 +43,14 @@ struct MaterialUniforms { float base[4]; float emissive[4]; float pbr[4]; float 
 // per-command Metal ICB, without the actor reveal override (GPU ICB
 // excludes kDrawActorReveal). Keep byte parity across both paths.
 static_assert(sizeof(MaterialUniforms) == 36u*sizeof(float));
-inline MaterialUniforms packGpuPbrMaterialU2(const Material& mt) {
+inline MaterialUniforms packGpuPbrMaterialU2(const Material& mt,bool linearEmissive=false,bool linearBaseColor=false,bool bc5Normal=false) {
         MaterialUniforms mu{};
         mu.base[0] = mt.baseColor.x; mu.base[1] = mt.baseColor.y; mu.base[2] = mt.baseColor.z; mu.base[3] = mt.baseColor.w;
         mu.emissive[0] = mt.emissive.x * mt.emissiveStrength; mu.emissive[1] = mt.emissive.y * mt.emissiveStrength; mu.emissive[2] = mt.emissive.z * mt.emissiveStrength;
         mu.emissive[3] = std::isfinite(mt.shadowDiffusion) ? std::clamp(mt.shadowDiffusion, 0.0f, 1.0f) : 0.0f;
         mu.pbr[0] = mt.metallic; mu.pbr[1] = mt.roughness; mu.pbr[2] = mt.normalScale; mu.pbr[3] = mt.occlusionStrength;
         mu.misc[0] = mt.alpha == AlphaMode::Mask ? mt.alphaCutoff : 0.0f;
-        mu.misc[1] = float(int(mt.team)); mu.misc[2] = mt.teamStrength; mu.misc[3] = (mt.vertexColors ? 1.0f : 0.0f) + (mt.vertexOcclusion ? 2.0f : 0.0f) + (mt.vertexOcclusion && mt.backOcclusion ? 4.0f : 0.0f);
+        mu.misc[1] = float(int(mt.team)); mu.misc[2] = mt.teamStrength; mu.misc[3] = (mt.vertexColors ? 1.0f : 0.0f) + (mt.vertexOcclusion ? 2.0f : 0.0f) + (mt.vertexOcclusion && mt.backOcclusion ? 4.0f : 0.0f) + (linearEmissive?8.0f:0.0f) + (linearBaseColor?16.0f:0.0f)+(bc5Normal?32.0f:0.0f);
         mu.uv0[0] = mt.uvOffset.x; mu.uv0[1] = mt.uvOffset.y; mu.uv0[2] = mt.uvScale.x; mu.uv0[3] = mt.uvScale.y;
         mu.uv1[0] = mt.uvRotation;
         mu.uv1[1] = float(int(mt.shading));  // 0 PBR, 1 Unlit, 2 Skin, 3 Eye, 4 Hair (VIVID)
@@ -73,9 +74,9 @@ inline MaterialUniforms packGpuPbrMaterialU2(const Material& mt) {
 // off the experimental ICB path below.
 struct ModelMaterialUniforms : MaterialUniforms { float eyeOptics[4]; };
 static_assert(sizeof(ModelMaterialUniforms) == 40u*sizeof(float));
-inline ModelMaterialUniforms packModelMaterialU2(const Material& mt) {
+inline ModelMaterialUniforms packModelMaterialU2(const Material& mt,bool linearEmissive=false,bool linearBaseColor=false,bool bc5Normal=false) {
     ModelMaterialUniforms mu{};
-    static_cast<MaterialUniforms&>(mu)=packGpuPbrMaterialU2(mt);
+    static_cast<MaterialUniforms&>(mu)=packGpuPbrMaterialU2(mt,linearEmissive,linearBaseColor,bc5Normal);
     mu.eyeOptics[0]=mt.eyeOptics.x;mu.eyeOptics[1]=mt.eyeOptics.y;
     mu.eyeOptics[2]=mt.eyeOptics.z;mu.eyeOptics[3]=mt.eyeOptics.w;
     return mu;
@@ -87,30 +88,26 @@ inline std::array<gfx::TextureHandle,4> gpuGraphSourceTextures(
     if (!material.shaderGraph) return result;
     const size_t count=std::min(size_t(4),material.shaderGraph->textures.size());
     for(size_t i=0;i<count;++i) {
-        const int index=material.graphTextures[i];
-        result[i]=index>=0 && size_t(index)<model.images.size() &&
-            model.images[size_t(index)].tex.valid() ?
-            model.images[size_t(index)].tex : white;
+        result[i]=resolvedGraphSourceTexture(model,material,i,white);
     }
     return result;
 }
 inline std::array<gfx::TextureHandle,6> gpuPbrSourceTextures(
     const Model& model, const Material& mt, gfx::TextureHandle white,
     gfx::TextureHandle black, gfx::TextureHandle flatNormal) {
-    const auto tex=[&](int image, gfx::TextureHandle fallback) {
-        return image>=0 && size_t(image)<model.images.size() &&
-               model.images[size_t(image)].tex.valid() ?
-               model.images[size_t(image)].tex : fallback;
+    const auto tex=[&](int Material::* slot,gfx::TextureHandle fallback){
+        return resolvedMaterialTexture(model,mt,slot,fallback);
     };
-    return {tex(mt.baseTex,white),tex(mt.mrTex,white),
-            tex(mt.normalTex,flatNormal),tex(mt.occlusionTex,white),
-            tex(mt.emissiveTex,white),tex(mt.teamTex,black)};
+    return {tex(&Material::baseTex,white),tex(&Material::mrTex,white),
+            tex(&Material::normalTex,flatNormal),tex(&Material::occlusionTex,white),
+            tex(&Material::emissiveTex,white),tex(&Material::teamTex,black)};
 }
 
 constexpr size_t kJointFloats = size_t(kMaxPaletteJoints) * 12; // 3 rows of vec4 per joint
 static_assert(kJointFloats * 4 <= 4096, "joint palette must fit a 4 KB uniform block");
 
 constexpr uint32_t kKeyDrawCallView = 32768;
+constexpr uint32_t kKeyModelEnvironment = 1u << 16;
 constexpr uint32_t kKeyDynamicGi = 1u << 25; // isolated opt-in model shader variant
 constexpr uint32_t kKeyMaterialInstancePalette = 1u << 27; // editor draw-call diagnostic shader permutation
 constexpr uint32_t kKeyModelVirtualTexture = 1u << 28;
@@ -133,10 +130,7 @@ void fillModelMaskProvenance(
         const Model& model,const Material& material) {
     result.maskedMaterial=material.alpha==AlphaMode::Mask;
     if(!result.maskedMaterial)return;
-    if(material.baseTex>=0 &&
-       std::size_t(material.baseTex)<model.images.size())
-        result.maskBaseTexture=
-            model.images[std::size_t(material.baseTex)].tex;
+    result.maskBaseTexture=resolvedMaterialTexture(model,material,&Material::baseTex);
     result.maskAlpha=material.baseColor.w;
     result.maskCutoff=material.alphaCutoff;
     result.maskUvOffset=material.uvOffset;
@@ -471,7 +465,7 @@ gfx::PipelineHandle Renderer3D::modelPipeline(const ModelItem& it, int phase, bo
     const bool mask = (!outline || maskPass) && it.mat->alpha == AlphaMode::Mask;
     const bool normalMap = phase != 0 && !outline && it.mat->normalTex >= 0 && matQuality_ != MaterialQuality::Low;
     const bool blend = (outline && !maskPass) || (!outline && !shadow && !depthAfter &&
-        (it.mat->alpha == AlphaMode::Blend || it.tint.w < 0.99f || transparentItem(it.flags)));
+        (alphaBlended(it.mat->alpha) || it.tint.w < 0.99f || transparentItem(it.flags)));
     const bool twoSided = !outline && it.mat->doubleSided;
     const bool giPhase = phase == 1 || phase == 2;
     const bool surfaceCapture=lumaSurfaceCapture_ && giPhase;
@@ -485,8 +479,7 @@ gfx::PipelineHandle Renderer3D::modelPipeline(const ModelItem& it, int phase, bo
     const uint32_t studioShaderBits = (geometryMainView_ && (phase == 1 || phase == 2) && studioDebugMode_ >= 2)
                                     ? uint32_t(studioDebugMode_) << 17 : 0u;
     const auto* candidateGraph=it.mat->shaderGraph&&int(matQuality_)>=it.mat->shaderGraph->minQuality?it.mat->shaderGraph.get():nullptr;
-    const bool availableAlphaR8=mask&&it.mat->baseTex>=0&&size_t(it.mat->baseTex)<it.model->images.size()&&
-        it.model->images[size_t(it.mat->baseTex)].virtualAlphaMask.valid();
+    const bool availableAlphaR8=mask&&resolvedMaterialAlphaCoverage(*it.model,*it.mat).valid();
     const bool allowVirtual=giPhase&&!materialPalette;
     ModelVirtualTextureBinding vtBinding;
     const bool availableVirtual=allowVirtual&&resolveModelVirtualTexture(*it.model,*it.mat,vtBinding);
@@ -495,6 +488,10 @@ gfx::PipelineHandle Renderer3D::modelPipeline(const ModelItem& it, int phase, bo
     const auto selectedGraph=sampling.graph?it.mat->shaderGraph:nullptr;
     const auto* graph=selectedGraph.get();
     const bool alphaR8=sampling.alphaR8,vtSampling=sampling.virtualTexture;
+    const bool environment=giPhase&&modelEnvironment_.valid();
+    if(environment&&(candidateGraph||availableVirtual||dynamicGi||lightmap||probes||materialCapture||matQuality_==MaterialQuality::Low||dev_->maxFragmentTextureSlots()<14)){
+        modelError_="model HDR environment conflicts with graph/VT/GI or material tier";return {};
+    }
     const int virtualAtlasSlot=sampling.atlasSlot,virtualTableSlot=sampling.tableSlot;
     const bool vtTrilinear=vtSampling&&vtBinding.indexedMipTable;
     const int graphTextureSlot=sampling.graphSlot,dynamicGiTextureSlot=sampling.dynamicGiSlot;
@@ -502,7 +499,7 @@ gfx::PipelineHandle Renderer3D::modelPipeline(const ModelItem& it, int phase, bo
         modelError_="dynamic GI exceeds base PBR fragment texture budget";
         return {};
     }
-    const uint32_t shaderKey = (vtSampling ? kKeyModelVirtualTexture : 0u) |
+    const uint32_t shaderKey = (environment ? kKeyModelEnvironment : 0u) | (vtSampling ? kKeyModelVirtualTexture : 0u) |
         (vtTrilinear ? kKeyModelVirtualTrilinear : 0u) |
         (alphaR8 ? kKeyModelVirtualAlpha : 0u) |
         gpuInstanceShaderBit | (materialCapture ? 0u : studioShaderBits) |
@@ -512,14 +509,17 @@ gfx::PipelineHandle Renderer3D::modelPipeline(const ModelItem& it, int phase, bo
                                (instanced ? kKeyInstanced : 0u) | (outline ? kKeyOutline : 0u) |
                                ((drawCallDebug_ && geometryMainView_ && (phase == 1 || phase == 2)) ? kKeyDrawCallView : 0u) |
                                (lightmap ? kKeyLightmap : 0u) | (probes ? kKeyProbes : 0u) | (lodFade ? kKeyLodFade : 0u) | (materialPalette ? kKeyMaterialPalette : 0u) | (dynamicGi ? kKeyDynamicGi : 0u);
-    const bool fadeDepth = blend && !outline && it.mat->alpha != AlphaMode::Blend && (it.flags & kDrawFadeDepth) && !transparentItem(it.flags);
+    const bool fadeDepth = blend && !outline && !alphaBlended(it.mat->alpha) && (it.flags & kDrawFadeDepth) && !transparentItem(it.flags);
     const uint32_t pipeKey = shaderKey | (blend ? 16u : 0u) | (twoSided ? 32u : 0u) |
         (fadeDepth ? 64u : 0u) | (depthAfter ? 1024u : 0u) | (maskPass ? (1u << 29) : 0u);
 
     const ModelShaderKey skey{shaderKey, selectedGraph};
-    const ModelShaderKey pkey{pipeKey, selectedGraph};
+    const auto blendMode=blend ? (outline ? gfx::BlendMode::Alpha :
+        alphaBlended(it.mat->alpha) ? materialBlendMode(it.mat->alpha) : gfx::BlendMode::Alpha) : gfx::BlendMode::Opaque;
+    const ModelShaderKey pkey{pipeKey, selectedGraph, blendMode};
     for (auto& [k, p] : modelPipes_) if (k == pkey) {
         if(warmingPipelines_ && !p.valid())warmingFailed_=true;
+        if(environment&&!p.valid())modelError_="HDR environment model pipeline unavailable";
         return p;
     }
 
@@ -545,6 +545,7 @@ gfx::PipelineHandle Renderer3D::modelPipeline(const ModelItem& it, int phase, bo
         if (baked) defs += "#define BAKED 1\n";
         if (morph) defs += "#define MORPH 1\n";
         if (normalMap) defs += "#define NORMALMAP 1\n";
+        if (environment) defs += "#define AIVERSE_MODEL_ENVIRONMENT 1\n";
         if (mask) defs += "#define ALPHAMASK 1\n";
         if (alphaR8) defs += "#define VIRTUAL_ALPHA_MASK 1\n";
         if (vtSampling) defs += "#define AIVERSE_MODEL_VT 1\n";
@@ -710,11 +711,12 @@ gfx::PipelineHandle Renderer3D::modelPipeline(const ModelItem& it, int phase, bo
         gfx::ShaderDesc sd;
         sd.glslVertex = vs.c_str(); sd.glslFragment = fs.c_str(); sd.msl = msl.c_str();
         // tex11/tex12: SSR scene colour/depth; graph textures follow at kGraphTextureSlot.
-        sd.uniformSlots = dynamicGi ? (vtSampling ? 8 : 7) : vtSampling ? 7 : (shadow ? 5 : 6);
+        sd.uniformSlots = dynamicGi ? (vtSampling ? 8 : 7) : (vtSampling||environment) ? 7 : (shadow ? 5 : 6);
         sd.textureSlots = alphaR8 ? 16 : vtSampling ? virtualTableSlot+1 :
             (graph && !graph->textures.empty() ?
             graphTextureSlot+int(graph->textures.size()) : shadow ? 9 : 13);
         sd.textureSlots=std::max(sd.textureSlots,dynamicGi ? dynamicGiTextureSlot+1 : 0);
+        if(environment)sd.textureSlots=std::max(sd.textureSlots,14);
         sd.label = shadow ? "model shadow" : "model"; // U5/tex9: lights, tex10: height field
         ShaderEntry e;
         if (warmingPipelines_) e.job=dev_->createShaderAsync(sd);
@@ -765,7 +767,7 @@ gfx::PipelineHandle Renderer3D::modelPipeline(const ModelItem& it, int phase, bo
             pd.depthOnly = true;
             pd.depthBiasConstant = 2.0f; pd.depthBiasSlope = 2.5f;
         } else if (blend) {
-            pd.blend = gfx::BlendMode::Alpha;
+            pd.blend = blendMode;
             pd.depthWrite = fadeDepth;
         } else if (depthAfter) {
             pd.colorWrite = false;
@@ -1155,11 +1157,12 @@ bool Renderer3D::applyWindRig(const ModelDraw& d) {
     if (debug) {
         const void* key = d.materials ? static_cast<const void*>(d.materials) : static_cast<const void*>(d.model);
         auto& cached = windDebugMaterials_[key];
-        if (cached.revision != d.model->materialRevision || cached.count != source.size() ||
+        if (cached.model != d.model || cached.revision != d.model->materialRevision || cached.count != source.size() ||
             cached.materials.size() != source.size()) {
             cached.materials = source;
             const auto program = wind::windRigDebugGraph(windDebugView_);
             for (auto& mat : cached.materials) if (mat.shaderGraph == rigGraph) mat.shaderGraph = program;
+            cached.model = d.model;
             cached.revision = d.model->materialRevision;
             cached.count = source.size();
         }
@@ -1182,6 +1185,7 @@ void Renderer3D::drawModel(const ModelDraw& d) {
     ProfileTimer timer(profiling_?&profile_.submitMs:nullptr);
     const Model* m = d.model;
     if (!m || !m->vb.valid() || m->nodes.empty()) return;
+    if(d.nodeMask&&(d.nodeMask->size()!=m->nodes.size()||d.persistentId||d.staticCache||(d.flags&kDrawStatic)))return;
     if ((d.layers & visibilityMask_) == 0) return;
     if (applyWindRig(d)) return;
     if(modelPacketTap_)modelPacketTap_(d);
@@ -1213,7 +1217,14 @@ void Renderer3D::drawModel(const ModelDraw& d) {
     if (!customVertexStream) recordPersistentModel(d);
     // Partial primitive draws and per-instance vertex parameters cannot
     // replay an immutable whole-model static packet/cache.
-    const bool specialDraw = d.primitiveMaterialFilter >= 0 || d.useVertexParameters;
+    const bool techniques = d.variant < 0 && !m->materialTechniques.bySource.empty();
+    unsigned techniqueCaps = 0;
+    if (techniques) {
+        if (dev_->supportsCompute()) techniqueCaps |= TechniqueCompute;
+        if (dev_->supports(gfx::PixelFormat::RGBA16F)) techniqueCaps |= TechniqueHdr;
+        if (dev_->supportsTextureDimension(gfx::TextureDimension::Texture2DArray)) techniqueCaps |= TechniqueTextureArrays;
+    }
+    const bool specialDraw = techniques || d.primitiveMaterialFilter >= 0 || d.useVertexParameters || d.nodeMask || m->bspVisibility;
     if (capture_ && (d.flags & kDrawStatic) && d.primitiveMaterialFilter < 0 && !d.materialMask) {   // light baker: the static scene, every node in world space
         const auto& pose = d.nodeWorld && d.nodeWorld->size() == m->nodes.size() ? *d.nodeWorld : m->bindWorld;
         std::vector<mat4> nodeWorld(pose.size());
@@ -1343,7 +1354,7 @@ void Renderer3D::drawModel(const ModelDraw& d) {
                 const bool opaque = d.tint.w >= .99f && d.dissolve <= 0 &&
                     !transparentItem(d.flags) &&
                     std::none_of(mats.begin(), mats.end(), [](const Material& mat) {
-                        return mat.alpha == AlphaMode::Blend || mat.transparent;
+                        return alphaBlended(mat.alpha) || mat.transparent;
                     });
                 const float fadeWidth = opaque && !m->geometry &&
                     matQuality_ != MaterialQuality::Low ? modelLodFadeWidth_ : 0.0f;
@@ -1432,6 +1443,7 @@ void Renderer3D::drawModel(const ModelDraw& d) {
     if (packetEligible)
         packetSelectedMeshes.assign(m->nodes.size(), -1);
     for (int n : m->order) {
+        if(d.nodeMask&&!(*d.nodeMask)[size_t(n)])continue;
         const Node& node = m->nodes[size_t(n)];
         if (node.mesh < 0) continue;
         ++modelStats_.nodes;
@@ -1494,6 +1506,13 @@ void Renderer3D::drawModel(const ModelDraw& d) {
                             baseHasMorph && morphWeightsBounded &&
                             morphMappingsReady;
         const mat4 nodeWorld = cache ? cache->transforms[size_t(n)] : d.world * world[size_t(n)];
+        int bspCluster = -1;
+        if (m->bspVisibility && node.mesh == 0 && modelCullingEnabled_ && !cam_.ortho &&
+            !unboundedDisplacement && !customVertexStream && !d.baked) {
+            const float3 localEye = nodeWorld.inverse().transformPoint(camPos_);
+            if (length(nodeWorld.transformPoint(localEye) - camPos_) < 0.01f)
+                bspCluster = m->bspVisibility->cameraCluster(localEye);
+        }
         bool nodeView = inView, nodeShadow = inShadow;
         if (rigid && modelCullingEnabled_) {
             nodeView = inView && modelBoxVisible(viewProj_ * nodeWorld, baseMesh.boundsMin-margin, baseMesh.boundsMax+margin);
@@ -1512,7 +1531,7 @@ void Renderer3D::drawModel(const ModelDraw& d) {
                                  d.variant < 0 && !d.nodeMaterial;
         // CPU-owned rigid scenery only. GPU-authored packets retain their own
         // mesh/primitive identities and never borrow a second shadow LOD.
-        const bool independentLod=m->batching.independentShadowLod&&rigid&&lodEligible&&!m->geometry&&
+        const bool independentLod=!techniques&&m->batching.independentShadowLod&&rigid&&lodEligible&&!m->geometry&&
             !d.gpuIndexed.valid()&&d.gpuIndexedPrimitives.empty()&&d.gpuShadowPrimitives.empty();
         int shadowLodMesh=node.mesh;
         if (modelLodEnabled_ && lodEligible) {
@@ -1568,7 +1587,7 @@ void Renderer3D::drawModel(const ModelDraw& d) {
                     : std::numeric_limits<float>::infinity();
             }
             const bool opaque = d.tint.w>=.99f && d.dissolve<=0 && !transparentItem(d.flags) &&
-                std::none_of(mats.begin(),mats.end(),[](const Material& mat){return mat.alpha==AlphaMode::Blend || mat.transparent;});
+                std::none_of(mats.begin(),mats.end(),[](const Material& mat){return alphaBlended(mat.alpha) || mat.transparent;});
             const float fadeWidth = opaque && !m->geometry && matQuality_!=MaterialQuality::Low ? modelLodFadeWidth_ : 0;
             lodBlend=d.lodLevel>=0?forcedModelLod(node.mesh,baseMesh.lods,d.lodLevel)
                                    :selectModelLod(node.mesh,baseMesh.lods,pixels,fadeWidth);
@@ -1631,16 +1650,19 @@ void Renderer3D::drawModel(const ModelDraw& d) {
         const bool gpuPacketSource = d.gpuIndexed.valid() ||
                                      !d.gpuIndexedPrimitives.empty() ||
                                      !d.gpuShadowPrimitives.empty();
-        const bool shadowBatch = !customVertexStream && d.primitiveMaterialFilter < 0 && !d.materialMask &&
+        const bool shadowBatch = !techniques && !customVertexStream && d.primitiveMaterialFilter < 0 && !d.materialMask &&
                                  !gpuPacketSource && !m->geometry &&
                                  !d.nodeMaterial && d.variant < 0 &&
                                  shadowBatchCompatible(drawMesh,mats);
         std::vector<const MaterialBatch*> colourBatches;
-        if (!customVertexStream && !shadowOnly && d.primitiveMaterialFilter < 0 && !d.materialMask && !gpuPacketSource &&
+        if (bspCluster < 0 && !techniques && !customVertexStream && !shadowOnly && d.primitiveMaterialFilter < 0 && !d.materialMask && !gpuPacketSource &&
             !m->geometry && !d.nodeMaterial &&
             d.variant < 0 && d.tint.w >= .99f && !transparentItem(d.flags))
             for (const auto& batch : drawMesh.materialBatches)
                 if (materialBatchCompatible(drawMesh, batch, mats)) colourBatches.push_back(&batch);
+        const double techniqueDistance = techniques
+            ? length(nodeWorld.transformPoint((baseMesh.boundsMin + baseMesh.boundsMax) * 0.5f) - camPos_)
+            : 0.0;
         auto addItem = [&](const Primitive& p, uint8_t shadowRole, uint8_t materialRole = 0,
                            uint32_t originalPrimitive=UINT32_MAX) {
             if(shadowOnly) {
@@ -1652,7 +1674,7 @@ void Renderer3D::drawModel(const ModelDraw& d) {
                  p.material != d.primitiveMaterialFilter)) return;
             if (d.materialMask && (p.material < 0 || size_t(p.material) >= d.materialMask->size() ||
                                    !(*d.materialMask)[size_t(p.material)])) return;
-            int mi = p.material;
+            int mi = techniques ? m->materialTechniques.select(p.material, techniqueDistance, techniqueCaps, materialScheme_) : p.material;
             if (d.variant >= 0 && d.variant < int(p.variantMaterial.size()) && p.variantMaterial[size_t(d.variant)] >= 0) mi = p.variantMaterial[size_t(d.variant)];
             if (d.nodeMaterial && size_t(n) < d.nodeMaterial->size() && (*d.nodeMaterial)[size_t(n)] >= 0 && &mats == d.materials) mi = (*d.nodeMaterial)[size_t(n)];
             ModelItem it;
@@ -1669,7 +1691,7 @@ void Renderer3D::drawModel(const ModelDraw& d) {
             // ModelItem list. Mesh/material identities come from original
             // primitives, not from the atomic GPU output order. CPU batch
             // proxies and alternate authored LODs never borrow a packet.
-            if(shadowRole!=2 && materialRole==0 && part==0) {
+            if(!techniques && shadowRole!=2 && materialRole==0 && part==0) {
                 if(!d.gpuIndexedPrimitives.empty()) {
                     const uint32_t primitiveId=uint32_t(
                         &p-drawMesh.primitives.data());
@@ -1748,13 +1770,16 @@ void Renderer3D::drawModel(const ModelDraw& d) {
             it.model = m; it.prim = &p; it.materialIndex = materialIndex;
             it.mat = &mats[size_t(materialIndex)];
             it.vertexOverride = customVertexStream ? d.vertexOverride : gfx::BufferHandle{};
-            it.tint = d.tint; it.team = d.team; it.flash = d.flash; it.flags = d.flags | (mats[size_t(std::clamp(mi, 0, int(mats.size()) - 1))].transparent ? uint32_t(kDrawTransparent) : 0u);
+            it.tint = d.tint; it.team = d.team; it.flash = d.flash; it.flashColor = d.flashColor; it.flags = d.flags | (mats[size_t(std::clamp(mi, 0, int(mats.size()) - 1))].transparent ? uint32_t(kDrawTransparent) : 0u);
             it.dissolve = d.dissolve; it.teamGlow = d.teamGlow; it.outline = d.outline;
             it.rigid = rigid;
             it.motionPersistentId = d.persistentId;
             it.motionNodeIndex = n;
-            it.castShadow = !(d.flags & kDrawNoCastShadow) && (d.tint.w >= 0.99f || (d.flags & kDrawKeepShadow)) && d.dissolve <= 0 && it.mat->castShadow && it.mat->alpha != AlphaMode::Blend && !transparentItem(it.flags);
-            it.inView = nodeView && !shadowOnly; it.inShadow = nodeShadow && it.castShadow && (shadowOnly||!separateShadow);
+            it.castShadow = !(d.flags & kDrawNoCastShadow) && (d.tint.w >= 0.99f || (d.flags & kDrawKeepShadow)) && d.dissolve <= 0 && it.mat->castShadow && !alphaBlended(it.mat->alpha) && !transparentItem(it.flags);
+            it.inView = nodeView && !shadowOnly &&
+                (bspCluster < 0 || meshIndex != node.mesh ||
+                 m->bspVisibility->visible(bspCluster, originalPrimitive));
+            it.inShadow = nodeShadow && it.castShadow && (shadowOnly||!separateShadow);
             it.joints = -1; it.baked = false; it.anim = anim; it.morph = -1;
             const bool skinnedPrim = node.skin >= 0 && !p.jointPalette.empty();
             if (skinnedPrim && canBake && node.skin == m->baked.skin) {
@@ -1933,7 +1958,7 @@ Renderer3D::ModelViewProvenance Renderer3D::modelViewProvenance(
         primitive.skinning=it.joints>=0;
         primitive.baked=it.baked;
         primitive.shaderVertexOffset=it.displacedVertexSource;
-        primitive.translucent=it.mat->alpha==AlphaMode::Blend ||
+        primitive.translucent=alphaBlended(it.mat->alpha) ||
             it.mat->transparent || it.tint.w<0.99f ||
             transparentItem(it.flags);
         primitive.customGpuStream=it.vertexOverride.valid();
@@ -2000,7 +2025,7 @@ void Renderer3D::recordModelSubmission(
     p.skinning=it.joints>=0;
     p.baked=it.baked;
     p.shaderVertexOffset=it.displacedVertexSource;
-    p.translucent=it.mat->alpha==AlphaMode::Blend ||
+    p.translucent=alphaBlended(it.mat->alpha) ||
         it.mat->transparent || it.tint.w<0.99f ||
         transparentItem(it.flags);
     p.customGpuStream=it.vertexOverride.valid();
@@ -2039,6 +2064,7 @@ void Renderer3D::packModelInstance(const ModelItem& x, int phase,
     // Two spare floats in the existing 144-byte Inst slot (vec4 lod).
     // Per-instance palette mode uses z; normal LOD and GI keep xy/anim.
     d[34] = float(instanceMaterial);
+    d[35] = float(x.flashColor); // RGB8 + 1 is exactly representable in float32.
 }
 
 bool Renderer3D::drawModelBatch(const uint32_t* items, uint32_t count,
@@ -2086,8 +2112,8 @@ bool Renderer3D::drawModelBatch(const uint32_t* items, uint32_t count,
     // changed the texture/uniform state. Always refresh this opt-in borrow.
     const Material& mt = *it.mat;
     const auto* candidateGraph=mt.shaderGraph&&int(matQuality_)>=mt.shaderGraph->minQuality?mt.shaderGraph.get():nullptr;
-    const bool availableAlphaR8=mt.alpha==AlphaMode::Mask&&(phase!=3||selectionMaskPass_)&&mt.baseTex>=0&&
-        size_t(mt.baseTex)<it.model->images.size()&&it.model->images[size_t(mt.baseTex)].virtualAlphaMask.valid();
+    const bool availableAlphaR8=mt.alpha==AlphaMode::Mask&&(phase!=3||selectionMaskPass_)&&
+        resolvedMaterialAlphaCoverage(*it.model,mt).valid();
     const bool materialPalette=phase==1&&(instancePalette||it.paletteMaterials);
     const bool allowVirtual=(phase==1||phase==2)&&!materialPalette;
     const bool dynamicGi=(phase==1||phase==2)&&dynamicGiAtlas_.valid();
@@ -2097,6 +2123,10 @@ bool Renderer3D::drawModelBatch(const uint32_t* items, uint32_t count,
         candidateGraph!=nullptr,candidateGraph&&candidateGraph->usesVirtualTexture,availableVirtual,dynamicGi,availableAlphaR8,allowVirtual);
     const auto* activeGraph=sampling.graph?candidateGraph:nullptr;
     const bool drawVt=sampling.virtualTexture;
+    if((phase==1||phase==2)&&modelEnvironment_.valid()){
+        const float params[4]={modelEnvironmentRotation_,modelEnvironmentIntensity_,0.f,0.f};
+        dev_->setUniforms(6,params,sizeof params);dev_->setTexture(13,modelEnvironment_);
+    }
     const int atlasSlot=sampling.atlasSlot,tableSlot=sampling.tableSlot;
     if(dynamicGi) {
         dev_->setUniforms(drawVt?7:6,dynamicGiUniforms_.data(),dynamicGiUniforms_.size()*sizeof(float));
@@ -2153,7 +2183,7 @@ bool Renderer3D::drawModelBatch(const uint32_t* items, uint32_t count,
     const bool actorRevealChanged = lastItem_ &&
         ((lastItem_->flags ^ it.flags) & kDrawActorReveal) != 0;
     if (materialStateChanged || actorRevealChanged) {
-        ModelMaterialUniforms mu=packModelMaterialU2(mt);
+        ModelMaterialUniforms mu=packModelMaterialU2(mt,resolvedLinearEmissive(*it.model,mt),resolvedLinearBaseColor(*it.model,mt),resolvedBc5Normal(*it.model,mt));
         if (phase != 0 && geometryMainView_ && (it.flags & kDrawActorReveal) && actorReveal.w > 0) {
             mu.reveal[0]=actorReveal.x;mu.reveal[1]=actorReveal.y;mu.reveal[2]=actorReveal.z;mu.reveal[3]=actorReveal.w;
             const float3 centre{actorReveal.x,actorReveal.y,actorReveal.z};
@@ -2165,23 +2195,22 @@ bool Renderer3D::drawModelBatch(const uint32_t* items, uint32_t count,
     }
     if (materialStateChanged || newModel) {
         const int graphTextureSlot=sampling.graphSlot;
-        auto tex = [&](int idx, gfx::TextureHandle def) {
-            return idx >= 0 && idx < int(it.model->images.size()) && it.model->images[size_t(idx)].tex.valid() ? it.model->images[size_t(idx)].tex : def;
+        auto tex = [&](int Material::* slot,gfx::TextureHandle def){
+            return resolvedMaterialTexture(*it.model,mt,slot,def);
         };
-        dev_->setTexture(1, tex(mt.baseTex, white_));
-        if (mt.alpha == AlphaMode::Mask && mt.baseTex >= 0 &&
-            size_t(mt.baseTex) < it.model->images.size() &&
-            sampling.alphaR8) {
-            const auto coverage = it.model->images[size_t(mt.baseTex)].virtualAlphaMask;
-            if (coverage.valid()) dev_->setTexture(15,coverage);
+        dev_->setTexture(1,tex(&Material::baseTex,white_));
+        if(mt.alpha==AlphaMode::Mask&&sampling.alphaR8){
+            const auto coverage=resolvedMaterialAlphaCoverage(*it.model,mt);
+            if(coverage.valid())dev_->setTexture(15,coverage);
         }
-        if(activeGraph)for(size_t i=0;i<activeGraph->textures.size();++i)dev_->setTexture(graphTextureSlot+int(i),tex(mt.graphTextures[i],white_));
-        if (phase != 0) {
-            dev_->setTexture(2, tex(mt.mrTex, white_));
-            dev_->setTexture(3, tex(mt.normalTex, flatNormal_));
-            dev_->setTexture(4, tex(mt.occlusionTex, white_));
-            dev_->setTexture(5, tex(mt.emissiveTex, white_));
-            dev_->setTexture(6, tex(mt.teamTex, black_));
+        if(activeGraph)for(size_t i=0;i<activeGraph->textures.size();++i)
+            dev_->setTexture(graphTextureSlot+int(i),resolvedGraphSourceTexture(*it.model,mt,i,white_));
+        if(phase!=0){
+            dev_->setTexture(2,tex(&Material::mrTex,white_));
+            dev_->setTexture(3,tex(&Material::normalTex,flatNormal_));
+            dev_->setTexture(4,tex(&Material::occlusionTex,white_));
+            dev_->setTexture(5,tex(&Material::emissiveTex,white_));
+            dev_->setTexture(6,tex(&Material::teamTex,black_));
         }
     }
     // Resolve every submission, not just on material pointer changes:
@@ -2660,7 +2689,7 @@ void Renderer3D::prepareGpuModelDraws() {
         const char* flag = std::getenv("AIVERSE_GPU_AUTHORED_DRAWS");
         return flag && std::strcmp(flag, "1") == 0;
     }();
-    if (!enabled || !gpuAuthoredDrawEnabled_ || !modelMultiDrawEnabled_ || !dev_ ||
+    if (modelEnvironment_.valid() || !enabled || !gpuAuthoredDrawEnabled_ || !modelMultiDrawEnabled_ || !dev_ ||
         dev_->info().backend != gfx::Backend::Metal ||
         !dev_->supportsCompute() || !dev_->frameSerial()) return;
 
@@ -2708,9 +2737,7 @@ void Renderer3D::prepareGpuModelDraws() {
         // GPU PBR ICB supports opaque models and masked models whose
         // exact R8 alpha is bound at tex15 in the argument buffer.
         // Other alpha materials keep their ordinary CPU path.
-        const bool alphaCoverage = it.mat->baseTex >= 0 &&
-            size_t(it.mat->baseTex) < it.model->images.size() &&
-            it.model->images[size_t(it.mat->baseTex)].virtualAlphaMask.valid();
+        const bool alphaCoverage=resolvedMaterialAlphaCoverage(*it.model,*it.mat).valid();
         if (it.mat->alpha != AlphaMode::Opaque &&
             !(it.mat->alpha == AlphaMode::Mask && alphaCoverage))
             continue;
@@ -3132,17 +3159,14 @@ void Renderer3D::prepareGpuModelDraws() {
                         virtualDescriptor.params[1]=binding.gutterPixels;
                         virtualDescriptor.params[2]=float(uint32_t(binding.addressU));
                         virtualDescriptor.params[3]=float(uint32_t(binding.addressV));
-                        if (item.mat->alpha==AlphaMode::Mask &&
-                            item.mat->baseTex>=0 &&
-                            size_t(item.mat->baseTex)<item.model->images.size())
-                            virtualDescriptor.alphaCoverage=item.model->images[
-                                size_t(item.mat->baseTex)].virtualAlphaMask;
+                        if(item.mat->alpha==AlphaMode::Mask)
+                            virtualDescriptor.alphaCoverage=resolvedMaterialAlphaCoverage(*item.model,*item.mat);
                     }
                     gfx::GpuIcbPbrMaterial ordinaryDescriptor;
                     if (pbrMode) {
                         const auto textures=gpuPbrSourceTextures(
                             *item.model,*item.mat,white_,black_,flatNormal_);
-                        const auto u2=packGpuPbrMaterialU2(*item.mat);
+                        const auto u2=packGpuPbrMaterialU2(*item.mat,resolvedLinearEmissive(*item.model,*item.mat),resolvedLinearBaseColor(*item.model,*item.mat),resolvedBc5Normal(*item.model,*item.mat));
                         std::memcpy(ordinaryDescriptor.u2.data(),&u2,sizeof(u2));
                         ordinaryDescriptor.textures=textures;
                         if (item.mat->shaderGraph) {
@@ -3247,11 +3271,8 @@ void Renderer3D::prepareGpuModelDraws() {
                 group.usesVirtualTexture = vtEnabled[indices[first]] != 0;
                 group.virtualTexture = vtBindings[indices[first]];
                 const auto& firstModel = modelItems_[indices[first]];
-                if (firstModel.mat->alpha == AlphaMode::Mask &&
-                    firstModel.mat->baseTex >= 0 &&
-                    size_t(firstModel.mat->baseTex) < firstModel.model->images.size())
-                    group.alphaCoverage = firstModel.model->images[
-                        size_t(firstModel.mat->baseTex)].virtualAlphaMask;
+                if(firstModel.mat->alpha==AlphaMode::Mask)
+                    group.alphaCoverage=resolvedMaterialAlphaCoverage(*firstModel.model,*firstModel.mat);
                 if (materialMode || pbrMode) {
                     // First ticket is retained for legacy introspection;
                     // execution validates every per-item resource snapshot.
@@ -3443,7 +3464,7 @@ void Renderer3D::renderModels(int phase) {
     auto started=profiling_?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
     for (uint32_t i = 0; i < modelItems_.size(); ++i) {
         const ModelItem& it = modelItems_[i];
-        const bool blended = it.mat->alpha == AlphaMode::Blend || it.tint.w < 0.99f || transparentItem(it.flags);
+        const bool blended = alphaBlended(it.mat->alpha) || it.tint.w < 0.99f || transparentItem(it.flags);
         bool visible = it.inView, shadow = it.inShadow;
         if (auxiliaryModelPass_ && it.rigid && modelCullingEnabled_) {
             visible = modelBoxVisible(viewProj_ * it.world, it.prim->boundsMin, it.prim->boundsMax);
@@ -3890,7 +3911,7 @@ void Renderer3D::renderModels(int phase) {
         const ModelItem& x = modelItems_[xIndex];
         const ModelItem& y = modelItems_[yIndex];
         if((x.lodThreshold<1 || x.lodInvert)!=(y.lodThreshold<1 || y.lodInvert))return false;
-        const bool bx = x.mat->alpha == AlphaMode::Blend || x.tint.w < 0.99f, by = y.mat->alpha == AlphaMode::Blend || y.tint.w < 0.99f;
+        const bool bx = alphaBlended(x.mat->alpha) || x.tint.w < 0.99f, by = alphaBlended(y.mat->alpha) || y.tint.w < 0.99f;
         return x.paletteMaterials == y.paletteMaterials && x.prim == y.prim &&
                materialGroup[xIndex] == materialGroup[yIndex] && x.baked == y.baked && bx == by && x.gi == y.gi && x.lmPage == y.lmPage &&
                (x.flags & (kDrawFadeDepth | kDrawTransparent | kDrawActorReveal)) == (y.flags & (kDrawFadeDepth | kDrawTransparent | kDrawActorReveal));
@@ -4001,10 +4022,8 @@ void Renderer3D::renderModels(int phase) {
                 const bool usesVt=resolveModelVirtualTexture(
                     *item.model,*item.mat,current);
                 gfx::TextureHandle alpha;
-                if (item.mat->alpha == AlphaMode::Mask &&
-                    item.mat->baseTex >= 0 &&
-                    size_t(item.mat->baseTex) < item.model->images.size())
-                    alpha=item.model->images[size_t(item.mat->baseTex)].virtualAlphaMask;
+                if(item.mat->alpha==AlphaMode::Mask)
+                    alpha=resolvedMaterialAlphaCoverage(*item.model,*item.mat);
                 GpuMaterialResourceBinding live;
                 live.virtualTextureEnabled = usesVt;
                 if (usesVt) live.virtualTexture = current;
@@ -4026,7 +4045,7 @@ void Renderer3D::renderModels(int phase) {
                     live.pbrEnabled=true;
                     live.pbrTextures=gpuPbrSourceTextures(
                         *item.model,*item.mat,white_,black_,flatNormal_);
-                    const auto u2=packGpuPbrMaterialU2(*item.mat);
+                    const auto u2=packGpuPbrMaterialU2(*item.mat,resolvedLinearEmissive(*item.model,*item.mat),resolvedLinearBaseColor(*item.model,*item.mat),resolvedBc5Normal(*item.model,*item.mat));
                     std::memcpy(live.pbrU2.data(),&u2,sizeof(u2));
                     if (item.mat->shaderGraph) {
                         live.graphTextureCount=uint32_t(

@@ -20,6 +20,7 @@
 //   * vertex buffer: one interleaved stream; GLSL attribute location = VertexAttr::location,
 //     MSL [[attribute(location)]] via [[stage_in]] at buffer(0).
 #pragma once
+#include "BufferTextureCopy.h"
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -31,6 +32,7 @@
 #include <string>
 #include <vector>
 #include "engine/gfx/GpuTimingRouter.h"
+#include "engine/gfx/GpuAllocationBudget.h"
 
 namespace aiverse::gfx {
 
@@ -47,7 +49,7 @@ using ShaderHandle = Handle<struct ShaderTag>;
 using ComputeHandle = Handle<struct ComputeTag>;
 using PipelineHandle = Handle<struct PipelineTag>;
 
-enum class Backend { Metal, GLES3, GL33, Vulkan };
+enum class Backend { Metal, GLES3, GL33, Vulkan, Cpu, Direct3D9, Direct3D11 };
 // Pending != failed: a renderer must never infer GPU fence failure
 // from normal in-flight work or elapsed frame counters.
 enum class ResourceRetirementStatus : uint8_t {
@@ -123,7 +125,7 @@ enum class VertexFormat { Float2, Float3, Float4, UByte4N, UByte4 }; // UByte4: 
 enum class IndexType { None, UInt16, UInt32 };
 enum class Primitive { Triangles, Lines };
 enum class CullMode { None, Back, Front };
-enum class BlendMode { Opaque, Alpha, Additive, Premultiplied, Multiply, Subtract, Screen };
+enum class BlendMode { Opaque, Alpha, Additive, Premultiplied, Multiply, Subtract, Screen, AdditiveUnweighted };
 // Premultiplied: ONE, 1-srcAlpha. Multiply: dst * src colour. Subtract: dst - src * srcAlpha (reverse subtract). (particles)
 // Screen: src + dst * (1 - src colour) for premultiplied colour, alpha as Premultiplied (Spine "screen" slots)
 
@@ -567,6 +569,8 @@ inline size_t estimateTextureFootprint(const TextureDesc& d) {
 }
 
 // Each backend picks the sources it understands. A shader may provide all of them.
+// CPU shader contract: locations 0 and 1 are float4 clip position and RGBA.
+enum class CpuShader { None, ClipColor, ClipColorTexture };
 struct ShaderDesc {
     const char* glslVertex = nullptr;   // GLSL ES 3.00 body WITHOUT #version line (added by backend)
     const char* glslFragment = nullptr;
@@ -575,17 +579,22 @@ struct ShaderDesc {
     int uniformSlots = 1;               // number of uniform blocks (U0..)
     const char* label = nullptr;
     bool linearTarget = false; // internal variant: AIVERSE_HDR=1, selected for RGBA16F passes
+    CpuShader cpu = CpuShader::None;
+    // Native Direct3D source with vs_main and ps_main. Input TEXCOORDn maps to attribute location n.
+    const char* hlsl9 = nullptr;  // vs_3_0 / ps_3_0
+    const char* hlsl11 = nullptr; // vs_4_0 / ps_4_0
 };
 
 // Vulkan shader resource ABI. Other backends keep their native slot contracts.
 // TextureResources: storage images 0..3, sampled images 4..11, buffers 12..15,
 // uniform buffer 16. BufferPushConstants: buffers 0..7, <=128 push bytes.
-enum class VulkanComputeLayout : uint8_t { TextureResources, BufferPushConstants };
+enum class VulkanComputeLayout : uint8_t { TextureResources, BufferPushConstants, StorageUniforms };
 struct ComputeDesc {
     const char* msl=nullptr;
     const char* glsl=nullptr;
     const char* label=nullptr;
     VulkanComputeLayout vulkanLayout=VulkanComputeLayout::TextureResources;
+    uint32_t storageUniformSlots=19; // slots [0,N), binding 8 reserved for uniform block
 };
 
 struct VertexAttr {
@@ -620,6 +629,7 @@ struct PipelineDesc {
     PixelFormat additionalColorFormats[3] = {
         PixelFormat::RGBA8, PixelFormat::RGBA8, PixelFormat::RGBA8
     };
+    bool vertexPerInstance=false; // optional single binding instance-rate stream
 };
 
 // Default: render to the screen. With targets: render into textures (both must match in size).
@@ -727,7 +737,34 @@ inline VulkanExtensionRequests& vulkanExtensionRequests() { static VulkanExtensi
 
 class Device {
 public:
-    virtual ~Device() = default;
+    virtual ~Device() {if(allocationBudget_)allocationBudget_->closeDevice(this);}
+    // One render-owner-thread ledger for presentation clients that opt into
+    // envelope accounting. Independent worlds cannot bypass the same limit.
+    // Zero inherits; nonzero conflicting limits are rejected. Explicit budget
+    // adoption is allowed only before use or after an unowned idle ledger.
+    std::shared_ptr<GpuAllocationBudget> acquireGpuAllocationBudget(
+        std::shared_ptr<GpuAllocationBudget> requested={},size_t limit=0){
+        if(allocationBudget_)allocationBudget_->collect(gpuCompletedFence());
+        if(requested&&allocationBudget_&&requested!=allocationBudget_){
+            if(allocationBudget_.use_count()!=1||allocationBudget_->stats().charged()!=0)return {};
+            if(!requested->bind(this)||(limit&&requested->stats().limit&&requested->stats().limit!=limit))return {};
+            allocationBudget_->closeDevice(this);allocationBudget_.reset();
+        }
+        if(!allocationBudget_){
+            auto candidate=requested?requested:std::make_shared<GpuAllocationBudget>(limit);
+            if(!candidate->bind(this)||(limit&&candidate->stats().limit&&candidate->stats().limit!=limit))return {};
+            allocationBudget_=std::move(candidate);
+        }
+        if(limit){
+            if(allocationBudget_->stats().limit&&allocationBudget_->stats().limit!=limit)return {};
+            allocationBudget_->setLimit(limit);
+        }
+        return allocationBudget_;
+    }
+    // Separate headroom for temporary upload/readback buffers. Zero unlimited;
+    // lowering below outstanding usage denies new transfers until completion.
+    void setGpuTransferBudget(size_t bytes){transferBudget_.setLimit(bytes);}
+    GpuAllocationBudgetStats gpuTransferBudgetStats(){return transientGpuBudget().stats();}
     // One shared timing collection owner per graphics Device. Components
     // subscribe instead of independently draining takeGpuTimings().
     // All router calls remain on this Device's render owner thread.
@@ -758,6 +795,11 @@ public:
     virtual bool updateStorageBufferChecked(BufferHandle,const void*,size_t,size_t=0) {
         return false;
     }
+    // Ordered GPU-to-GPU storage copy in the current frame, outside encoders.
+    // Both resources must survive encoded work even if handles are retired.
+    // True is encode acceptance, not completion. Unsupported backends refuse.
+    virtual bool supportsStorageBufferCopy() const { return false; }
+    virtual bool copyStorageBufferChecked(BufferHandle,BufferHandle,size_t,size_t=0,size_t=0) { return false; }
     virtual void destroyBuffer(BufferHandle h) = 0;
     // Optional per-buffer diagnostics. No GPU stall/readback, and never
     // authoritatively measures GPU memory bandwidth or execution.
@@ -785,6 +827,17 @@ public:
     virtual SamplerHandle createSampler(const SamplerDesc&) { return {}; }
     virtual void destroySampler(SamplerHandle) {}
     virtual bool updateTextureRegion(TextureHandle, const TextureUploadDesc&) { return false; }
+    // Optional GPU-only transfer: copy the full level zero of an ordinary,
+    // RGBA8/RGBA8_sRGB or RGBA16F/RGBA32F 2D sampled texture from a Storage buffer.
+    // RGBA16F mip generation requires explicit backend capability; RGBA32F is single mip. A requested
+    // full mip chain must be allocated for generation; reject incomplete chains.
+    // Inside a recording frame, outside encoders. Raw bytes, no conversion.
+    // Source offset/row pitch follow BufferTextureCopy2D. Caller keeps both
+    // resources live until the covering GPU fence has actually completed.
+    // True means encoded, not completed. Unsupported devices do no work.
+    virtual bool supportsStorageBufferTextureCopy() const { return false; }
+    virtual bool supportsHdrTextureMipGeneration(PixelFormat) const { return false; }
+    virtual bool copyStorageBufferToTexture2D(BufferHandle,TextureHandle,const BufferTextureCopy2D&) { return false; }
     virtual bool bindTextureView(int, TextureViewHandle, SamplerHandle = {}) { return false; }
     // CPU-only RHI metadata lookup; no readback, synchronization or texture
     // sampling. Unsupported providers return false and leave out unchanged.
@@ -802,6 +855,10 @@ public:
     // GLSL defines put after #version / precision of every GL shader compiled from now on (GL backend only;
     // others ignore it). Set before the renderers create their pipelines.
     virtual void setGlslPrelude(const std::string& defines) { (void)defines; }
+    // Opt-in: createShader returns at once and the backend compiles the program when a pipeline using it is
+    // first bound or warmed (GL backend; others ignore it). Compile errors then surface at that point: the draw
+    // is skipped, lastError() and stderr name the shader, warmPipelineColorStatus reports Failed.
+    virtual void setDeferredShaderBuild(bool on) { (void)on; }
     virtual ShaderHandle createShader(const ShaderDesc& d) = 0;   // returns invalid handle on failure (see lastError())
     // Start on the device thread, then poll on that same thread. Jobs must not outlive
     // the device. Dropping a job cancels publication; backend callbacks own their data.
@@ -834,8 +891,8 @@ public:
     // live TextureHandles only (not swapchain internals); estimate is not a
     // driver allocation query. Query on the graphics device owner thread.
     virtual std::vector<TextureResourceInfo> textureResources() const { return {}; }
-    // Copies the colour of a render target (invalid = the screen as drawn so far this frame) into `to`: an RGBA8
-    // render target of the same size. Only between passes. False when the backend can't (the screen is not
+    // Copies the colour of a render target (invalid = the screen as drawn so far this frame) into `to`:
+    // an RGBA8 target, or a matching RGBA16F HDR target where supported. Only between passes. False when the backend can't (the screen is not
     // readable: see setScreenReadable, sizes differ); the caller then takes another path.
     virtual bool copyColor(TextureHandle from, TextureHandle to) { (void)from; (void)to; return false; }
     // Optional diagnostics only: synchronously read a completed RGBA8 render
@@ -881,6 +938,7 @@ public:
     // Storage buffers persist across frames; updateBuffer uploads in queue order.
     // Commands are between beginFrame/endFrame and outside render passes.
     virtual bool supportsCompute() const { return false; }
+    virtual bool supportsStorageUniformCompute(uint32_t) const {return false;}
     virtual ComputeHandle createCompute(const ComputeDesc&) { return {}; }
     virtual void destroyCompute(ComputeHandle) {}
     virtual bool beginCompute(ComputeHandle) { return false; }
@@ -903,6 +961,10 @@ public:
         dispatch(x,y);
         return gpuHealthy();
     }
+    // GPU-authored three uint32 threadgroup counts, ordered by compute barriers.
+    // Backend fixes threadgroup size to 64 x 1 x 1, matching dispatch().
+    virtual bool supportsGpuComputeIndirect() const {return false;}
+    virtual bool dispatchGpuIndirect(BufferHandle,size_t=0){return false;}
     virtual void endCompute() {}
     // True only when the latest dispatch was successfully encoded; not GPU completion.
     virtual bool computeDispatchSucceeded() const { return false; }
@@ -1024,10 +1086,18 @@ public:
 
     // Frame (driven by the platform layer)
     virtual void beginFrame(int framebufferWidth, int framebufferHeight) = 0;
-    virtual void endFrame() = 0; // presents
+    // Optional command frame without swapchain acquire/present for native tools.
+    // Same device and owner thread; successful begin must be paired with endFrame.
+    virtual bool supportsOffscreenFrames() const { return false; }
+    virtual bool beginOffscreenFrame() { return false; }
+    virtual void endFrame() = 0; // presents if a drawable was acquired
     // Tools (editor screenshots, MCP): deliver the next presented frame as top-down RGBA8.
     // The callback may run one or two frames later; it always runs on the main thread.
     using CaptureFn = std::function<void(int w, int h, std::vector<uint8_t> rgba)>;
+    using TaggedCaptureFn = std::function<void(uint64_t frame,int w,int h,std::vector<uint8_t> rgba)>;
+    virtual void captureNextFrameTagged(TaggedCaptureFn fn) {
+        captureNextFrame([fn=std::move(fn)](int w,int h,std::vector<uint8_t> rgba){if(fn)fn(0,w,h,std::move(rgba));});
+    }
     virtual void captureNextFrame(CaptureFn fn) { if (fn) fn(0, 0, {}); }
     // Optional offscreen RGBA8 readback inside a frame but outside a pass.
     virtual bool captureTexture(TextureHandle source,CaptureFn callback) {
@@ -1145,14 +1215,20 @@ public:
     }
 
 protected:
+    GpuAllocationBudget& transientGpuBudget(){
+        transferBudget_.collect(gpuCompletedFence());return transferBudget_;
+    }
     int fbW_ = 0, fbH_ = 0;
 private:
     GpuTimingRouter gpuTimingRouter_{};
+    std::shared_ptr<GpuAllocationBudget> allocationBudget_;
+    GpuAllocationBudget transferBudget_{};
 };
 
 // Backend factories. `nativeSurface` is backend specific:
 //   Metal: CAMetalLayer*   GL: nullptr (context must be current on the calling thread)
 std::unique_ptr<Device> createMetalDevice(void* nativeSurface);
 std::unique_ptr<Device> createGLDevice(Backend glFlavor);
+std::unique_ptr<Device> createCpuDevice(); // headless, top-down RGBA8
 
 } // namespace aiverse::gfx

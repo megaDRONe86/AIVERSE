@@ -1,12 +1,17 @@
 #include "ModelingOps.h"
 #include "Workspace.h"
+#include "PhysisNatureCommandSchema.h"
+#include "StudioPlayTools.h"
+#include <aiverselib/runtime/WorkBudget.h>
 #include "ShaderGraphOps.h"
+#include "GraphOps.h"
+#include "FeatureGateOps.h"
 #include "AnimationOps.h"
 #include "GeometryOps.h"
 #include "engine/actor/ActorModule.h"
 #include "ScenarioOps.h"
 #include "SchemaOps.h"
-namespace aiverse::editor { void registerFpsOps(Workspace& ws); }
+namespace aiverse::editor { void registerFpsOps(Workspace& ws); void registerWorldPersistenceOps(Workspace& ws); }
 #ifdef AIVERSE_BATTLE_OPS
 namespace aiverse::editor { void registerBattleNetOps(Workspace& ws); }   // agent-net-mobile
 #endif
@@ -42,10 +47,13 @@ namespace aiverse::editor { void registerPhysisOps(Workspace&); }
 #include "NativeBuildOps.h"
 #include "Projects.h"
 #include "ProjectFile.h"
+#include "ProjectFileEdits.h"
+#include "ProjectHistoryPersistence.h"
 #include <algorithm>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
@@ -121,12 +129,6 @@ bool erasePath(Json& j, const std::string& path) {
     if (last.index >= 0) { if (!parent->isArray() || size_t(last.index) >= parent->size()) return false; parent->eraseAt(size_t(last.index)); return true; }
     return parent->erase(last.key);
 }
-bool writeText(const std::string& f, const std::string& text, std::string* err) {
-    std::ofstream out(f, std::ios::binary);
-    if (!out) { if (err) *err = "cannot write " + f; return false; }
-    out << text;
-    return bool(out);
-}
 Json ok(Json extra = Json::object()) { extra.set("ok", Json::fromBool(true)); return extra; }
 Json str(const std::string& s) { return Json::string(s); }
 Json num(double v) { return Json::number(v, 3); }
@@ -173,9 +175,16 @@ std::string Project::rulesPath() const { return dir + "/" + manifest.getStr("rul
 
 bool Project::load(const std::string& d, std::string* err) {
     try {
-        Json m = Json::parseFile(d + "/game.json");
+        recoverProjectFileEdits(d);
+        if(fs::exists(fs::path(d)/".aiverse-cache"/"studio-history-batch"))
+            throw std::runtime_error("Pending coordinated asset history recovery; open in native Studio");
+        auto manifestText = readProjectFileBytes(fs::path(d)/"game.json");
+        Json m;
+        try {m=Json::parse(manifestText);}
+        catch(const JsonError& e){throw JsonError(d+"/game.json: "+e.what());}
         JsonOrigin origin;
         Json r = composeJson(d + "/" + m.getStr("rules", "rules.json"), fileReader(), &origin);
+        auto rawRulesText=origin.text;
         {   // what saveRules would write for each file now: a save rewrites only the files an edit changed
             auto parts = splitComposed(r, origin);
             for (size_t i = 0; i < parts.size(); ++i) origin.text[i] = parts[i].second.dump() + "\n";
@@ -183,8 +192,22 @@ bool Project::load(const std::string& d, std::string* err) {
         game::Rules parsed;
         if(m.getStr("module", "game")=="actor")actor::readConfig(r);else parsed=game::loadRules(r);   // == actorSession() of the manifest being loaded
         dir = d; manifest = std::move(m); rulesJson = std::move(r); rulesOrigin = std::move(origin); rules = std::move(parsed);
+        savedRulesText=std::move(rawRulesText);savedManifestText=std::move(manifestText);
         rulesError.clear();
         rulesDirty = manifestDirty = false;
+        documentHistory=ProjectHistory{};historyRequiresReload=false;
+        savedHistoryCheckpoint.reset();historyPersistenceWarning.clear();
+        try{
+            savedHistoryCheckpoint=readProjectHistoryCheckpoint(dir);
+            if(savedHistoryCheckpoint){
+                ProjectHistoryBaseline baseline;
+                const auto root=fs::canonical(dir);
+                baseline.emplace("game.json",*savedManifestText);
+                for(size_t i=0;i<rulesOrigin.files.size();++i)
+                    baseline.emplace(fs::canonical(rulesOrigin.files[i]).lexically_relative(root).generic_string(),savedRulesText.at(i));
+                documentHistory=decodeProjectHistory(dir,*savedHistoryCheckpoint,baseline);
+            }
+        }catch(const std::exception& e){historyPersistenceWarning=e.what();}
         return true;
     } catch (const std::exception& e) {
         if (err) *err = e.what();
@@ -195,18 +218,90 @@ bool Project::reloadRules() {
     try { if(actorSession()){actor::readConfig(rulesJson);rules=game::Rules{};}else rules = game::loadRules(rulesJson); rulesError.clear(); return true; }
     catch (const std::exception& e) { rulesError = e.what(); return false; }
 }
-bool Project::saveRules(std::string* err) {
-    if (rulesOrigin.files.empty()) rulesOrigin.files.push_back(rulesPath());
-    // every entry goes back to the file it came from; files whose content did not change are not touched
-    auto parts = splitComposed(rulesJson, rulesOrigin);
-    for (size_t i = 0; i < parts.size(); ++i) {
-        const std::string text = parts[i].second.dump() + "\n";
-        if (auto it = rulesOrigin.text.find(i); it != rulesOrigin.text.end() && it->second == text) continue;
-        if (!writeText(parts[i].first, text, err)) return false;
-        rulesOrigin.text[i] = text;
+void Project::applyHistoryTransaction(const std::vector<ProjectFileEdit>& edits,ProjectHistory next){
+    if(next.versionToken()==documentHistory.versionToken()){
+        applyProjectFileEdits(dir,edits);return;
     }
-    rulesDirty = false;
-    return true;
+    auto plan=edits;
+    auto checkpoint=prepareProjectHistoryCheckpoint(dir,savedHistoryCheckpoint,next);
+    // Initialization is a safe empty baseline, even if publication fails.
+    if(!savedHistoryCheckpoint)savedHistoryCheckpoint=checkpoint.before;
+    auto bytes=checkpoint.after;
+    plan.push_back(std::move(checkpoint));
+    applyProjectFileEdits(dir,plan);
+    documentHistory=std::move(next);savedHistoryCheckpoint=std::move(bytes);
+    historyPersistenceWarning.clear();
+}
+std::vector<ProjectFileEdit> Project::stageDirtySave(){
+    if(!rulesDirty&&!manifestDirty)return {};
+    if(dir.empty()||!savedManifestText)throw std::runtime_error("Project documents must be loaded before saving");
+    const auto previous=Json::parse(*savedManifestText);
+    const bool topology=previous.getStr("rules","rules.json")!=manifest.getStr("rules","rules.json")||
+                        previous.getStr("module","game")!=manifest.getStr("module","game");
+    if(rulesDirty&&(topology||historyRequiresReload))
+        throw std::runtime_error("Reopen after changing the rules source or module before saving rules");
+    auto manifestBytes=*savedManifestText;
+    if(manifestDirty&&previous.dump()!=manifest.dump())manifestBytes=manifest.dump()+"\n";
+    std::vector<ProjectFileEdit> edits={{fs::path(dir)/"game.json",*savedManifestText,manifestBytes}};
+    if(rulesDirty){
+        const auto parts=splitComposed(rulesJson,rulesOrigin);
+        if(rulesOrigin.files.empty()||parts.size()!=savedRulesText.size()||
+           fs::weakly_canonical(rulesOrigin.files.front())!=fs::weakly_canonical(rulesPath()))
+            throw std::runtime_error("Rules file set changed; reopen the project");
+        for(size_t i=0;i<parts.size();++i){
+            const auto normalized=parts[i].second.dump()+"\n";
+            const auto before=savedRulesText.at(i);
+            const auto after=rulesOrigin.text.at(i)==normalized?before:normalized;
+            edits.push_back({parts[i].first,before,after});
+            savedRulesText[i]=after;rulesOrigin.text[i]=normalized;
+        }
+    }else if(manifestDirty&&!topology){
+        for(size_t i=0;i<rulesOrigin.files.size();++i){
+            const auto& bytes=savedRulesText.at(i);edits.push_back({rulesOrigin.files[i],bytes,bytes});
+        }
+    }
+    auto next=documentHistory;
+    next.record(std::vector<ProjectFileEdit>(edits),{});
+    if(next.versionToken()!=documentHistory.versionToken()){
+        auto checkpoint=prepareProjectHistoryCheckpoint(dir,savedHistoryCheckpoint,next);
+        savedHistoryCheckpoint=checkpoint.after;
+        edits.push_back(std::move(checkpoint));
+        documentHistory=std::move(next);historyPersistenceWarning.clear();
+    }
+    savedManifestText=std::move(manifestBytes);
+    if(manifestDirty&&topology)historyRequiresReload=true;
+    rulesDirty=false;manifestDirty=false;
+    return edits;
+}
+bool Project::saveRules(std::string* err,const std::string& historyLabel,const ProjectFileEdit* newFile) {
+    try {
+        if(!savedManifestText||rulesOrigin.files.empty())
+            throw std::runtime_error("Project documents must be loaded before saving rules");
+        const auto parts=splitComposed(rulesJson,rulesOrigin);
+        if(parts.size()!=savedRulesText.size() || fs::weakly_canonical(rulesOrigin.files.front())!=fs::weakly_canonical(rulesPath()))
+            throw std::runtime_error("Rules file set changed; reopen the project");
+        auto nextRaw=savedRulesText;
+        auto nextNormalized=rulesOrigin.text;
+        std::vector<ProjectFileEdit> edits={{fs::path(dir)/"game.json",*savedManifestText,*savedManifestText}};
+        for(size_t i=0;i<parts.size();++i) {
+            const auto text=parts[i].second.dump()+"\n";
+            const auto& before=savedRulesText.at(i);
+            const auto after=rulesOrigin.text.at(i)==text?before:text;
+            edits.push_back({parts[i].first,before,after});
+            nextRaw[i]=after;nextNormalized[i]=text;
+        }
+        const std::string noHistory;
+        auto history=documentHistory;
+        history.record(std::vector<ProjectFileEdit>(edits),historyRequiresReload?noHistory:historyLabel);
+        if (newFile) {
+            if (!newFile->createOnly) throw std::runtime_error("Expected a new project file");
+            edits.push_back(*newFile);
+        }
+        applyHistoryTransaction(edits,std::move(history));
+        savedRulesText=std::move(nextRaw);rulesOrigin.text=std::move(nextNormalized);
+        rulesDirty=false;
+        return true;
+    } catch(const std::exception& e) {if(err)*err=e.what();return false;}
 }
 std::vector<std::string> Project::rulesFiles() const {
     std::vector<std::string> out;
@@ -214,19 +309,172 @@ std::vector<std::string> Project::rulesFiles() const {
     if (out.empty()) out.push_back(manifest.getStr("rules", "rules.json"));
     return out;
 }
-bool Project::saveManifest(std::string* err) {
-    if (!writeText(dir + "/game.json", manifest.dump() + "\n", err)) return false;
-    manifestDirty = false;
-    return true;
+bool Project::saveManifest(std::string* err,const std::string& historyLabel) {
+    try {
+        if(!savedManifestText)throw std::runtime_error("Project manifest must be loaded before saving");
+        const auto previous=Json::parse(*savedManifestText);
+        const auto normalized=manifest.dump();
+        auto next=previous.dump()==normalized?*savedManifestText:normalized+"\n";
+        const bool topology=previous.getStr("rules","rules.json")!=manifest.getStr("rules","rules.json")||
+                            previous.getStr("module","game")!=manifest.getStr("module","game");
+        const bool mapList=previous["maps"].dump()!=manifest["maps"].dump();
+        std::vector<ProjectFileEdit> edits={{fs::path(dir)/"game.json",*savedManifestText,next}};
+        // A recorded manifest edit must include exact rules dependencies, so
+        // history cannot silently restore a manifest against external rule edits.
+        const bool tracked=!historyLabel.empty()&&!historyRequiresReload&&!topology&&!mapList;
+        if(tracked)for(size_t i=0;i<rulesOrigin.files.size();++i){
+            const auto& bytes=savedRulesText.at(i);
+            edits.push_back({rulesOrigin.files[i],bytes,bytes});
+        }
+        const std::string noHistory;
+        auto history=documentHistory;
+        history.record(std::vector<ProjectFileEdit>(edits),tracked?historyLabel:noHistory);
+        applyHistoryTransaction(edits,std::move(history));
+        savedManifestText=std::move(next);manifestDirty=false;
+        if(topology){historyRequiresReload=true;}
+        return true;
+    } catch(const std::exception& e){if(err)*err=e.what();return false;}
+}
+std::string Project::historyVersion() const {
+    return dir+"|project|"+documentHistory.versionToken();
+}
+Json Project::historyStatus() const {
+    Json out=Json::object(),steps=Json::array();
+    size_t i=0;
+    for(const auto& entry:documentHistory.steps()){
+        Json row=Json::object();row.set("label",str(entry.label));
+        row.set("done",Json::fromBool(i++<documentHistory.position()));steps.push(std::move(row));
+    }
+    out.set("scope",str("project"));out.set("steps",std::move(steps));
+    out.set("persistent",Json::fromBool(true));
+    if(!historyPersistenceWarning.empty())out.set("persistenceWarning",str(historyPersistenceWarning));
+    out.set("position",Json::number(int64_t(documentHistory.position())));
+    out.set("bytes",Json::number(int64_t(documentHistory.bytes())));
+    out.set("maxSteps",Json::number(int64_t(ProjectHistory::MaxSteps)));
+    out.set("maxBytes",Json::number(int64_t(ProjectHistory::MaxBytes)));
+    out.set("version",str(historyVersion()));
+    const bool blocked=dir.empty()||rulesDirty||manifestDirty||historyRequiresReload;
+    out.set("canUndo",Json::fromBool(!blocked&&documentHistory.canUndo()));
+    out.set("canRedo",Json::fromBool(!blocked&&documentHistory.canRedo()));
+    if(blocked)out.set("blockedReason",str(historyRequiresReload?"Reopen after changing rules source or module":"Open a project and save pending changes first"));
+    return out;
+}
+std::vector<ProjectFileEdit> Project::stageHistoryStep(bool redo) {
+        if(dir.empty()||rulesDirty||manifestDirty||historyRequiresReload||!savedManifestText)
+            throw std::runtime_error("Project history requires an open, saved project with unchanged rules source");
+        const auto& entry=documentHistory.next(redo);
+        auto edits=redo?entry.files:reverseProjectFileEdits(entry.files);
+        // Refuse unsaved owner mutations, even if a caller forgot to set a dirty flag.
+        if(manifest.dump()!=Json::parse(*savedManifestText).dump())throw std::runtime_error("Unsaved manifest changes");
+        const auto current=splitComposed(rulesJson,rulesOrigin);
+        if(current.size()!=rulesOrigin.files.size()||edits.size()!=current.size()+1)
+            throw std::runtime_error("Project history dependency set changed");
+        std::map<fs::path,const ProjectFileEdit*> target;
+        for(const auto& edit:edits){
+            if(!target.emplace(edit.path.lexically_normal(),&edit).second)
+                throw std::runtime_error("Duplicate project history dependency");
+        }
+        const auto manifestEdit=target.at((fs::path(dir)/"game.json").lexically_normal());
+        if(manifestEdit->before!=*savedManifestText)throw std::runtime_error("Manifest history baseline changed");
+        for(size_t i=0;i<current.size();++i){
+            if(current[i].second.dump()+"\n"!=rulesOrigin.text.at(i)||
+                target.at(fs::path(current[i].first).lexically_normal())->before!=savedRulesText.at(i))
+                throw std::runtime_error("Rules history baseline changed");
+        }
+        // Validate the complete target document with the same composition and
+        // game/actor loader BEFORE any disk writes, using only the typed plan.
+        auto nextManifest=Json::parse(manifestEdit->after);
+        if(!nextManifest.isObject()||
+           nextManifest.getStr("rules","rules.json")!=manifest.getStr("rules","rules.json")||
+           nextManifest.getStr("module","game")!=manifest.getStr("module","game")||
+           nextManifest["maps"].dump()!=manifest["maps"].dump())
+            throw std::runtime_error("Project history topology changed");
+        JsonOrigin nextOrigin;
+        auto nextRules=composeJson(rulesPath(),[&](const std::string& path,std::string& out){
+            const auto it=target.find(fs::path(path).lexically_normal());
+            if(it==target.end()||it->second==manifestEdit)return false;
+            out=it->second->after;return true;
+        },&nextOrigin);
+        if(nextOrigin.files!=rulesOrigin.files)throw std::runtime_error("Project history rules include set changed");
+        auto nextRaw=nextOrigin.text;
+        const auto parts=splitComposed(nextRules,nextOrigin);
+        for(size_t i=0;i<parts.size();++i)nextOrigin.text[i]=parts[i].second.dump()+"\n";
+        game::Rules nextParsed;
+        if(actorSession())actor::readConfig(nextRules);else nextParsed=game::loadRules(nextRules);
+        auto nextManifestText=manifestEdit->after;
+        manifest=std::move(nextManifest);rulesJson=std::move(nextRules);
+        rulesOrigin=std::move(nextOrigin);savedRulesText=std::move(nextRaw);
+        savedManifestText=std::move(nextManifestText);rules=std::move(nextParsed);
+        rulesError.clear();documentHistory.advance(redo);
+        return edits;
+}
+bool Project::historyStep(bool redo,const std::string& expectedVersion,std::string* err){
+    try{
+        if(expectedVersion!=historyVersion())throw std::runtime_error("Project history changed; refresh before navigating");
+        Project staged=*this;
+        const auto edits=staged.stageHistoryStep(redo);
+        applyHistoryTransaction(edits,std::move(staged.documentHistory));
+        staged.documentHistory=std::move(documentHistory);
+        staged.savedHistoryCheckpoint=std::move(savedHistoryCheckpoint);
+        staged.historyPersistenceWarning=std::move(historyPersistenceWarning);
+        *this=std::move(staged);
+        return true;
+    }catch(const std::exception& e){if(err)*err=e.what();return false;}
 }
 
 // ================================================================= workspace
 
 void registerLensOps(Workspace& ws);
-Workspace::Workspace() { registerLensOps(*this); registerGeometryOps(*this); registerModelingOps(*this); registerAnimationOps(*this); registerShaderGraphOps(*this); registerFpsOps(*this); registerCoreOps(); registerPortOps(*this); registerPackageOps(*this); registerTileOps(*this); registerTerrainOps(*this); registerGenOps(*this); registerDataOps(*this); registerBalanceOps(*this); registerLightOps(*this); registerPhysisOps(*this); registerFxOps(*this); registerOverlayOps(*this); registerBrandingOps(*this); registerPlanetOps(*this); registerScenarioOps(*this); registerCampaignOps(*this); registerSchemaOps(*this); registerMaterialOps(*this); registerPostFxOps(*this); registerScriptOps(*this); registerToolchainOps(*this); registerNativeBuildOps(*this); registerStrategicOps(*this); registerUiOps(*this); registerFieldOps(*this); registerRaidOps(*this); registerRouteOps(*this); registerRoadOps(*this); registerWaterOps(*this); registerWizardOps(*this); registerLightBakeOps(*this); registerHumanCreatorOps(*this);
+Workspace::Workspace() { registerLensOps(*this); registerGeometryOps(*this); registerModelingOps(*this); registerAnimationOps(*this); registerShaderGraphOps(*this); registerFpsOps(*this); registerWorldPersistenceOps(*this); registerCoreOps(); registerPortOps(*this); registerPackageOps(*this); registerTileOps(*this); registerTerrainOps(*this); registerGenOps(*this); registerDataOps(*this); registerBalanceOps(*this); registerLightOps(*this); registerPhysisOps(*this); registerFxOps(*this); registerOverlayOps(*this); registerBrandingOps(*this); registerPlanetOps(*this); registerScenarioOps(*this); registerCampaignOps(*this); registerSchemaOps(*this); registerMaterialOps(*this); registerPostFxOps(*this); registerScriptOps(*this); registerToolchainOps(*this); registerNativeBuildOps(*this); registerStrategicOps(*this); registerUiOps(*this); registerFieldOps(*this); registerRaidOps(*this); registerRouteOps(*this); registerRoadOps(*this); registerWaterOps(*this); registerWizardOps(*this); registerLightBakeOps(*this); registerHumanCreatorOps(*this); registerGraphOps(*this);
 #ifdef AIVERSE_BATTLE_OPS
     registerBattleNetOps(*this);
 #endif
+    // Discoverable, genre-independent SpectraFX native Studio tools.
+    // Headless MCP hosts retain the schemas but receive an explicit
+    // no-native-viewport error from spectraPreview().
+    registerOp({"fx_asset_check",
+        "Check an indexed model or texture GUID using native Studio CPU decoding; does not verify GPU upload.",
+        Json::parse(R"({"properties":{"guid":{"type":"string"}},"required":["guid"]})"),
+        [this](const Json& p)->Json {return spectraAssetCheck(p);}});
+    registerOp({"fx_replay_prepare",
+        "Prepare a native SpectraFX replay at an exact tick with optional CPU RNG seed, Metal allocation seed or Metal shader seed. Poll fx_replay_status until replayReady.",
+        Json::parse(R"({"properties":{"tick":{"type":"integer","minimum":0,"maximum":3600},"parameters":{"type":"object"},"seed":{"type":"integer","minimum":0,"maximum":2147483647},"gpuAllocationSeed":{"type":"integer","minimum":0,"maximum":2147483647},"gpuShaderSeed":{"type":"integer","minimum":0,"maximum":4294967295}},"required":["tick"]})"),
+        [this](const Json& p)->Json {
+            Json request=p;request.set("action",Json::string("replayPrepare"));
+            return spectraPreview(request);
+        }});
+    registerOp({"fx_checkpoint_file",
+        "Transfer SPFT checkpoint in ordered 32 KiB hex chunks; import runs on render owner.",
+        Json::parse(R"({"properties":{"action":{"type":"string","enum":["checkpointFileBegin","checkpointFileAppend","checkpointFileExport","checkpointFileRead","checkpointFileImport","checkpointFileCancel"]},"offset":{"type":"integer","minimum":0,"maximum":1048600},"chunk":{"type":"string","maxLength":65536},"transferId":{"type":"integer","minimum":1}},"required":["action"]})"),
+        [this](const Json& p)->Json {
+            const auto action=p.getStr("action");
+            if(action!="checkpointFileBegin"&&action!="checkpointFileAppend"&&action!="checkpointFileExport"&&action!="checkpointFileRead"&&action!="checkpointFileImport"&&action!="checkpointFileCancel")throw std::runtime_error("Invalid checkpoint file action");
+            return spectraPreview(p);
+        }});
+    registerOp({"fx_checkpoint_timeline",
+        "Save or restore a paused Metal preview checkpoint; poll fx_replay_status for completion.",
+        Json::parse(R"({"properties":{"action":{"type":"string","enum":["checkpointSave","checkpointRestore","checkpointCancel","status"]},"checkpointId":{"type":"integer","minimum":1}},"required":["action"]})"),
+        [this](const Json& p)->Json {
+            const auto action=p.getStr("action");
+            if(action!="checkpointSave"&&action!="checkpointRestore"&&action!="checkpointCancel"&&action!="status")throw std::runtime_error("Invalid checkpoint action");
+            return spectraPreview(p);
+        }});
+    registerOp({"fx_replay_status",
+        "Read native SpectraFX replay readiness, tick, GPU seed retry state and backend. Requires a running Studio FX viewport.",
+        Json::parse(R"({"properties":{}})"),
+        [this](const Json&)->Json {
+            Json request=Json::object();request.set("action",Json::string("status"));
+            return spectraPreview(request);
+        }});
+    registerOp({"fx_replay_capture",
+        "Queue or poll a bounded native SpectraFX JPEG capture. Use action=capture with requireReplayReady=true; then action=captureStatus. Provenance is request-time, not exact GPU frame completion.",
+        Json::parse(R"({"properties":{"action":{"type":"string","enum":["capture","captureStatus","captureCancel"]},"maxSide":{"type":"integer","minimum":64,"maximum":1024},"requireReplayReady":{"type":"boolean"},"captureId":{"type":"integer","minimum":1}},"required":["action"]})"),
+        [this](const Json& p)->Json {
+            const std::string action=p.getStr("action");
+            if(action!="capture"&&action!="captureStatus"&&action!="captureCancel")
+                throw std::runtime_error("fx_replay_capture: invalid action");
+            return spectraPreview(p);
+        }});
 }
 Workspace::~Workspace() { if (buildThread_.joinable()) buildThread_.join(); }
 
@@ -244,11 +492,12 @@ std::string shellQuote(const std::string& s) {
 
 static std::string stamp(const char* fmt);
 
-void Workspace::startBuild(const std::string& target, const std::string& config, const std::string& extraArgs) {
+void Workspace::startBuild(const std::string& target, const std::string& config, const std::string& extraArgs, const std::string& outputDir) {
     if (project.dir.empty()) throw std::runtime_error("no game is open");
     if (map.dirty && !map.path.empty() && !building_) map.save(map.path, nullptr);
     const bool estimate = extraArgs.find("--estimate") != std::string::npos;   // the Build window's size estimate: one file, overwritten
-    startTool("--target " + target + " --config " + config + (extraArgs.empty() ? "" : " " + extraArgs), estimate ? "estimate" : "build-" + target, true);
+    startTool("--target " + target + " --config " + config + (extraArgs.empty() ? "" : " " + extraArgs) +
+              (outputDir.empty() ? "" : " --out " + shellQuote(outputDir)), estimate ? "estimate" : "build-" + target, true);
 }
 
 namespace {
@@ -274,10 +523,36 @@ void Workspace::appendBuildLog(const std::string& line) {
     buildLog_ += line + "\n";
 }
 
+Json Workspace::buildLogChunk(int64_t requestedFrom, int64_t expectedRun) {
+    std::lock_guard<std::mutex> lock(buildMutex_);
+    const bool running = building_.load();
+    const int runs = runCount_.load();
+    const int64_t run = int64_t(runs) + (running ? 1 : 0);
+    size_t from = size_t(std::clamp<int64_t>(requestedFrom, 0, int64_t(buildLog_.size())));
+    if (expectedRun >= 0 && expectedRun != run) from = 0;
+    const auto continuation = [&](size_t at) {
+        return (static_cast<unsigned char>(buildLog_[at]) & 0xc0) == 0x80;
+    };
+    while (from < buildLog_.size() && continuation(from)) ++from;
+    size_t end = std::min(buildLog_.size(), from + 256 * 1024);
+    while (end < buildLog_.size() && end > from && continuation(end)) --end;
+    Json out = Json::object();
+    out.set("from", Json::number(int64_t(from)));
+    out.set("next", Json::number(int64_t(end)));
+    out.set("size", Json::number(int64_t(buildLog_.size())));
+    out.set("text", Json::string(buildLog_.substr(from,end-from)));
+    out.set("run", Json::number(run));
+    out.set("runs", Json::number(int64_t(runs)));
+    out.set("running", Json::fromBool(running));
+    out.set("exitCode", Json::number(int64_t(buildRc_)));
+    out.set("label", Json::string(runLabel_));
+    out.set("logFile", Json::string(logFile_));
+    return out;
+}
+
 void Workspace::startCommand(const std::string& command, const std::string& shown, const std::string& label) {
     if (building_) throw std::runtime_error("a build is already running");
     if (buildThread_.joinable()) buildThread_.join();
-    building_ = true;
     std::string cmd = command + " 2>&1";
 #if defined(_WIN32)
     cmd = "\"" + cmd + "\"";   // cmd.exe strips the outer quotes of a command that starts with one
@@ -286,6 +561,7 @@ void Workspace::startCommand(const std::string& command, const std::string& show
     const fs::path logFile = fs::path(logsDir()) / (keep ? label + "-" + stamp("%Y%m%d-%H%M%S") + ".log" : "build-estimate.log");
     {
         std::lock_guard<std::mutex> lk(buildMutex_);
+        building_ = true;
         buildLog_ = shown + "\n";
         buildRc_ = 0;
         runLabel_ = label;
@@ -328,6 +604,7 @@ void Workspace::startCommand(const std::string& command, const std::string& show
         lf.close();
         std::error_code ec;
         if (keep) aiverse::pack::copyFileReplace(logFile, logFile.parent_path() / "build-last.log", ec);
+        std::lock_guard<std::mutex> lock(buildMutex_);
         ++runCount_;
         building_ = false;
     });
@@ -406,7 +683,7 @@ Json Workspace::toolList() const {
     for (auto& o : ops_) {
         Json t = Json::object();
         t.set("name", str(o.name));
-        t.set("description", str(o.description));
+        t.set("description", str(o.description+(o.studioLinkOnly?" Requires authenticated HTML5 Studio link; no local fallback.":"")));
         Json s = o.schema.isObject() ? o.schema : Json::object();
         if (!s.has("type")) s.set("type", str("object"));
         if (!s.has("properties")) s.set("properties", Json::object());
@@ -463,6 +740,8 @@ bool Workspace::openGame(const std::string& idOrDir, std::string* err) {
     std::error_code ec;
     dir = fs::weakly_canonical(dir, ec).string();
     if (!project.load(dir, err)) return false;
+    ++projectLifetime_; // includes reopening the same project
+    buildingGraphDiagnosticsProvider={}; // never expose the previous project's runtime
     {   // recent projects (shared with aiversemcp); the engine's own templates aren't user projects
         const std::string tpl = fs::weakly_canonical(fs::path(gamesDir()), ec).string();
         const bool isTemplate = dir.rfind(tpl, 0) == 0;
@@ -484,6 +763,7 @@ bool Workspace::openGame(const std::string& idOrDir, std::string* err) {
 // ================================================================= operations
 
 void Workspace::registerCoreOps() {
+    registerStudioPlayTools(*this);
     auto add = [this](const char* name, const char* desc, const char* sch, OpFn fn) {
         registerOp({name, desc, schema(sch), std::move(fn)});
     };
@@ -500,6 +780,7 @@ void Workspace::registerCoreOps() {
                 Json entry = Json::object();
                 entry.set("name", str(op.name));
                 entry.set("guiOnly", Json::fromBool(op.guiOnly));
+                entry.set("studioLinkOnly", Json::fromBool(op.studioLinkOnly));
                 entry.set("inputSchema", op.schema.isObject() ? op.schema : Json::object());
                 entries.push(entry);
                 ++total;
@@ -510,6 +791,94 @@ void Workspace::registerCoreOps() {
             result.set("guiOnlyCount", Json::number(int64_t(guiOnly)));
             result.set("note", str("Registration only. Verify tools/call against the built MCP executable and active editor; compile-time capabilities and runtime dependencies may differ."));
             return result;
+        });
+    add("building_graph_diagnostics", "Read actual building graph invalidation ACK state from an attached runtime owner. Returns unavailable without a provider; ACK does not mean completed graph rebuild.",
+        R"({"type":"object","properties":{"sceneId":{"type":"string","pattern":"^[1-9][0-9]{0,18}$"}},"required":["sceneId"],"additionalProperties":false})",
+        [this](const Json& p){
+            const auto raw=p.getStr("sceneId");
+            if(raw.empty()||raw.size()>19||raw[0]=='0')throw std::runtime_error("Invalid building scene ID");
+            uint64_t id=0;
+            for(char c:raw){
+                if(c<'0'||c>'9'||id>(uint64_t(INT64_MAX)-uint64_t(c-'0'))/10)
+                    throw std::runtime_error("Invalid building scene ID");
+                id=id*10+uint64_t(c-'0');
+            }
+            Json out=Json::object();
+            if(!buildingGraphDiagnosticsProvider){
+                out.set("available",Json::fromBool(false));
+                out.set("reason",str("No runtime building diagnostics provider attached"));
+                return out;
+            }
+            const auto snapshot=buildingGraphDiagnosticsProvider(id);
+            out.set("available",Json::fromBool(snapshot.isObject()));
+            if(snapshot.isObject())out.set("snapshot",snapshot);
+            else out.set("reason",str("Building scene diagnostics unavailable"));
+            return out;
+        });
+    add("feature_readiness_get", "Read an existing engine readiness report snapshot; not live verification.",
+        R"({"type":"object","additionalProperties":false})",
+        [this](const Json&) { return featureReadinessSnapshot(*this); });
+    add("feature_readiness_query", "Page feature readiness snapshot sections: features, tasks, dependencies, blockers and schedule.",
+        R"({"type":"object","properties":{"section":{"enum":["features","tasks","dependencies","blockers","schedule"]},"owner":{"type":"string"},"feature":{"type":"string"},"kind":{"type":"string"},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":200}},"additionalProperties":false})",
+        [this](const Json& p) { return featureReadinessQuery(*this,p); });
+    add("feature_readiness_status_get", "Inspect report-generation job status without opening a game.",
+        R"({"type":"object","additionalProperties":false})",
+        [this](const Json&) {
+            Json out=Json::object();
+            out.set("busy", Json::fromBool(building()));
+            out.set("label",str(runLabel()));
+            out.set("runCount",num(int64_t(runCount())));
+            out.set("exitCode",num(int64_t(buildResult())));
+            return out;
+        });
+    add("feature_readiness_refresh", "Queue the fixed local feature policy report generator. Does not build, test or mutate a project.",
+        R"({"type":"object","additionalProperties":false})",
+        [this](const Json&) {
+            if (building()) throw std::runtime_error("Another background job is running");
+            if (engineDir.empty()) throw std::runtime_error("Engine root is unavailable");
+            const auto script=fs::absolute(fs::path(engineDir)/"tools/agents/feature_policy.py");
+            const auto output=fs::absolute(fs::path(engineDir)/"logs/feature-readiness.json");
+            if (!fs::is_regular_file(script)) throw std::runtime_error("Feature policy script unavailable");
+            const char* env=std::getenv("AIVERSE_PYTHON");
+#if defined(_WIN32)
+            const std::string python=env&&*env?env:"python";
+#else
+            const std::string python=env&&*env?env:"python3";
+#endif
+            auto safeArg=[](const std::string& value) {
+                if (value.find_first_of("\r\n")!=std::string::npos) throw std::runtime_error("Unsupported newline in tool argument");
+#if defined(_WIN32)
+                if (value.find_first_of("\"%!^&|<>")!=std::string::npos) throw std::runtime_error("Unsupported command character");
+#endif
+                return shellQuote(value);
+            };
+            const std::string command=safeArg(python)+" "+safeArg(script.string())+" --base origin/main --output "+safeArg(output.string());
+            const int count=runCount();
+            startCommand(command,"Feature readiness report","feature-readiness");
+            Json out=Json::object();
+            out.set("queued",Json::fromBool(true));
+            out.set("runCount",num(int64_t(count)));
+            return out;
+        });
+    add("simulation_budget_plan", "Calculate deterministic recurring decision visits per tick and maximum revisit latency. Pure planning only; does not change rules or live simulation.",
+        R"({"type":"object","properties":{"count":{"type":"integer","minimum":0,"maximum":2000000000},"periodTicks":{"type":"integer","minimum":1,"maximum":36000},"maxVisitsPerTick":{"type":"integer","minimum":0,"maximum":2000000000}},"required":["count","periodTicks"],"additionalProperties":false})",
+        [](const Json& p){
+            auto read=[&](const char* key,uint32_t maximum,uint32_t minimum,bool required){
+                if(!p.has(key)&&!required)return uint32_t(0);
+                const auto& v=p[key];
+                if(!v.isNumber()||v.fx().raw%Fixed::kOne||v.integer()<minimum||uint64_t(v.integer())>maximum)
+                    throw std::runtime_error(std::string("invalid simulation budget field: ")+key);
+                return uint32_t(v.integer());
+            };
+            const auto count=read("count",2000000000,0,true);
+            const auto period=read("periodTicks",36000,1,true);
+            const auto cap=read("maxVisitsPerTick",2000000000,0,false);
+            const auto plan=lib::runtime::planRecurringWork(count,period,cap);
+            Json out=Json::object();
+            out.set("visitsPerTick",Json::number(int64_t(plan.visitsPerTick)));
+            out.set("maxRevisitTicks",Json::number(int64_t(plan.maxRevisitTicks)));
+            out.set("meetsPeriod",Json::fromBool(plan.meetsPeriod));
+            return out;
         });
     auto needProject = [this] { if (project.dir.empty()) throw std::runtime_error("no game is open: call open_game first"); };
     auto entityRef = [this](const Json& p) {
@@ -533,9 +902,10 @@ void Workspace::registerCoreOps() {
     };
     auto rulesChanged = [this](const std::string& what) {
         project.rulesDirty = true;
-        bool good = project.reloadRules();
+        if(!project.reloadRules()) throw std::runtime_error("rules rejected by the loader: " + project.rulesError);
+        std::string err;
+        if(!project.saveRules(&err,what)) throw std::runtime_error(err);
         note({Change::Rules, 0, 0, -1, -1, -1, what});
-        if (!good) throw std::runtime_error("rules rejected by the loader: " + project.rulesError);
     };
 
     // ---------------------------------------------------------------- games
@@ -616,6 +986,7 @@ void Workspace::registerCoreOps() {
         Json r = Json::object();
         r.set("dir", str(project.dir));
         r.set("manifest", project.manifest);
+        r.set("originalManifest", str(project.manifest.dump()));
         Json s = Json::object();
         s.set("resources", Json::number(int64_t(project.rules.resources.size())));
         s.set("types", Json::number(int64_t(project.rules.types.size())));
@@ -625,17 +996,139 @@ void Workspace::registerCoreOps() {
         if (!project.rulesError.empty()) r.set("rulesError", str(project.rulesError));
         return r;
     });
-    add("set_manifest", "Set a value in game.json (name, version, orientation, window, icon, maps, input, ...). Saved immediately. window = desktop window: {mode: windowed|fixed|maximized|fullscreen, width, height, minWidth, minHeight, keepAspect, allowFullscreen, macos|windows|linux: overrides}.",
-        R"({"properties": {"path": {"type": "string"}, "value": {}}, "required": ["path", "value"]})", [this, needProject](const Json& p) {
+    add("set_manifest", "Set a value in game.json (name, version, orientation, window, icon, maps, input, ...). Saved immediately. An empty path replaces the object root. valueJson accepts raw JSON without browser numeric conversion; expectedManifest guards against changes since game_info.originalManifest. window = desktop window: {mode: windowed|fixed|maximized|fullscreen, width, height, minWidth, minHeight, keepAspect, allowFullscreen, macos|windows|linux: overrides}.",
+        R"({"properties": {"path": {"type": "string"}, "value": {}, "valueJson": {"type": "string"}, "expectedManifest": {"type": "string"}}, "required": ["path"], "oneOf": [{"required": ["value"]}, {"required": ["valueJson"]}]})", [this, needProject](const Json& p) {
             needProject();
-            *jsonPath(project.manifest, ps(p, "path"), true) = p["value"];
+            if(p.has("expectedManifest") && (!p["expectedManifest"].isString() || p.getStr("expectedManifest")!=project.manifest.dump()))
+                throw std::runtime_error("Project settings changed; reload before saving");
+            if(!p["path"].isString() || p.has("value")==p.has("valueJson") ||
+               (p.has("valueJson") && !p["valueJson"].isString()))
+                throw std::runtime_error("Manifest path and exactly one value or valueJson are required");
+            const Json value=p.has("valueJson")?Json::parse(p.getStr("valueJson")):p["value"];
+            if(ps(p,"path").empty() && !value.isObject())
+                throw std::runtime_error("Project settings must be a JSON object");
+            Json backup=project.manifest;
+            *jsonPath(project.manifest, ps(p, "path"), true) = value;
             std::string err;
-            if (!project.saveManifest(&err)) throw std::runtime_error(err);
+            if (!project.saveManifest(&err,"Manifest: "+ps(p,"path"))) {project.manifest=std::move(backup);throw std::runtime_error(err);}
             Json r = ok();
             r.set("summary", str("game.json: " + ps(p, "path")));
             return r;
         });
 
+    add("project_history_status","Inspect bounded project document history (separate from map history).","{}",[this,needProject](const Json&){
+        needProject();return project.historyStatus();
+    });
+    add("project_history_step","Undo or redo one saved project document edit. Requires exact version from project_history_status; refuses conflicts.",
+        R"({"properties":{"direction":{"type":"string","enum":["undo","redo"]},"expectedVersion":{"type":"string"}},"required":["direction","expectedVersion"]})",
+        [this,needProject](const Json& p){
+            needProject();
+            const auto direction=p.getStr("direction");
+            if(direction!="undo"&&direction!="redo")throw std::runtime_error("Invalid project history direction");
+            if(!p["expectedVersion"].isString())throw std::runtime_error("Project history version required");
+            std::string err;
+            if(!project.historyStep(direction=="redo",p.getStr("expectedVersion"),&err))throw std::runtime_error(err);
+            note({Change::Rules,0,0,-1,-1,-1,"Project history: "+direction});
+            return project.historyStatus();
+        });
+    // Linked Studio-only asset operations. The standalone MCP registry
+    // advertises the schema, but the native session owns the actual mutation.
+    auto addLinked=[this](const char* name,const char* desc,const char* sch,OpFn fn){
+        registerOp({name,desc,schema(sch),std::move(fn),false,true});
+    };
+    const auto requireStudioLink=[](const Json&)->Json{throw std::runtime_error("Requires an authenticated HTML5 Studio agent link");};
+    addLinked("view_wind","Control forest and nature in the private PHYSIS viewport.",windShowcaseSchema,requireStudioLink);
+    addLinked("physis_nature_preview","Inspect or control the PHYSIS nature preview in linked Studio.",
+        physisNatureCommandSchema,requireStudioLink);
+    for(const char* name:{"animation_runtime_status","rig_runtime_status"})
+        addLinked(name,"Read per-entity animation diagnostics from the running Studio play-test.",
+            R"({"type":"object","properties":{},"additionalProperties":false})",requireStudioLink);
+    for(const char* name:{"animation_editor_open","rig_editor_open"})
+        addLinked(name,"Open a saved or inline animation graph in the linked editor.",
+            R"({"type":"object","properties":{"name":{"type":"string"},"graph":{"type":"object"}}})",requireStudioLink);
+    for(const char* name:{"animation_editor_status","rig_editor_status"})
+        addLinked(name,"Read the linked editor draft, evaluated local pose and contact diagnostics.",
+            R"({"type":"object","properties":{},"additionalProperties":false})",requireStudioLink);
+    addLinked("studio_planet_forest_live","Read the completed local ECS forest snapshot for the current saved planetary map. No remote simulation, no mutation.",
+        R"({"type":"object","properties":{"expectedProject":{"type":"string"},"mapPath":{"type":"string"},"expectedRevision":{"type":"string"}},"required":["expectedProject","mapPath","expectedRevision"],"additionalProperties":false})",requireStudioLink);
+    addLinked("studio_planet_scene_get","Read desired and rendered surface body and the current Scene orbit camera, with project/map/revision guards.",
+        R"({"type":"object","properties":{"expectedProject":{"type":"string"},"mapPath":{"type":"string"},"expectedRevision":{"type":"string"}},"required":["expectedProject","mapPath","expectedRevision"],"additionalProperties":false})",requireStudioLink);
+    addLinked("studio_planet_scene_body_set","Select a surface body in linked Studio, or empty body for Auto. Changes only transient Scene state; wait for activeBody before camera edits.",
+        R"({"type":"object","properties":{"expectedProject":{"type":"string"},"mapPath":{"type":"string"},"expectedRevision":{"type":"string"},"body":{"type":"string"}},"required":["expectedProject","mapPath","expectedRevision","body"],"additionalProperties":false})",requireStudioLink);
+    addLinked("studio_planet_scene_camera_set","Set the current planetary Scene orbit camera in body-local metres and radians. Transient view only; no ECS or document mutation.",
+        R"({"type":"object","properties":{"expectedProject":{"type":"string"},"mapPath":{"type":"string"},"expectedRevision":{"type":"string"},"body":{"type":"string"},"target":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},"distance":{"type":"number","minimum":2,"maximum":8192},"yaw":{"type":"number","minimum":-1000,"maximum":1000},"pitch":{"type":"number","minimum":-1.5707963,"maximum":1.5707963},"ortho":{"type":"boolean"}},"required":["expectedProject","mapPath","expectedRevision","body","target","distance","yaw","pitch","ortho"],"additionalProperties":false})",requireStudioLink);
+    addLinked("studio_asset_history","Read current linked Studio asset history and project identity.",
+        R"({"type":"object","properties":{},"additionalProperties":false})",[](const Json&)->Json{
+            throw std::runtime_error("Requires an authenticated HTML5 Studio agent link");
+        });
+    addLinked("studio_asset_catalog","Read existing linked Studio content GUIDs and importer settings; no metadata creation.",
+        R"({"type":"object","properties":{"expectedProject":{"type":"string"},"offset":{"type":"integer"},"limit":{"type":"integer"}},"required":["expectedProject"]})",[](const Json&)->Json{
+            throw std::runtime_error("Requires an authenticated HTML5 Studio agent link");
+        });
+    addLinked("studio_asset_meta_patch","Change one existing asset importer setting through linked Studio history.",
+        R"({"type":"object","properties":{"expectedProject":{"type":"string"},"expectedVersion":{"type":"string"},"guid":{"type":"string"},"key":{"type":"string"},"value":{}},"required":["expectedProject","expectedVersion","guid","key","value"]})",[](const Json&)->Json{
+            throw std::runtime_error("Requires an authenticated HTML5 Studio agent link");
+        });
+    addLinked("studio_asset_folder_create","Create a content folder through linked Studio history.",
+        R"({"type":"object","properties":{"expectedProject":{"type":"string"},"expectedVersion":{"type":"string"},"parent":{"type":"string"},"name":{"type":"string"}},"required":["expectedProject","expectedVersion","parent","name"]})",[](const Json&)->Json{
+            throw std::runtime_error("Requires an authenticated HTML5 Studio agent link");
+        });
+    addLinked("studio_history_capabilities","Inspect linked Studio history policy for every registered MCP operation. Unverified means potential side effects, not safe bulk undo.",
+        R"({"type":"object","properties":{},"additionalProperties":false})",[](const Json&)->Json{throw std::runtime_error("Requires an authenticated HTML5 Studio agent link");});
+    addLinked("studio_asset_move_preview","Review internal content move or rename by existing GUIDs; no external import.",
+        R"({"type":"object","properties":{"expectedProject":{"type":"string"},"expectedVersion":{"type":"string"},"guids":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":64},"destination":{"type":"string"},"newName":{"type":"string"}},"required":["expectedProject","expectedVersion","guids","destination"]})",
+        [](const Json&)->Json{throw std::runtime_error("Requires an authenticated HTML5 Studio agent link");});
+    addLinked("studio_asset_move_commit","Apply a reviewed linked Studio internal move using its token and explicit non-destructive decisions.",
+        R"({"type":"object","properties":{"expectedProject":{"type":"string"},"expectedVersion":{"type":"string"},"token":{"type":"string"},"decisions":{"type":"array","items":{"type":"object","properties":{"id":{"type":"integer"},"action":{"type":"string","enum":["import","keep-both","skip"]}},"required":["id","action"]}}},"required":["expectedProject","expectedVersion","token","decisions"]})",
+        [](const Json&)->Json{throw std::runtime_error("Requires an authenticated HTML5 Studio agent link");});
+    addLinked("studio_asset_dependencies","Read known direct or multi-hop dependency edges by existing GUID, paginated.",
+        R"({"type":"object","properties":{"expectedProject":{"type":"string"},"guid":{"type":"string"},"depth":{"type":"integer","minimum":1,"maximum":16},"offset":{"type":"integer","minimum":0,"maximum":65536},"limit":{"type":"integer","minimum":1,"maximum":100},"direction":{"type":"string","enum":["all","incoming","outgoing"]},"expectedToken":{"type":"string"}},"required":["expectedProject","guid"],"additionalProperties":false})",
+        [](const Json&)->Json{throw std::runtime_error("Requires an authenticated HTML5 Studio agent link");});
+    addLinked("studio_asset_recovery_storage","Read linked Studio logical recovery storage and quota.",
+        R"({"type":"object","properties":{"expectedProject":{"type":"string"}},"required":["expectedProject"],"additionalProperties":false})",
+        [](const Json&)->Json{throw std::runtime_error("Requires an authenticated HTML5 Studio agent link");});
+    addLinked("studio_asset_trash_list","Read paginated recovery records and retained-history protection.",
+        R"({"type":"object","properties":{"expectedProject":{"type":"string"},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":100}},"required":["expectedProject"],"additionalProperties":false})",
+        [](const Json&)->Json{throw std::runtime_error("Requires an authenticated HTML5 Studio agent link");});
+    addLinked("studio_asset_trash_restore_review","Review exact recovery record identity for restore only.",
+        R"({"type":"object","properties":{"expectedProject":{"type":"string"},"id":{"type":"string"}},"required":["expectedProject","id"],"additionalProperties":false})",
+        [](const Json&)->Json{throw std::runtime_error("Requires an authenticated HTML5 Studio agent link");});
+    addLinked("studio_asset_trash_restore","Restore a reviewed recovery record. Clears asset history; requires explicit confirmation.",
+        R"({"type":"object","properties":{"expectedProject":{"type":"string"},"id":{"type":"string"},"token":{"type":"string"},"expectedVersion":{"type":"string"},"confirmed":{"type":"boolean"}},"required":["expectedProject","id","token","expectedVersion","confirmed"],"additionalProperties":false})",
+        [](const Json&)->Json{throw std::runtime_error("Requires an authenticated HTML5 Studio agent link");});
+    addLinked("studio_asset_delete","Move an existing GUID to reversible project trash. Requires confirmation and current asset history.",
+        R"({"type":"object","properties":{"expectedProject":{"type":"string"},"guid":{"type":"string"},"expectedVersion":{"type":"string"},"confirmed":{"type":"boolean"}},"required":["expectedProject","guid","expectedVersion","confirmed"],"additionalProperties":false})",
+        [](const Json&)->Json{throw std::runtime_error("Requires an authenticated HTML5 Studio agent link");});
+    addLinked("studio_asset_recovery_quota_set","Set retained trash quota in MiB with expected old value; zero means unlimited.",
+        R"({"type":"object","properties":{"expectedProject":{"type":"string"},"expectedMiB":{"type":"integer","minimum":0,"maximum":1048576},"quotaMiB":{"type":"integer","minimum":0,"maximum":1048576}},"required":["expectedProject","expectedMiB","quotaMiB"],"additionalProperties":false})",
+        [](const Json&)->Json{throw std::runtime_error("Requires an authenticated HTML5 Studio agent link");});
+    addLinked("studio_asset_trash_cleanup_review","Review selected history-unprotected recovery slots for cleanup. Permanent purge remains native UI only.",
+        R"({"type":"object","properties":{"expectedProject":{"type":"string"},"ids":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":50}},"required":["expectedProject","ids"],"additionalProperties":false})",
+        [](const Json&)->Json{throw std::runtime_error("Requires an authenticated HTML5 Studio agent link");});
+    addLinked("studio_agent_history_list","Read retained conversation history links and exact owner boundaries; no mutation.",
+        R"({"type":"object","properties":{"expectedProject":{"type":"string"},"offset":{"type":"integer","minimum":0,"maximum":2000},"limit":{"type":"integer","minimum":1,"maximum":100}},"required":["expectedProject"],"additionalProperties":false})",
+        [](const Json&)->Json{throw std::runtime_error("Requires an authenticated HTML5 Studio agent link");});
+    addLinked("studio_agent_history_step","Undo or redo an exact retained agent edit at its current owner boundary. Stop the hosted agent first.",
+        R"({"type":"object","properties":{"expectedProject":{"type":"string"},"scope":{"type":"string","enum":["map","project","assets"]},"historyId":{"type":"string"},"direction":{"type":"string","enum":["undo","redo"]},"expectedVersion":{"type":"string"},"confirmed":{"type":"boolean"}},"required":["expectedProject","scope","historyId","direction","expectedVersion","confirmed"],"additionalProperties":false})",
+        [](const Json&)->Json{throw std::runtime_error("Requires an authenticated HTML5 Studio agent link");});
+    addLinked("studio_agent_batch_preview","Review the exact fully tracked conversation batch for undo or redo. Stop the hosted agent first.",
+        R"({"type":"object","properties":{"expectedProject":{"type":"string"},"direction":{"type":"string","enum":["undo","redo"]}},"required":["expectedProject","direction"],"additionalProperties":false})",
+        [](const Json&)->Json{throw std::runtime_error("Requires an authenticated HTML5 Studio agent link");});
+    addLinked("studio_agent_batch_apply","Apply a reviewed conversation batch using its exact token; stop the hosted agent first.",
+        R"({"type":"object","properties":{"expectedProject":{"type":"string"},"direction":{"type":"string","enum":["undo","redo"]},"token":{"type":"string"},"confirmed":{"type":"boolean"}},"required":["expectedProject","direction","token","confirmed"],"additionalProperties":false})",
+        [](const Json&)->Json{throw std::runtime_error("Requires an authenticated HTML5 Studio agent link");});
+    addLinked("studio_owner_history","Read linked Map, Project and Assets owner history, version tokens, dirty flags and save availability.",
+        R"({"type":"object","properties":{"expectedProject":{"type":"string"}},"required":["expectedProject"],"additionalProperties":false})",
+        [](const Json&)->Json{throw std::runtime_error("Requires an authenticated HTML5 Studio agent link");});
+    addLinked("studio_owner_history_step","Navigate one current native owner boundary. Requires exact owner version and confirmation; stop hosted agent first.",
+        R"({"type":"object","properties":{"expectedProject":{"type":"string"},"scope":{"type":"string","enum":["map","project","assets"]},"direction":{"type":"string","enum":["undo","redo"]},"expectedVersion":{"type":"string"},"confirmed":{"type":"boolean"}},"required":["expectedProject","scope","direction","expectedVersion","confirmed"],"additionalProperties":false})",
+        [](const Json&)->Json{throw std::runtime_error("Requires an authenticated HTML5 Studio agent link");});
+    addLinked("studio_save_documents","Save the currently named map and dirty Project documents with native atomic checkpoints. No Save As or arbitrary file path.",
+        R"({"type":"object","properties":{"expectedProject":{"type":"string"},"expectedMap":{"type":"string"},"expectedOwnerVersion":{"type":"string"},"confirmed":{"type":"boolean"}},"required":["expectedProject","expectedMap","expectedOwnerVersion","confirmed"],"additionalProperties":false})",
+        [](const Json&)->Json{throw std::runtime_error("Requires an authenticated HTML5 Studio agent link");});
+    addLinked("studio_asset_history_reset_review","Read a review of a damaged asset checkpoint. Archive/reset apply remains native UI only.",
+        R"({"type":"object","properties":{"expectedProject":{"type":"string"}},"required":["expectedProject"],"additionalProperties":false})",
+        [](const Json&)->Json{throw std::runtime_error("Requires an authenticated HTML5 Studio agent link");});
     // ---------------------------------------------------------------- rules
     add("rules_get", "Read rules.json or a part of it by path (e.g. 'types.footman', 'resources', 'triggers[0]'). No path = whole file. "
         "Rules split over files (rules.json \"include\") read as one document; \"extends\" entries are shown as written, "
@@ -682,11 +1175,10 @@ void Workspace::registerCoreOps() {
         R"({"properties": {"path": {"type": "string"}, "value": {}}, "required": ["path", "value"]})", [this, needProject, rulesChanged](const Json& p) {
             needProject();
             Json backup = project.rulesJson;
+            const bool wasDirty=project.rulesDirty;
             *jsonPath(project.rulesJson, ps(p, "path"), true) = p["value"];
             try { rulesChanged("Правила: " + ps(p, "path")); }
-            catch (...) { project.rulesJson = backup; project.reloadRules(); throw; }
-            std::string err;
-            if (!project.saveRules(&err)) throw std::runtime_error(err);
+            catch (...) { project.rulesJson = std::move(backup); project.reloadRules(); project.rulesDirty=wasDirty; throw; }
             Json r = ok();
             r.set("summary", str("Правила: " + ps(p, "path")));
             return r;
@@ -695,15 +1187,14 @@ void Workspace::registerCoreOps() {
         R"({"properties": {"path": {"type": "string"}, "value": {"type": "object"}}, "required": ["path", "value"]})", [this, needProject, rulesChanged](const Json& p) {
             needProject();
             Json backup = project.rulesJson;
+            const bool wasDirty=project.rulesDirty;
             std::function<void(Json&, const Json&)> merge = [&](Json& dst, const Json& src) {
                 if (!src.isObject() || !dst.isObject()) { dst = src; return; }
                 for (auto& [k, v] : src.members()) { Json* d = dst.find(k); if (d) merge(*d, v); else dst.set(k, v); }
             };
             merge(*jsonPath(project.rulesJson, ps(p, "path"), true), p["value"]);
             try { rulesChanged("Правила: " + ps(p, "path")); }
-            catch (...) { project.rulesJson = backup; project.reloadRules(); throw; }
-            std::string err;
-            if (!project.saveRules(&err)) throw std::runtime_error(err);
+            catch (...) { project.rulesJson = std::move(backup); project.reloadRules(); project.rulesDirty=wasDirty; throw; }
             Json r = ok();
             r.set("summary", str("Правила (слияние): " + ps(p, "path")));
             return r;
@@ -712,11 +1203,10 @@ void Workspace::registerCoreOps() {
         R"({"properties": {"path": {"type": "string"}}, "required": ["path"]})", [this, needProject, rulesChanged](const Json& p) {
             needProject();
             Json backup = project.rulesJson;
+            const bool wasDirty=project.rulesDirty;
             if (!erasePath(project.rulesJson, ps(p, "path"))) throw std::runtime_error("path not found");
             try { rulesChanged("Правила: удалено " + ps(p, "path")); }
-            catch (...) { project.rulesJson = backup; project.reloadRules(); throw; }
-            std::string err;
-            if (!project.saveRules(&err)) throw std::runtime_error(err);
+            catch (...) { project.rulesJson = std::move(backup); project.reloadRules(); project.rulesDirty=wasDirty; throw; }
             Json r = ok();
             r.set("summary", str("Правила: удалено " + ps(p, "path")));
             return r;
@@ -776,10 +1266,14 @@ void Workspace::registerCoreOps() {
                 if (!listed) {
                     Json e = Json::object();
                     e.set("file", str(rel)); e.set("title", str(ps(p, "title", map.data.name)));
+                    Json backup=project.manifest;
                     project.manifest.member("maps");
                     if (!project.manifest["maps"].isArray()) project.manifest.set("maps", Json::array());
                     project.manifest.find("maps")->push(e);
-                    project.saveManifest(&err);
+                    if(!project.saveManifest(&err)){
+                        project.manifest=std::move(backup);
+                        throw std::runtime_error("Map saved, but manifest update failed: "+err);
+                    }
                 }
             }
             Json r = ok();
@@ -1105,6 +1599,114 @@ void Workspace::registerCoreOps() {
             r.set("summary", str("Поле ресурса " + res));
             return r;
         });
+    add("map_area","Create, edit or remove a named map rectangle [x,z,width,height]. Renaming updates map triggers and wave routes.",
+        R"({"properties":{"action":{"enum":["create","edit","remove"]},"name":{"type":"string"},"newName":{"type":"string"},"rect":{"type":"array","items":{"type":"number"},"minItems":4,"maxItems":4}},"required":["action","name"]})",
+        [this](const Json& p){
+            const auto action=p.getStr("action"),name=p.getStr("name"),next=p.getStr("newName",name);
+            if(action!="create" && action!="edit" && action!="remove")throw std::runtime_error("Unknown area action");
+            if(map.data.worldSpace || name.empty() || next.empty())throw std::runtime_error("Expected a named map area");
+            auto& extra=map.data.extra;
+            Json areas=extra["areas"];
+            if(areas.isNull())areas=Json::object();
+            if(!areas.isObject())throw std::runtime_error("The map areas block must be an object");
+            if(action=="create" ? areas.has(name) : !areas.has(name))throw std::runtime_error(action=="create"?"Area already exists":"Unknown area");
+            if(name!=next && areas.has(next))throw std::runtime_error("Area name already exists");
+            const auto& rect=p["rect"];
+            if(action!="remove" && (!rect.isArray() || rect.size()!=4 ||
+               !std::all_of(rect.items().begin(),rect.items().end(),[](const Json& n){return n.isNumber() && std::isfinite(n.toDouble());}) ||
+               rect[2].toDouble()<=0 || rect[3].toDouble()<=0))
+                throw std::runtime_error("Use four coordinates and a positive width and height");
+            if(action=="edit" && next==name && areas[name]==rect)return ok();
+            Json triggers,waves;
+            bool changedTriggers=false,changedWaves=false;
+            if(action!="create" && (action=="remove" || name!=next)){
+                const auto referenced=[&](const Json& row){return row.getStr("area")==name;};
+                bool ruleReference=false;
+                for(const auto& trigger:project.rulesJson["triggers"].items()){
+                    ruleReference|=referenced(trigger["event"]);
+                    for(const char* key:{"conditions","actions"})for(const auto& row:trigger[key].items())ruleReference|=referenced(row);
+                }
+                for(const auto& hazard:project.rulesJson["hazards"].items())ruleReference|=referenced(hazard);
+                if(ruleReference)throw std::runtime_error("Project rules reference this area. Update the rules first.");
+                auto updateRef=[&](Json* ref,bool& changed){
+                    if(!ref || !ref->isString() || ref->str()!=name)return;
+                    if(action=="remove")throw std::runtime_error("Remove this area's trigger or wave references first");
+                    *ref=Json::string(next);changed=true;
+                };
+                triggers=extra["triggers"];
+                for(auto& trigger:triggers.itemsMut()){
+                    if(auto* event=trigger.find("event"))updateRef(event->find("area"),changedTriggers);
+                    for(const char* key:{"conditions","actions"})if(auto* rows=trigger.find(key))
+                        for(auto& row:rows->itemsMut())updateRef(row.find("area"),changedTriggers);
+                }
+                waves=extra["waves"];
+                for(auto& wave:waves.itemsMut())if(auto* route=wave.find("route"))
+                    for(auto& point:route->itemsMut())updateRef(&point,changedWaves);
+            }
+            if(action=="remove" || name!=next)areas.erase(name);
+            if(action!="remove")areas.set(next,rect);
+            map.beginEdit();
+            extra.set("areas",std::move(areas));
+            if(changedTriggers)extra.set("triggers",std::move(triggers));
+            if(changedWaves)extra.set("waves",std::move(waves));
+            note({Change::Map,0,0,-1,-1,-1,"Map area: "+name});
+            return ok();
+        });
+    const auto regionLetter = [this](const Json& params) {
+        if (map.data.worldSpace || map.data.planet()) throw std::runtime_error("Regions require a flat map");
+        const auto letter = params.getStr("letter");
+        if (letter.size() != 1 || letter.front() < 'A' || letter.front() > 'Z')
+            throw std::runtime_error("Choose a region letter from A to Z");
+        return letter.front();
+    };
+    add("region_list", "List region names and exact cell counts, with a bounded coverage map for the selected letter.",
+        R"({"properties":{"letter":{"type":"string"}},"required":["letter"]})",
+        [this, regionLetter](const Json& params) {
+            const char selected = regionLetter(params);
+            const auto& d = map.data;
+            if (d.w <= 0 || d.h <= 0 || d.regions.size() != size_t(d.w) * d.h)
+                throw std::runtime_error("Region grid is unavailable");
+            const int stride = std::max(1, (std::max(d.w, d.h) + 95) / 96);
+            std::vector<std::string> coverage((d.h + stride - 1) / stride, std::string((d.w + stride - 1) / stride, '.'));
+            int counts[26]{};
+            for (int y = 0; y < d.h; ++y) {
+                for (int x = 0; x < d.w; ++x) {
+                    const char c = d.regions[d.idx(x, y)];
+                    if (c >= 'A' && c <= 'Z') ++counts[c - 'A'];
+                    if (c == selected) coverage[y / stride][x / stride] = '#';
+                }
+            }
+            Json entries = Json::array(), rows = Json::array();
+            for (char c = 'A'; c <= 'Z'; ++c) {
+                Json entry = Json::object();
+                entry.set("letter", str(std::string(1, c)));
+                const auto name = d.regionNames.find(c);
+                entry.set("name", str(name == d.regionNames.end() ? "" : name->second));
+                entry.set("cells", num(counts[c - 'A']));
+                entries.push(std::move(entry));
+            }
+            for (const auto& row : coverage) rows.push(str(row));
+            Json result = ok();
+            result.set("regions", entries); result.set("coverage", rows);
+            result.set("stride", num(stride)); result.set("width", num(d.w)); result.set("height", num(d.h));
+            return result;
+        });
+    add("region_name", "Set the display name for a region. An empty name clears the label and keeps painted cells.",
+        R"({"properties":{"letter":{"type":"string"},"name":{"type":"string"}},"required":["letter","name"]})",
+        [this, regionLetter](const Json& params) {
+            const char c = regionLetter(params);
+            if (!params["name"].isString()) throw std::runtime_error("Expected a region display name");
+            const auto name = params.getStr("name");
+            if (name.size() > 256) throw std::runtime_error("Region name exceeds 256 bytes");
+            auto& names = map.data.regionNames;
+            auto previous = names.find(c);
+            if (previous == names.end() ? name.empty() : previous->second == name) return ok();
+            map.beginEdit();
+            if (name.empty()) names.erase(c);
+            else names[c] = name;
+            note({Change::Map,0,0,-1,-1,-1,std::string("Region name: ") + c});
+            return ok();
+        });
     add("region_paint", "Paint a region (Northgard-style territory) with a letter (A-Z, '.' erases); optional display name.",
         (std::string(R"({"properties": {"letter": {"type": "string"}, "name": {"type": "string"}, )") + kShapeSchema + R"(}, "required": ["letter"]})").c_str(),
         [this](const Json& p) {
@@ -1239,22 +1841,40 @@ void Workspace::registerCoreOps() {
             r.set("summary", str(added ? "Дорога добавлена" : "Дорога удалена"));
             return r;
         });
-    add("player_set", "Change player N (1-based): name, team, faction, start [x,z] (faction start units spawn there), waves (scripted side), resources {id: amount}, "
+    add("player_set", "Change player N (1-based): name, team, faction, start [x,z] (faction start units spawn there) (on a planet: {body,face,x,y}) or null to clear it, waves (scripted side), resources {id: amount}, "
         "ai {preset: easy|normal|hard|rush|defender|economist, thinkTicks, aggression, any rules ai knob} for this slot's computer player ({} clears it).",
         R"({"properties": {"player": {"type": "integer"}, "name": {"type": "string"}, "team": {"type": "integer"}, "faction": {"type": "string"},
-            "start": {"type": "array", "items": {"type": "number"}}, "waves": {"type": "boolean"}, "resources": {"type": "object"},
+            "start": {"type": ["array","object","null"], "items": {"type": "number"}}, "waves": {"type": "boolean"}, "resources": {"type": "object"},
             "ai": {"type": "object"}}, "required": ["player"]})",
         [this](const Json& p) {
             int n = pi(p, "player");
+            if(n<1 || (n>int(map.data.players.size()) && n>16)) throw std::runtime_error("player out of range");
+            const auto& start=p["start"];
+            if(start.isObject()){
+                const int index=map.data.findBody(start.getStr("body"));
+                if(index<0 || !map.data.bodies[size_t(index)].surface()) throw std::runtime_error("Unknown starting surface");
+                const auto within=[](const Json& v,int limit){
+                    return v.isNumber() && v.toDouble()>=0 && v.toDouble()<=limit;
+                };
+                const int size=map.data.bodies[size_t(index)].faceSize;
+                if(!within(start["face"],5) || start["face"].toDouble()!=start["face"].integer() ||
+                   !within(start["x"],size) || !within(start["y"],size)) throw std::runtime_error("Invalid start on planet face");
+            }
             map.beginEdit();
             while (int(map.data.players.size()) < n && map.data.players.size() < 16)
                 map.data.players.push_back({"Player " + std::to_string(map.data.players.size() + 1), int(map.data.players.size() + 1)});
-            if (n < 1 || n > int(map.data.players.size())) throw std::runtime_error("player out of range");
             auto& pl = map.data.players[size_t(n - 1)];
             if (p.has("name")) pl.name = ps(p, "name");
             if (p.has("team")) pl.team = pi(p, "team");
             if (p.has("faction")) pl.faction = ps(p, "faction");
-            if (p.has("start")) { pl.hasStart = true; pl.startX = float(p["start"][0].toDouble()); pl.startZ = float(p["start"][1].toDouble()); }
+            if (p.has("start")) {
+                pl.hasStart=!start.isNull();
+                pl.startAt=start.isObject()?start:Json{};
+                if(pl.hasStart){
+                    pl.startX=float((start.isObject()?start["x"]:start[0]).toDouble());
+                    pl.startZ=float((start.isObject()?start["y"]:start[1]).toDouble());
+                }
+            }
             if (p.has("waves")) pl.waves = p.getBool("waves");
             if (p.has("ai")) {   // validated like the loader does (map players[i].ai)
                 game::parseAIPlayerRules(p["ai"], "players[" + std::to_string(n - 1) + "].ai");
@@ -1311,13 +1931,13 @@ void Workspace::registerCoreOps() {
     });
 
     // ---------------------------------------------------------------- testing
-    add("match_run", "Run a fast bot-vs-bot match on the open map (headless, deterministic) and report the outcome: winner, duration, "
+    registerNativeSimulationCheck(*this, {"match_run", "Run a fast bot-vs-bot match on the open map (headless, deterministic) and report the outcome: winner, duration, "
         "per-player economy/army timeline, event counts and fired triggers; optional event log. Use it to balance and to verify a map is playable.",
-        R"({"properties": {"seconds": {"type": "number", "description": "time limit, default 900"}, "seed": {"type": "integer"},
+        schema(R"({"properties": {"seconds": {"type": "number", "description": "time limit, default 900"}, "seed": {"type": "integer"},
             "difficulty": {"type": "integer", "description": "0 easy, 1 normal, 2 hard"},
             "events": {"description": "true = log every event (with time, players, objects), or a list of event names"},
             "maxEvents": {"type": "integer"},
-            "saveCheck": {"type": "number", "description": "at this second: save, load into a fresh simulation and run both 10 s without bots; reports whether they stay identical"}}})",
+            "saveCheck": {"type": "number", "description": "at this second: save, load into a fresh simulation and run both 10 s without bots; reports whether they stay identical"}}})"),
         [this, needProject](const Json& p) {
             needProject();
             SimConfig cfg;
@@ -1419,7 +2039,7 @@ void Workspace::registerCoreOps() {
             r.set("checksum", str(cs));
             r.set("summary", str("Тестовый матч: победа " + winner + " за " + std::to_string(sim.tick() / sim.tickRate()) + " с"));
             return r;
-        });
+        }});
 
     // ---------------------------------------------------------------- assets
     add("asset_import", "Copy a file (model .glb/.gltf, texture .png/.jpg, sound .wav/.ogg, font, UI .rml/.rcss) into the game folder.",
@@ -1478,23 +2098,38 @@ void Workspace::registerCoreOps() {
 
     // ---------------------------------------------------------------- editor-only (implemented by the GUI)
     auto gui = [this](const char* name, const char* desc, const char* sch) {
-        Op op{name, desc, schema(sch), [](const Json&) -> Json { throw std::runtime_error("this tool needs the editor window (start aiverse_editor)"); }, true};
+        Op op{name, desc, schema(sch), [](const Json&) -> Json { throw std::runtime_error("Open HTML5 Studio and connect its agent link to use this tool"); }, true};
         registerOp(std::move(op));
     };
-    gui("view_screenshot", "Scene screenshot defaults to clean render-texture capture; clean:false keeps viewport UI. Optional width/height render256..4096 up to8MP, pitch -89..89; camera inspection never changes the map.",
-        R"({"properties": {"window": {"type": "string", "enum": ["all", "scene", "game"]}, "device": {"type": "string", "description": "device preset id (see device_list) or 'none'"}, "clean":{"type":"boolean"}, "width":{"type":"integer"}, "height":{"type":"integer"}, "x": {"type": "number"}, "y": {"type": "number"}, "z": {"type": "number"}, "distance": {"type": "number"}, "pitch": {"type": "number"}, "yaw": {"type": "number"}}})");
-    gui("view_focus", "Move the editor camera to look at x,y,z (y and distance optional).",
+    gui("view_screenshot", "HTML Studio captures its full main window by default (window: all). Game and PHYSIS capture their own visible native viewports. Scene screenshot defaults to clean render-texture capture; clean:false keeps viewport UI. Optional width/height render256..4096 up to8MP, pitch -89..89; camera inspection never changes the map.",
+        R"({"properties": {"window": {"type": "string", "enum": ["all", "scene", "game", "physis"]}, "device": {"type": "string", "description": "device preset id (see device_list) or 'none'"}, "clean":{"type":"boolean"}, "width":{"type":"integer"}, "height":{"type":"integer"}, "x": {"type": "number"}, "y": {"type": "number"}, "z": {"type": "number"}, "distance": {"type": "number"}, "pitch": {"type": "number"}, "yaw": {"type": "number"}}})");
+    gui("view_gizmos","Read or update Scene overlays for the local PHYSIS diagnostic heatmap, wind, fire spread, river flow, terrain slope, tree wind and erosion zones. Optional select is the map entity ID. Radius and spacing are metres. Use a non-clean Scene screenshot to capture overlays.",
+        R"({"properties":{"physisOutlines":{"type":"boolean"},"physisRadius":{"type":"integer","minimum":6,"maximum":24},"physisStride":{"type":"integer","minimum":1,"maximum":4},"physisLayer":{"type":"integer","minimum":0,"maximum":13},"physisHeatmap":{"type":"boolean"},"physisWind":{"type":"boolean"},"physisFire":{"type":"boolean"},"nereidFlow":{"type":"boolean"},"nereidAllWater":{"type":"boolean"},"terraSlope":{"type":"boolean"},"terraSlopeAtTarget":{"type":"boolean"},"terraTreeWind":{"type":"boolean"},"erosionZones":{"type":"boolean"},"radius":{"type":"number"},"spacing":{"type":"number"},"select":{"type":"string"}}})");
+    gui("view_ground","Read displayed ground heights in metres for world-space [x,z] points, in input order. Entity terrain maps sample terrain tile meshes with heightfield fallback.",
+        R"({"properties":{"points":{"type":"array","items":{"type":"array","minItems":2,"items":{"type":"number"}}}},"required":["points"]})");
+    gui("view_pick","Inspect a point in the visible Scene using normalized u,v coordinates from the top left. Returns hit, map entity index and entityId. HTML Studio also reports the picked document objectId. The current selection is preserved.",
+        R"({"properties":{"u":{"type":"number","minimum":0,"maximum":1},"v":{"type":"number","minimum":0,"maximum":1}},"required":["u","v"]})");
+    gui("view_focus", "Focus the visible Scene camera on x,y,z. On a planet, x,z are cells on the face under the center of the viewport. Height defaults to zero on planar maps. Distance is optional.",
         R"({"properties": {"x": {"type": "number"}, "y": {"type": "number"}, "z": {"type": "number"}, "distance": {"type": "number"}}, "required": ["x", "z"]})");
-    gui("play_start", "Play-test the open map inside the editor window (bots on all sides unless 'human' is set). The user watches live.",
-        R"({"properties": {"speed": {"type": "number"}, "human": {"type": "integer", "description": "player slot controlled by the user, 0 = bots only"}, "device": {"type": "string"}}})");
-    gui("play_stop", "Stop the play-test and return to editing.", "{}");
-    gui("play_status", "Current play-test state: time, players, resources, units, result.", "{}");
+    addLinked("play_start","Launch the open map or client menu in the HTML Studio Game window.",
+        R"({"properties":{"speed":{"type":"number"},"human":{"type":"integer"},"device":{"type":"string"},"client":{"type":"boolean"}}})",requireStudioLink);
+    addLinked("play_stop", "Stop the Studio play-test and return to editing.", "{}",requireStudioLink);
+    gui("region_ownership_diagnostics", "Read last successful live region ownership reconciliation; requires running editor simulation.", "{}");
+    addLinked("editor_select","Select map entities by docs with optional focus, inspect a project rule by key, the map, a named area, a region letter, a zero-based entity or a one-based player, or clear selection.",R"({"properties":{"docs":{"type":"array","items":{"type":"integer","minimum":0}},"refs":{"type":"array","items":{"type":["integer","string"]}},"epoch":{"type":"string"},"focus":{"type":"boolean"},"kind":{"type":"string","enum":["entity","player","area","region","type","resource","tech","faction","map","none"]},"key":{"type":"string"},"index":{"type":"integer","minimum":0}}})",requireStudioLink);
+    addLinked("geometry_stats","Read the last rendered Studio Scene geometry counters and completed GPU timings.","{}",requireStudioLink);
+    addLinked("editor_theme","Set Studio theme and accent.",R"({"properties":{"mode":{"type":"string","enum":["dark","light"]},"accent":{"type":"string","enum":["blue","violet","teal","orange"]}}})",requireStudioLink);
+    addLinked("editor_window","Open or close a panel, switch workspace or restore the layout.", R"({"properties":{"id":{"type":"string"},"open":{"type":"boolean"},"resetLayout":{"type":"boolean"},"workspace":{"type":"string","enum":["scene","world","look","animate","character","logic","publish"]}}})",requireStudioLink);
+    addLinked("world_regions_status","Read region ownership in the current preview or match.","{}",requireStudioLink);
+    addLinked("world_entities","List and group filtered objects in the edit or play world.",R"({"properties":{"filter":{"type":"string"},"group":{"type":"array","items":{"type":"string"}},"limit":{"type":"integer"}}})",requireStudioLink);
+    addLinked("world_entity","Inspect a world object by reference or map index.",R"({"properties":{"ref":{"type":"integer","minimum":1},"doc":{"type":"integer","minimum":0}}})",requireStudioLink);
+    addLinked("editor_windows","List HTML Studio panels and their open state.", "{}",requireStudioLink);
+    addLinked("play_status", "Current Studio play-test time, players, resources, units and result.", "{}",requireStudioLink);
     gui("play_units", "Live objects of the running play-test: id (for play_command), map name, type, owner, position, hp, orders, statuses. "
         "Filter by owner / type; at most 'limit' (default 200).",
         R"({"properties": {"owner": {"type": "integer"}, "type": {"type": "string"}, "limit": {"type": "integer"}}})");
     registerOp({"play_command", "Issue a player command in the running play-test, exactly like player input (the user sees it live). command: " +
         commandNames() + ". " + kCommandHelp, schema((std::string(R"({"properties": {)") + commandSchemaProps() + R"(}, "required": ["command"]})").c_str()),
-        [](const Json&) -> Json { throw std::runtime_error("this tool needs the editor window (start aiverse_editor)"); }, true});
+        [](const Json&) -> Json { throw std::runtime_error("Open HTML5 Studio and connect its agent link to use this tool"); }, true});
     gui("device_list", "Device presets for the simulator (phones, tablets, desktops).", "{}");
     gui("device_set", "Show the viewport in a device frame (resolution, notch/safe area, orientation) like a phone simulator. 'none' turns it off.",
         R"({"properties": {"device": {"type": "string"}, "orientation": {"type": "string", "enum": ["portrait", "landscape"]}}, "required": ["device"]})");

@@ -4,6 +4,8 @@
 #include "../../engine/data/Json.h"
 #include <vector>
 namespace aiverse::projectile {
+// Provenance is assigned by the shared chain policy and preserved by hosts.
+enum class FlightOrigin : uint8_t { Unknown, Emission, Split, Ricochet };
 enum class ProjectileModKind : uint8_t { Damage, Speed, Radius, Split, Ricochet, FlyThrough };
 struct ProjectileModifier {
     ProjectileModKind kind = ProjectileModKind::Damage;
@@ -18,6 +20,9 @@ struct ProjectileFlight {
     Fixed gravity{}, verticalSpeed{}; // acceleration down local up; launch velocity along up
     uint16_t splitBudget = 64;
     std::vector<ProjectileModifier> modifiers;
+    // Target-fitted arc, evaluated by a host with an aim point.
+    bool arc = false;
+    Fixed arcHeight{}, arcHeightPerDistance{};
 };
 ProjectileFlight parseProjectileFlight(const Json& j, const std::string& where);
 }

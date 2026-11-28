@@ -83,7 +83,7 @@ AIVERSE liefert die Mechaniken selbst – und macht das Spiel zu etwas, an dem e
 | **Multiplayer heißt endlose Desyncs.** Ein einziges `float` genügt, damit ein Match zwischen iPhone und Android auseinanderläuft. | Die Simulation ist überall bitgenau identisch: Festkomma statt Gleitkomma, eigener Zufallsgenerator, Prüfsummen. Die CI vergleicht bei jedem Push Matches auf Linux x64/ARM64, Windows und macOS. Über das Netz gehen nur Befehle; es gibt Lockstep mit Rollback und einen Server mit Matchmaking und Entscheidungen anhand von Replays. |
 | **Mobile GPUs sind schwach, das Spiel soll trotzdem gut aussehen.** | Jede teure Funktion – Schatten, Partikel, Terrain, Post-Effekte – hat Qualitätsstufen und passt sich der GPU an, von alten Mali- und Adreno-Chips bis Apple Silicon. |
 | **Die Veröffentlichung auf allen Plattformen ist ein eigenes Projekt.** Signaturen, Icons, Store- und Werbe-SDKs. | `aiversebuild` erzeugt mit einem Befehl eine .app, ein Xcode-Projekt, Gradle/APK, Web und .exe. Icons und Startbildschirme werden generiert. Plugins für App Store, Google Play, RuStore, Yandex Games, Steam, AdMob, AppLovin und mehr – ein Build enthält nur die, die das Spiel auswählt. |
-| **Jedes neue Spiel beginnt bei null.** | Über 30 spielbare Vorlagen, Genre-Kits mit Abnahme-Checklisten, 238 Skills für Agenten. Ein neues Spiel beginnt mit einem, das bereits funktioniert. |
+| **Jedes neue Spiel beginnt bei null.** | Über 30 spielbare Vorlagen, Genre-Kits mit Abnahme-Checklisten, 303 Skills für Agenten. Ein neues Spiel beginnt mit einem, das bereits funktioniert. |
 | **Meta und LiveOps werden in jedem Projekt neu geschrieben.** | `aiverse::meta`: Shop, Währungen, Quests, Pässe, tägliche Belohnungen, Energie, Clans, Turniere, Truhen mit Pity-System – in JSON konfiguriert. |
 
 ---
@@ -227,7 +227,7 @@ Vorlagen sind Pakete des [Katalogs](https://chromealex.github.io/AIVERSE/catalog
 - Andockbarer Editor im Unity-Stil: Szene, Inspector, Terrain, Effekte, Beleuchtung, UI, Testspiel und Gerätesimulator
 - `aiversemcp` – MCP-Server für Agenten – PHYSIS-Kartenkonfiguration, Validierung und Undo/Redo
 - Assistent **Spiel erstellen**
-- 238 Skills für Agenten und Genre-Kits mit Abnahme-Checklisten
+- 303 Skills für Agenten und Genre-Kits mit Abnahme-Checklisten
 - Importer für Assets klassischer Spiele aus Ihrer eigenen Kopie
 
 </td>
@@ -260,12 +260,18 @@ Windows: `studio_windows.cmd [project]` baut und öffnet `AiverseStudio.exe` (br
 CMake, Node.js; läuft auf WebView2 Runtime und Vulkan).
 
 `studio_mac.command` baut die Web-Oberfläche und das native Studio und öffnet es. Nur die Engine:
-`cmake -S . -B build/mac -DCMAKE_BUILD_TYPE=Release && cmake --build build/mac -j 8`. Der bisherige
-ImGui-Editor (`build/mac/AiverseEditor.app`) wird weiter gebaut und läuft unter Linux und Windows.
+`cmake -S . -B build/mac -DCMAKE_BUILD_TYPE=Release && cmake --build build/mac -j 8`.
 
-Linux: `cmake --preset linux-release && cmake --build build/linux-release`. Wer nicht kompilieren möchte,
-findet im Branch `builds` vorgefertigte Editor- und Tool-Builds
-([Details](docs/de/overview.md#fertige-engine-branch-builds-und-aiversemcp-ohne-compiler)).
+Unter Linux nutzt HTML5 Studio WebKitGTK 4.1 (2.40 oder neuer), SQLite, X11 und Vulkan. Installiere ihre Entwicklungspakete sowie Node.js, CMake und Ninja und baue die Web-Oberfläche, bevor du Studio konfigurierst.
+
+```bash
+(cd apps/studio-web && npm install && npm run build)
+cmake --preset linux-release -DAIVERSE_BUILD_STUDIO_HTML5=ON -DAIVERSE_BUILD_EDITOR=OFF
+cmake --build --preset linux-release --target aiverse_studio
+./build/linux-release/apps/studio-native/AiverseStudio
+```
+
+Nur die Engine unter Linux: `cmake --preset linux-release -DAIVERSE_BUILD_STUDIO_HTML5=OFF -DAIVERSE_BUILD_EDITOR=OFF` und `cmake --build --preset linux-release`. Der Branch `builds` enthält auch fertige Tools. [Fertige Engine und Tools](docs/de/overview.md#fertige-engine-branch-builds-und-aiversemcp-ohne-compiler)
 
 **2. Spiel erstellen.** Im Hub auf **Spiel erstellen** klicken oder ein Projekt aus einer Vorlage anlegen.
 Im Game-Fenster lässt es sich sofort gegen Bots spielen.

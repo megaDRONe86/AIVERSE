@@ -330,6 +330,10 @@ struct ModelDraw {
     // (layers & Renderer3D::visibilityMask()) != 0; skipped draws also cast
     // no shadow in that view. Default layer 0 (bit 1).
     uint32_t layers = 1;
+    // Explicit all-pass visibility for ephemeral rigid draws. Caller must
+    // certify visibility in every view (including shadow/reflection).
+    const std::vector<uint8_t>* nodeMask = nullptr;
+    uint32_t flashColor = 0; // 0 = legacy warm highlight, otherwise packed RGB8 + 1
 };
 
 enum DrawFlags : uint32_t {
@@ -701,6 +705,10 @@ public:
                                     const Material& material,
                                     ModelVirtualTextureBinding& out) const {
         out = {};
+        // A custom resolver must not resurrect a retired or stale tracked
+        // base slot through its external VT domain.
+        if(material.baseTex>=0&&size_t(material.baseTex)<model.images.size()&&
+           !resolveMaterialImage(model,material,&Material::baseTex))return false;
         if (!modelVirtualTextureResolver_ ||
             !modelVirtualTextureResolver_(model,material,out) ||
             !out.valid()) {
@@ -753,6 +761,18 @@ public:
     // before starting another draw submission; no GPU resources are owned here.
     void invalidateStaticModelCache(uint64_t persistentId);
     void invalidateModelCachesFor(const Model* model);
+    // Known renderer-owned CPU roots. Never dereference a borrowed
+    // previous-scene Material pointer. False means unresolved replay/raw
+    // table references, so a complete native root certificate is forbidden.
+    // Returned spans are valid only until the next renderer mutation.
+    bool appendGraphImageRoots(const Model& model,std::vector<std::span<const Material>>& roots) const;
+    // Explicit host contract: final CPU submission and all replay/provenance
+    // consumers of the scene are finished. Invalidates the old scene only,
+    // never destroys GPU resources or waits for GPU completion.
+    // Non-mutating preflight for hosts with more than one renderer. All
+    // participants must agree before any previous-scene state is discarded.
+    bool canDetachCompletedGraphImageReplay() const noexcept;
+    bool detachCompletedGraphImageReplay() noexcept;
     // Hierarchical wind masks (WindRigShader.h). Scene wind drives every
     // rigged draw that does not supply its own vertexParameters; the debug
     // view (editors only) recolours rigged materials by part/depth/weight.
@@ -925,6 +945,10 @@ public:
     // With a post hook: ends the scene pass, runs the effects into screenPass (left open). No-op otherwise.
     // Call after everything that belongs to the 3D scene (particles), before UI.
     void resolvePrisma(); // canonical image processing resolve; leaves UI pass open
+    // One-shot consumer of real main depth, after its writer ends, only on
+    // the offscreen post-process path. Callback must finish any compute pass.
+    using SceneDepthConsumer=std::function<void(gfx::Device&,gfx::TextureHandle,const mat4&,float3)>;
+    void consumeResolvedSceneDepth(SceneDepthConsumer fn){sceneDepthConsumer_=std::move(fn);}
     // Presentation-only camera cut / teleport / view replacement hooks.
     // Invalidating a view keeps GPU target allocations but discards all
     // previous transform and deformation history. No ECS mutation.
@@ -1014,6 +1038,15 @@ public:
                                                    int width, int height)>;
     void addMotionReactiveDraw(MotionReactiveDraw fn) {
         if (fn) motionReactiveDraws_.push_back(std::move(fn));
+    }
+    // Frame-scoped display-referred draws after PRISMA resolve and before UI.
+    // Callback only submits to the open output pass, with original scene depth
+    // available read-only. Width/height describe OUTPUT pixels (depth UV is normalized).
+    // Returns false without an active postprocessor: the host must use its LDR path.
+    using DisplayDraw = MotionReactiveDraw;
+    bool addDisplayDraw(DisplayDraw fn) {
+        if(!post_ || !resolvedDepthSource_.valid() || !fn)return false;
+        displayDraws_.push_back(std::move(fn));return true;
     }
     void resolvePostFx() { resolvePrisma(); } // legacy API
     // Extra renderers (sprites, tiles) that draw with their own pipelines inside the main pass: run
@@ -1191,7 +1224,7 @@ public:
                         !item.prim || !item.mat || !item.indexCount ||
                         !item.model->vb.valid() || !item.model->ib.valid() ||
                         item.tint.w < 0.99f || item.dissolve > 0.0f ||
-                        item.mat->alpha == AlphaMode::Blend ||
+                        alphaBlended(item.mat->alpha) ||
                         item.mat->transparent ||
                         item.materialRole == 1 || item.shadowRole == 2)
                         continue;
@@ -1298,9 +1331,20 @@ public:
     void bindTrace(int textureSlot);
     bool ssrActive() const { return ssrThisFrame_; }       // the scene targets are bound this frame (water SSR)
 
+    void setMaterialScheme(std::string scheme) { materialScheme_ = std::move(scheme); }
+    const std::string& materialScheme() const { return materialScheme_; }
     void setMaterialQuality(MaterialQuality q);
+    // Borrowed linear RGBA16F EnvironmentIbl atlas (130x330 legacy or
+    // 130x460 with integrated BRDF LUT); caller retains it until
+    // all renderer GPU reads complete. No ownership or scene-wide fallback.
+    bool setModelEnvironment(gfx::TextureHandle atlas,float rotation=0.f,float intensity=1.f){
+        if(atlas.valid()&&(!dev_||dev_->maxFragmentTextureSlots()<14||!dev_->supports(gfx::PixelFormat::RGBA16F)||
+            !std::isfinite(rotation)||!std::isfinite(intensity)||intensity<0.f||intensity>8.f))return false;
+        modelEnvironment_=atlas;modelEnvironmentRotation_=rotation;modelEnvironmentIntensity_=intensity;return true;
+    }
     MaterialQuality materialQuality() const { return matQuality_; }
     static MaterialQuality defaultMaterialQualityFor(const gfx::Device& dev, bool mobile);
+    void clearModelError() { modelError_.clear(); }
     const std::string& modelError() const { return modelError_; }   // last model shader failure
 
     const mat4& viewProj() const { return viewProj_; }
@@ -1644,7 +1688,7 @@ public:
 private:
     wind::SceneWind sceneWind_{};
     wind::WindDebugView windDebugView_ = wind::WindDebugView::Off;
-    struct WindDebugMaterials { uint64_t revision = 0; size_t count = 0; std::vector<Material> materials; };
+    struct WindDebugMaterials { const Model* model=nullptr; uint64_t revision = 0; size_t count = 0; std::vector<Material> materials; };
     std::unordered_map<const void*, WindDebugMaterials> windDebugMaterials_;
     bool applyWindRig(const ModelDraw& d);
     struct DrawItem {
@@ -1686,7 +1730,7 @@ private:
         gfx::DrawIndexedIndirectCommand gpuLodNear{}, gpuLodFar{};
         float gpuLodMaxPixels = 0, gpuLodError = 0;
         float3 gpuLodBoundsMin{}, gpuLodBoundsMax{};
-        mat4 world; float4 tint; float3 team; float flash; uint32_t flags;
+        mat4 world; float4 tint; float3 team; float flash; uint32_t flags; uint32_t flashColor = 0;
         uint64_t motionPersistentId = 0; // 0: transient, never tracked
         int motionNodeIndex = -1;
         int32_t joints;     // offset into jointData_ (floats), -1 when not palette-skinned
@@ -1821,6 +1865,8 @@ private:
     int sceneW_ = 0, sceneH_ = 0;
     PostProcess* post_ = nullptr;      // set by render() when the hook is active, cleared by resolvePrisma()
     gfx::PassDesc postOut_;
+    gfx::TextureHandle resolvedDepthSource_;
+    SceneDepthConsumer sceneDepthConsumer_;
 
     // trace tier
     bool traceWanted_ = true;
@@ -1829,6 +1875,8 @@ private:
     // Reset every beginScene; secondary elevations use SSR/environment only.
     bool reflectionPlaneValid_ = false;
     float reflectionPlaneY_ = 0.f;
+    gfx::TextureHandle modelEnvironment_{};
+    float modelEnvironmentRotation_=0.f,modelEnvironmentIntensity_=1.f;
     bool modelReflections_ = false; // opt-in opaque PBR SSR; High trace + HDR only
     bool hdrFrame_ = false;
     HeightField heightField_;
@@ -1947,6 +1995,7 @@ private:
     void drawGeometryBatch(const uint32_t* items, uint32_t count, int phase);
     bool geometryMainView_ = true;
     int geometryShadowSize_=0;
+    std::string materialScheme_ = "default";
     MaterialQuality matQuality_ = MaterialQuality::High;
     std::vector<ModelItem> modelItems_;
     StrataPreviewStats strataPreviewStats_{};
@@ -2077,6 +2126,7 @@ private:
     uint64_t motionLastSubmittedFence_ = 0; // 0: unknown, never guess
     ObjectMotionStats objectMotionStats_{};
     std::vector<MotionReactiveDraw> motionReactiveDraws_;
+    std::vector<DisplayDraw> displayDraws_;
     gfx::ShaderHandle objectMotionShader_;
     gfx::PipelineHandle objectMotionPipeline_;
     gfx::ShaderHandle objectMotionInstancedShader_;
@@ -2209,8 +2259,9 @@ private:
     struct ModelShaderKey {
         uint32_t variant;
         std::shared_ptr<const graph::Program> graph;
+        gfx::BlendMode blend = gfx::BlendMode::Opaque;
         bool operator==(const ModelShaderKey& other) const {
-            if (variant != other.variant) return false;
+            if (variant != other.variant || blend != other.blend) return false;
             if (graph == other.graph) return true;
             if (!graph || !other.graph) return false;
             // Material fragment and vertex shader source are backend-specific.

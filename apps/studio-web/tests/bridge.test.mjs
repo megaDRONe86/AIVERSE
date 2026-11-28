@@ -4,10 +4,10 @@ import { stripTypeScriptTypes } from 'node:module';
 import vm from 'node:vm';
 import test from 'node:test';
 
-function bridge() {
+function bridge(range = 1) {
   const sent = [], timers = new Map();
   let timerId = 0;
-  const window = { webkit: { messageHandlers: { aiverse: {
+  const window = { crypto: { getRandomValues(array) { array[0]=range; return array; } }, webkit: { messageHandlers: { aiverse: {
     postMessage: request => sent.push(request)
   } } } };
   const context = { window,
@@ -43,10 +43,46 @@ test('slow native calls are logged, never failed, and late replies still resolve
   assert.equal((await result).mode, 'edit');
 });
 
+test('two WebViews with pending requests resolve only their own broadcast reply',async()=>{
+  const first=bridge(0xffffffff), second=bridge(8);
+  const atlas=first.invoke('studio.lightBakeAtlas',{}), snapshot=second.invoke('studio.snapshot',{});
+  const atlasId=first.sent[0].id, sceneId=second.sent[0].id;
+  assert.ok(Number.isSafeInteger(atlasId) && atlasId < 2**47);
+  assert.notEqual(atlasId,sceneId);
+  for(const web of [first,second])web.window.__aiverseReceive({id:atlasId,result:{png:'atlas'}});
+  assert.equal((await atlas).png,'atlas');
+  assert.equal(second.timers.size,1);
+  second.window.__aiverseReceive({id:sceneId,result:{mode:'edit'}});
+  assert.equal((await snapshot).mode,'edit');
+});
+
+test('Linux window routes requests and replies through its injected transport', async () => {
+  const b = bridge();
+  const sent = [];
+  b.window.__aiverseLinux = { postMessage: request => sent.push(request) };
+  const pending = b.invoke('studio.snapshot', {});
+  assert.equal(b.sent.length, 0);
+  assert.equal(sent[0].method, 'studio.snapshot');
+  b.window.__aiverseReceive({ id: sent[0].id, result: { mode: 'edit' } });
+  assert.equal((await pending).mode, 'edit');
+  assert.equal(b.timers.size, 0);
+});
+
 test('native replies clear ordinary call timers', async () => {
   const b = bridge();
   const result = b.invoke('studio.snapshot', {});
   b.window.__aiverseReceive({ id: b.sent[0].id, result: { mode: 'edit' } });
   assert.equal((await result).mode, 'edit');
   assert.equal(b.timers.size, 0);
+});
+
+test('project navigation carries the exact opaque version and reports native conflict', async () => {
+  const b = bridge();
+  const result = b.invoke('studio.projectHistoryStep', {direction:'undo',expectedVersion:'/game|project|17'});
+  assert.equal(b.sent[0].method,'studio.projectHistoryStep');
+  assert.equal(b.sent[0].params.direction,'undo');
+  assert.equal(b.sent[0].params.expectedVersion,'/game|project|17');
+  b.window.__aiverseReceive({id:b.sent[0].id,error:'Project document changed'});
+  await assert.rejects(result,/Project document changed/);
+  assert.equal(b.timers.size,0);
 });

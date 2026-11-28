@@ -4,6 +4,18 @@
 //   Minimap.cpp   minimap image (CPU raster -> dynamic UI texture)
 //   Lobby.cpp     online play: NetClient, lobby / room screens, network matches
 #pragma once
+#include "engine/view/game/MainCameraShake.h"
+#include "engine/view/MapProjection.h"
+#include "engine/view/game/PlanarMinimap.h"
+#include "ProjectCursors.h"
+#include "engine/view/game/GamePortrait.h"
+#include "MatchFiles.h"
+#ifndef __EMSCRIPTEN__
+#include "engine/net/LanDiscovery.h"
+#include "engine/net/server/Server.h"
+#endif
+#include "engine/render/CameraEdgeScroll.h"
+#include "engine/render/CameraBehavior.h"
 #include "UiModel.h"
 #include "engine/view/game/EntityActionControls.h"
 #include "engine/view/game/TopDownControls.h"
@@ -14,6 +26,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -33,6 +46,8 @@
 #include "engine/render/CameraClientAdapter.h"
 #include "engine/render/CameraModelSnapshot.h"
 #include "engine/render/RenderDeviceLifetime.h"
+#include "engine/render/graph/TextureGraphGpuOwner.h"
+#include "engine/view/RuntimeTextureGraphTask.h"
 #include "engine/services/Store.h"
 #include "engine/sim/Simulation.h"
 #include "engine/ui/UiLayer.h"
@@ -42,6 +57,7 @@
 #include "engine/game/ComputerPlayer.h"
 #include "engine/game/Localize.h"
 #include "engine/game/GameCore.h"
+#include "engine/sim/PresentationEventQueue.h"
 #include "engine/audio/GameAudio.h"
 #include "engine/audio/AudioScriptSound.h"
 #include "engine/view/game/GameView.h"
@@ -56,17 +72,19 @@
 namespace Rml { class ElementDocument; class Element; }
 typedef struct lua_State lua_State;
 
+namespace aiverse::terraweave::caverns {class CaveClientVisualHost;}
+
 namespace aiverse::client {
 
 using namespace aiverse::render;
 using namespace aiverse::game;
 
 struct MapEntry { std::string file, title; };
-struct Notice { std::string text; double until; };
+struct Notice { std::string text, style; double until; };
 
 class Minimap {
 public:
-    void build(gfx::Device& dev, const GameState& gs, const Rules& rules);  // per match: terrain colours, texture
+    void build(gfx::Device& dev, const GameState& gs, const std::string& background, const game::minimap::Layout& layout);
     void update(gfx::Device& dev, const GameState& gs, const Rules& rules, const GameScene& scene, const std::vector<uint8_t>* vision,
                 const float3 (&viewQuad)[4], bool haveQuad, const std::vector<OverlayMinimapMark>* marks = nullptr);
     void release(gfx::Device& dev);
@@ -74,6 +92,7 @@ public:
     int width() const { return w_; }
     int height() const { return h_; }
     float cellsPerPixel() const { return cellsPerPx_; }
+    float3 pointer(float u,float v) const { return bounds_.point(u,v); }
     // planet maps (MinimapPlanet.cpp): a globe around the camera focus, or the system seen from above
     void buildPlanet(gfx::Device& dev, const GameView& view);
     void updatePlanet(gfx::Device& dev, const GameView& view, const GameScene& scene, const Rules& rules, bool fog);
@@ -91,7 +110,10 @@ private:
     gfx::TextureHandle tex_;
     int w_ = 0, h_ = 0, gridW_ = 0, gridH_ = 0;
     float cellsPerPx_ = 1;
+    ::aiverse::view::MapProjection bounds_;
+    bool rectangle_ = false;
     std::vector<uint32_t> base_, pixels_;
+    game::minimap::Raster raster_;   // planar maps: shared with the Studio overlay preview
 };
 
 class GameClient {
@@ -99,6 +121,8 @@ class GameClient {
     struct ScriptUiApi;     // ClientScriptUi.cpp: scripthost.event / send for engine/ui/lib/scriptui.lua
     friend struct ScriptUiApi;
 public:
+    GameClient();
+    ~GameClient(); // out-of-line: owns an optional incomplete-type Caverns GPU host
     // Embedded GameClient shares its editor's gfx::Device generation.
     // Standalone client creates an epoch automatically during initStep(0).
     void setGpuDeviceLease(render::RenderDeviceLifetime::Lease lease) {
@@ -113,9 +137,34 @@ public:
     bool mapLoading() const { return mapLoading_; }
     static float initWeight(int step);   // share of the loading progress bar
     void frame(gfx::Device& dev, double dt);
+    // Presentation-only native API. Invoke on the graphics owner thread;
+    // graph generation is asynchronous and the exact target is rechecked at commit.
+    Json startRuntimeTextureMaterial(size_t type,size_t choice,size_t material,
+        const Json& graph,const Json& overrides=Json::object(),
+        const render::texture_graph::ResidentMaterialOptions& options={});
+    Json runtimeTextureMaterialStatus() const;
+    // Provider certifies external roots (not spans into renderer/camera
+    // internals). The client also inspects its own renderer and LENS roots.
+    // detachCompletedReplay permits discarding old CPU scene diagnostics
+    // and replay state only after the provider certifies all use is finished.
+    // recycleSlots requires permanent detachment of stale raw references.
+    void setAutomaticRuntimeGraphImageCollection(GameView::GraphImageRootProvider provider,
+        bool recycleSlots=false,bool detachCompletedReplay=false);
+    std::optional<GameView::GraphMaterialTargetInfo> runtimeTextureMaterialTarget(size_t type,size_t choice,size_t material) const;
+    // Synchronous native borrow. Release before frame(), mutation or shutdown;
+    // never keep the raw handle across the scope.
+    render::texture_graph::NativeGraphImageRead readRuntimeTextureMaterialImage(
+        size_t type,size_t choice,const view::LiveAppearanceMaterialTarget& target,
+        std::string_view output)const;
+    // The external certificate covers consumers outside this client; its own
+    // renderer and LENS roots are always checked, without detaching replay.
+    render::texture_graph::GraphImageReclaimResult collectRuntimeTextureMaterialImages(size_t type,size_t choice,size_t material,
+        const view::LiveAppearanceMaterialTarget& target,const render::texture_graph::GraphImageRoots& external);
+    bool cancelRuntimeTextureMaterial(const std::string& request);
     void event(const platform::Event& e);
+    bool canShutdown() const noexcept { return !view_.modelMutationBlocked(); }
     void shutdown();
-    void autostart(size_t i) { startMatch(i); }
+    void autostart(size_t i, std::optional<uint8_t> localSeat={}) { startMatch(i,Json(),nullptr,false,localSeat); }
     void forceLanguage(std::string tag) { forcedLanguage_ = std::move(tag); }
     void spectate() { spectator_ = true; }
     void showHowto() { howtoOpen_ = true; }
@@ -123,17 +172,29 @@ public:
     void previewScreen(std::string luaCode) { uiPreview_ = true; uiPreviewLua_ = std::move(luaCode); }   // --howto: open "How to play" over the menu
 
     // called from UI event listeners
-    void minimapPointer(float u, float v);   // u, v in [0, 1] of the minimap image
+    void minimapPointer(float u, float v, bool ping = false, bool pressed = true);   // u, v in [0, 1] of the minimap image
 
     // Hosting (the editor's Game window, apps/editor/ClientHost.cpp): frames render into these textures
     // instead of the screen; the host also sets platform::setHostedView around every call.
     void setHostTarget(gfx::TextureHandle color, gfx::TextureHandle depth, int w, int h) { hostColor_ = color; hostDepth_ = depth; hostW_ = w; hostH_ = h; }
+    GameView::AssetResidencyStats assetResidencyStats() const { return view_.assetResidencyStats(); }
+    const game::ViewScripts& viewScripts() const { return viewScripts_; }
     Simulation* simulation() { return sim_.get(); }
+    // Editor Play/hosted clients: update visual cave SDF without restarting
+    // the current match. This is presentation-only, never a physics ACK.
+    bool updateCavernsVisual(const Json& authored);
+
     // Host "Play from here" (Studio): the first camera of the next match (target x, z; distance; pitch and
     // yaw in degrees) instead of the fitted one. Applied once, then cleared.
     void setStartCamera(float x, float z, float distance, float pitchDeg, float yawDeg) {
         startCamera_[0] = x; startCamera_[1] = z; startCamera_[2] = distance; startCamera_[3] = pitchDeg; startCamera_[4] = yawDeg;
         hasStartCamera_ = true;
+    }
+    const render::GeometryScene& staticGeometry() const { return view_.geometryScene(); }
+    const render::Prisma& prismaDiagnostics() const { return prisma_; }
+    void setHostPostQuality(render::PrismaQuality quality) {
+        hostPostQuality_=quality;
+        prisma_.setQuality(quality);
     }
     bool inMatch() const { return !mapLoading_ && sim_ != nullptr && (screen_ == Screen::Playing || screen_ == Screen::Paused || screen_ == Screen::Over); }
     const std::string& errorText() const { return error_; }
@@ -155,15 +216,36 @@ public:
     bool hostCanControl() const;
     bool hostPaused() const;
     bool hostCanStep() const;
+    size_t hostMapIndex() const{return mapIndex_;}
     bool setHostPaused(bool paused);
+    double simulationSpeed() const;
+    bool setHostSpeed(double speed);
+    bool hostCheckpoint(bool restore);
+private:
+    double hostSpeed_=0;
+    std::string hostCheckpoint_;
+public:
     bool requestHostStep();
 
 private:
-    bool hostPaused_ = false, hostStep_ = false;
+    bool appendRuntimeGraphImageRoots(const render::Model& model,
+        std::vector<std::span<const render::Material>>& roots)const;
+    bool hostPaused_ = false;
+    uint32_t pendingHostSteps_ = 0;
     enum class Screen { Menu, Lobby, Playing, Paused, Over };
-    enum class Mode { Normal, AttackMove, Patrol, Place, Rally, Ability, Claim, Skill, Dig, Undig, Room, Road, Unroad, Drop, ScriptCmd, Repair, Reclaim };
+    enum class Mode { Normal, Move, AttackMove, Patrol, Place, Rally, Ability, Claim, Skill, Dig, Undig, Room, Road, Unroad, Drop, ScriptCmd, Repair, Reclaim };
 
-    void startMatch(size_t idx, const Json& initialVars = Json());
+    bool startMatch(size_t idx, const Json& initialVars = Json(), const MatchFile* file = nullptr, bool playback = false, std::optional<uint8_t> localSeat = {});
+    bool writeMatchFile(const std::string& slot, bool replay);
+    bool openMatchFile(const std::string& slot, bool replay);
+    std::vector<std::string> matchFileList(bool replay) const;
+    Json matchSetup_;
+    uint64_t matchContentHash_ = 0;
+    std::optional<Replay> playback_;
+    double playbackSpeed_ = 1;
+    bool playbackPaused_ = false;
+    bool slotsDirty_ = true;
+    std::vector<std::string> saveSlots_, replaySlots_;
     std::function<void(uint16_t)> typeAssetLoader_;
     void configureLoading();
     void updateBackgroundLoading();
@@ -209,9 +291,16 @@ private:
         c.player = human_;
         if (!c.units.empty()) sound_.onCommand(*sim_, c.units[0], c.type);
         sim_->submit(c);
+        presentOrder(c);
     }
+    void presentOrder(const Command& c);
+    void attachNoticeEvents(bool confirmedOnly);
     void processEvents();
-    void notice(const std::string& t) { notices_.push_back({t, time_ + 2.5}); if (notices_.size() > 4) notices_.erase(notices_.begin()); }
+    std::shared_ptr<PresentationEventQueue<SimEvent>> noticeEvents_;
+    void acknowledgeSelectionClick(Entity target);
+    void beginBuildPlacement(uint16_t type);
+    void noticeMissingResource(int64_t resource);
+    void notice(const std::string& text, double duration = 2.5, std::string style = {});
     void cleanSelection();
     bool selectionHasGarrison() const;
     bool selectionBuilds() const;
@@ -234,6 +323,8 @@ private:
     void updateUi();
     void buildTopBar(UiState& s);
     void buildCommandCard(UiState& s);
+    void layoutCommandCard(UiState& s);
+    std::string cardPage_;
     // ClientScriptCmd.cpp: rules "commands" (script commands) on the card, hotkeys, targeting, view.send
     const std::vector<game::ScriptCommandDef>* scriptCommands();
     bool scriptCommandFits(const game::ScriptCommandDef& d);
@@ -335,6 +426,13 @@ private:
     gfx::Device* dev_ = nullptr;
     std::unique_ptr<render::RenderDeviceLifetime> ownedGpuLifetime_;
     render::RenderDeviceLifetime::Lease gpuDeviceLease_;
+    // Separate presentation host from the editor Scene; never shares mutable
+    // Model snapshots or request handles with that host.
+    render::texture_graph::TextureGraphGpuOwner runtimeTextureGraph_;
+    std::optional<view::RuntimeTextureGraphTask> runtimeTextureTask_;
+    std::string runtimeTextureState_="idle",runtimeTextureReason_,runtimeTextureRequest_;
+    inline static constexpr const char* runtimeTextureScope_="game-client";
+    void tickRuntimeTextureMaterial(gfx::Device& dev);
     gfx::TextureHandle hostColor_, hostDepth_;   // setHostTarget: invalid = the screen
     int hostW_ = 0, hostH_ = 0;
     int fbW() const { return hostColor_.valid() ? hostW_ : dev_->framebufferWidth(); }
@@ -362,6 +460,8 @@ private:
     std::unique_ptr<Rml::EventListener> minimapListener_;
     Rml::Element* minimapEl_ = nullptr;
     UiState ui_state_, bound_;
+    std::map<platform::Key, int> cardKeys_;
+    std::vector<Entity> cardKeySelection_;
     std::vector<std::function<void()>> actions_, nextActions_;
     int shadowQuality_ = 0, boundShadowQuality_ = 0;
     render::QualityGovernor quality_;   // adaptive shadow/light tiers by frame time (lighting agent)
@@ -374,7 +474,15 @@ private:
     bool skillDragging_ = false, skillOverWorld_ = false;
     float skillStartX_=0, skillStartY_=0;
     int64_t skillTouch_=-1;
+    void buildMinimap(const Json& map);
+    const SceneObject* shortcutUnit(int type, bool idleWorker);
+    void buildSelectionShortcut(UiState& state);
+    bool visibleSelectionUnit(Entity e);
+    void buildSelectionData(UiState& state);
     Minimap minimap_;
+    std::vector<OverlayPing> pendingPings_;
+    std::vector<SimEvent> pendingOrders_;
+    void pingMap(float3 point);
 
     Renderer3D r3d_;
     render::CameraClientAdapter lensCameras_;
@@ -382,12 +490,17 @@ private:
     bool lensCamerasActive_=false;
     // streamed static world (map "streamedWorld": {"async": true, ...}, docs/large-worlds.md): chunks around the camera
     std::unique_ptr<world::WorldScene> worldScene_;
+    // Shared native GameClient and Editor Play visual-only cave presentation.
+    // No physics or NavMesh authority is claimed by this optional owner.
+    std::unique_ptr<terraweave::caverns::CaveClientVisualHost> cavernsVisual_;
+    Json lastCavernsVisualJson_;
     // Stage41: ordered nonblocking CPU/GPU samples only when the streamed
     // world's Horizon adaptive presentation quality is explicitly enabled.
     terraweave::HorizonFrameTimingBridge horizonFrameTiming_;
     int worldRadius_ = 2;
     render::PrismaVolumeStack prismaVolumes_; // camera-local PRISMA presentation profiles, nonauthoritative
     render::Prisma prisma_;               // post-processing: game.json / map "postfx" (engine/render/Prisma.h)
+    std::optional<render::PrismaQuality> hostPostQuality_;
     render::PrismaQuality prismaBase_ = render::PrismaQuality::Medium;   // tier before the governor stepped down
     void configurePrisma(const Json& map);
     // PHYSIS nature presentation (fire/smoke, sound, vegetation + water wind, sky)
@@ -400,6 +513,12 @@ private:
     void configureBakedLighting(const std::string& mapFile);
     GameView view_;
     ClientSpine spine_;
+    game::Portrait selectionPortrait_;
+    ::aiverse::view::ModelPreview portraitModel_;
+    Entity portraitSubject_;
+    int portraitSize_ = 192;
+    bool showPortrait_ = false, portraitFailed_ = false, portraitBlank_ = false;
+    void renderSelectionPortrait();
     ClientServices services_;
     ClientGamepad gamepad_;               // pad cursor / pan / zoom / bindings (ClientGamepad.cpp)
     bool padInjecting_ = false;
@@ -421,6 +540,10 @@ private:
     game::ScriptSound* scriptSound_ = nullptr;          // set once the audio engine is up
     std::vector<Entity> heardSelection_;  // selection when the last select sound played
     Camera cam_;
+    std::optional<Camera> campaignCamera_;
+    render::CameraLook encounterLook_;
+    game::MainCameraShake cameraShake_;
+    std::unordered_map<uint16_t, std::vector<Json>> shakeBindings_;
     aiverse::Vec2 screenSize_{};        // map screen being framed (BW multiscreen)
     bool screenFramed_ = false;
     Json manifest_, rulesJson_;
@@ -434,6 +557,11 @@ private:
     std::string forcedLanguage_;
 
     // online play
+    void stopLan();
+#ifndef __EMSCRIPTEN__
+    net::LanDiscovery lanDiscovery_;
+    std::unique_ptr<net::Server> lanRelay_;
+#endif
     std::vector<net::MapInfo> netMaps_;
     std::string netAddress_ = "127.0.0.1", netName_, netError_, chatInput_, roomName_;
     std::vector<std::string> chat_;
@@ -457,6 +585,8 @@ private:
     double time_ = 0;
     std::string error_;
     std::vector<Notice> notices_;
+    std::vector<size_t> activeNoticeIndices_;
+    bool messageLogOpen_ = false;
 
     // input
     ClientInputRouting inputShortcuts_;  // presentation-only semantic Actions -> validated Commands
@@ -473,7 +603,8 @@ private:
     float rectX_ = 0, rectY_ = 0;
     bool fireHeld_ = false, walkHeld_ = false;   // possession: mouse buttons held
     float steerX_ = 0, steerZ_ = 0;
-    bool steerFire_ = false;
+    bool steerFire_ = false, steerCrouching_ = false;
+    float steerYaw_ = 0;
     Entity steerTarget_;
     uint32_t lastSteerTick_ = 0;
     bool howtoOpen_ = false;
@@ -486,6 +617,11 @@ private:
     bool regionEvent(const platform::Event&, bool);
     uint32_t regionTick_ = UINT32_MAX;
     bool boxing_ = false, panning_ = false, sendDrag_ = false;
+    render::CameraEdgeScroll edgeScroll_;
+    render::EdgeScrollPointer edgePointer_;
+    render::float2 cursorEdge_{};
+    ProjectCursors cursors_;
+    std::string cursorState();
     float downX_ = 0, downY_ = 0, mouseX_ = -1, mouseY_ = -1;
     double lastClickTime_ = 0;
     Entity hover_;

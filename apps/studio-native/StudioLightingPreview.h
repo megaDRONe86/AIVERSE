@@ -2,16 +2,35 @@
 #include "StudioTerrainGeometry.h"
 #include "StudioDocumentVisuals.h"
 #include "engine/render/Model.h"
+#include "engine/render/LightmapUv.h"
+#include "engine/bake/LightmapData.h"
 #include <set>
 namespace aiverse::studio {
+// modelFromParts emits the ground as the first mesh and node 1 after its root.
+inline void studioTerrainLightmapUv(render::Model& model,const bake::LightmapData::Terrain& terrain) {
+    if(terrain.page<0 || terrain.extent[0]<=0 || terrain.extent[1]<=0 || model.meshes.empty())return;
+    for(auto& part:model.meshes.front().primitives){
+        for(size_t i=part.firstVertex;i<size_t(part.firstVertex)+part.vertexCount;++i){
+            auto& v=model.vertices[i];
+            render::setLightmapUv(v,{(v.pos.x-terrain.origin[0])/terrain.extent[0],
+                                     (v.pos.z-terrain.origin[1])/terrain.extent[1]});
+        }
+        part.lightmapUv=true;
+    }
+}
 // Uses exactly the existing document preview geometry, not game assets. This
 // PBR representation enables the shared receiver/GI passes on that preview.
 inline std::unique_ptr<render::Model> studioLightingPreview(const editor::MapDoc& doc,
-                                                         bool fps,float levelHeight,const std::set<std::string>& excluded={}) {
+                                                         bool fps,float levelHeight,const std::set<std::string>& excluded={},
+                                                         const render::MeshBuilder* sharedTerrain=nullptr) {
     using namespace render;
     MeshBuilder ground,box;box.color(rgba(255,255,255));box.box({0,0,0},{1,1,1});
     const auto proxies=studioDocumentProxies(doc,fps,levelHeight);
-    if(fps) {
+    if(sharedTerrain) {
+        // Exact same clipped heightfield as the unlit Scene. Empty is
+        // intentional: never seal a fully cut opening with a fallback box.
+        ground=*sharedTerrain;
+    } else if(fps) {
         float3 lo{-3,0,-3},hi{3,0,3};
         if(!proxies.empty()) {
             lo=proxies.front().boundsMin;hi=proxies.front().boundsMax;
@@ -23,7 +42,7 @@ inline std::unique_ptr<render::Model> studioLightingPreview(const editor::MapDoc
         ground.color(rgba(46,66,84));
         ground.box({(lo.x+hi.x)*.5f,lo.y-.08f,(lo.z+hi.z)*.5f},
                    {hi.x-lo.x+2.f,.12f,hi.z-lo.z+2.f});
-    } else if(doc.data.extra.getStr("terrainPresentation","legacy")!="entities" && !buildTerrainPreview(doc.data,ground,levelHeight).quads) {
+    } else if(doc.data.extra.getStr("terrainPresentation","legacy")!="entities" && !buildTerrainPreview(doc.data,ground,levelHeight).handled) {
         ground.color(rgba(46,66,84));
         const float w=float(std::max(1,doc.data.w)),h=float(std::max(1,doc.data.h));
         ground.box({w*.5f,-.08f,h*.5f},{w,.12f,h});

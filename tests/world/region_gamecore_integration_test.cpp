@@ -1,0 +1,379 @@
+// Real GameCore + NativeModule integration of the shared region lifecycle.
+// No new genre host and no changes to games that omit this opt-in module.
+#include "engine/game/GameCore.h"
+#include "engine/game/Native.h"
+#include "engine/game/Components.h"
+#include "engine/data/JsonCompose.h"
+#include "engine/world/RegionLifecycleRuntime.h"
+#include "engine/world/VehicleRegionTransfer.h"
+#include "engine/actor/ActorComponents.h"
+#include <aiverselib/mechanics/InteractionPersistence.h>
+#include "tests/AlwaysCheck.h"
+#include <cstdint>
+#include <iostream>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+using namespace aiverse;
+namespace g=aiverse::game;
+namespace w=aiverse::world;
+
+namespace fixture {
+constexpr uint16_t kCommand=61537; // test native module command, not player input
+struct RegionWork {
+    int32_t completed=0;
+    std::string assignment="idle";
+};
+void io(Archive& archive,RegionWork& state) {
+    archive(state.completed,state.assignment);
+}
+
+struct Links { std::vector<Entity> targets; };
+void io(Archive& archive,Links& links) { archive(links.targets); }
+
+class Native final:public g::NativeModule {
+public:
+    void setup(g::GameCore&,Simulation& sim,g::NativeState& state,const Json&)const override {
+        w::RegionDormancyController controller;
+        if(!controller.registerComponent<RegionWork>("fixture.region_work",1))
+            throw std::logic_error("region work codec registration");
+        auto admit=[](const Simulation&,w::Cell,std::span<const Entity>){return true;};
+        w::RegionLifecycleRuntime::GuardedPolicy guarded{{},admit,admit};
+        guarded.plan.addPaused<RegionWork>("fixture.region_work");
+        auto paused=[&]<class T>(const char* name){
+            if(!controller.registerComponent<T>(name,1) || !guarded.plan.addPaused<T>(name))
+                throw std::logic_error("mixed component codec registration");
+        };
+        paused.operator()<vehicles::VehicleDrive>("fixture.drive");
+        paused.operator()<vehicles::VehicleOccupant>("fixture.occupant");
+        paused.operator()<actor::LocomotionBody>("fixture.motor");
+        paused.operator()<lib::mechanics::BreakableInstance>("fixture.breakable");
+        sim.registerPersistentComponent<lib::mechanics::BreakableInstance>("fixture.breakable",1);
+        sim.registerPersistentComponent<actor::LocomotionBody>("fixture.motor",1);
+        guarded.mayPark=[](const Simulation& sim,w::Cell,std::span<const Entity> group){
+            auto resolve=[&](int64_t slot){
+                const auto& values=sim.world().resourceConst<g::NativeStore>()->modules.at(0).values;
+                const auto it=values.find("passenger");
+                return slot==7 && it!=values.end() ? Entity::fromPacked(uint64_t(it->second)) : kNullEntity;
+            };
+            return w::VehicleRegionTransfer::mayPark(sim.world(),group,resolve);
+        };
+        guarded.references.addComponent<Links>([](const Links& links,auto report) {
+            for(Entity entry:links.targets)report(entry);
+        });
+        w::RegionLifecycleRuntime::installGuarded(sim,std::move(controller),std::move(guarded),1);
+        sim.registerPersistentComponent<Links>("fixture.links",1);
+        sim.registerPersistentComponent<RegionWork>("fixture.region_work",1);
+
+        // Attach to a REAL spawned GameCore Unit, not a dummy GameModule.
+        // Prefer an immobile map structure so the fixture has a stable home.
+        auto& ecs=sim.world();
+        Entity chosen=kNullEntity;
+        ecs.eachExistingConst<g::Unit>([&](Entity e,const g::Unit&){
+            if(!ecs.has<Transform>(e))return;
+            if(ecs.has<g::Footprint>(e) && !chosen.valid())chosen=e;
+        });
+        if(!chosen.valid())ecs.eachExistingConst<g::Unit>(
+            [&](Entity e,const g::Unit&){
+                if(!chosen.valid() && ecs.has<Transform>(e))chosen=e;
+            });
+        if(!chosen.valid())throw std::runtime_error("no live GameCore map unit");
+        const w::Cell region=w::SpatialWorld(32).cell(ecs.get<Transform>(chosen).pos);
+        auto* ledger=ecs.resource<w::RegionEntityLedger>();
+        if(!ledger || !w::RegionEcsBridge::bindNew(
+                ecs,*ledger,chosen,1001,region))
+            throw std::runtime_error("cannot bind real GameCore unit to region");
+        ecs.add<RegionWork>(chosen,RegionWork{5,"city-duty"});
+        state.values["entity"]=int64_t(chosen.packed());
+        state.values["cell_x"]=region.x;
+        state.values["cell_y"]=region.y;
+        state.values["cell_z"]=region.z;
+    }
+    void tick(g::GameCore&,Simulation& sim,g::NativeState& state)const override {
+        auto& ecs=sim.world();
+        Entity e=Entity::fromPacked(uint64_t(state.values.at("entity")));
+        if(!ecs.alive(e) || ecs.has<w::RegionDormant>(e))return;
+        // The host's behaviour explicitly skips the parked component.
+        if(auto* work=ecs.tryGet<RegionWork>(e)) ++work->completed;
+    }
+    void command(g::GameCore&,Simulation& sim,g::NativeState& state,
+                 const Command& cmd)const override {
+        if(cmd.player!=1 || (cmd.param!=1 && cmd.param!=2) ||
+           !cmd.units.empty())return;
+        const w::Cell region{
+            int32_t(state.values.at("cell_x")),
+            int32_t(state.values.at("cell_y")),
+            int32_t(state.values.at("cell_z"))
+        };
+        // A validated authoritative game command, never a presentation call.
+        if(!w::RegionLifecycleRuntime::request(sim,region,cmd.param==2))
+            throw std::runtime_error("region activation queue unavailable");
+    }
+};
+std::unique_ptr<g::NativeModule> factory(){
+    return std::make_unique<Native>();
+}
+}
+
+static std::unique_ptr<Simulation> make(bool enabled) {
+    const std::string base=std::string(AIVERSE_TEMPLATES_DIR)+"/mushrooms/";
+    Json rules=readComposedJson(base+"rules.json",fileReader());
+    const Json map=Json::parseFile(base+"maps/duel.json");
+    std::vector<g::NativeDefinition> definitions;
+    if(enabled) {
+        rules.set("nativeModules",Json::parse(R"([{"id":"region_lifecycle_fixture","command":61537}])"));
+        definitions.push_back({"region_lifecycle_fixture",1,&fixture::factory});
+    }
+    auto sim=std::make_unique<Simulation>(
+        SimConfig{29,20,0,true},std::make_unique<g::GameCore>(std::move(definitions)));
+    sim->setup(rules,map);
+    return sim;
+}
+static Entity target(Simulation& sim){
+    const auto* store=sim.world().resourceConst<g::NativeStore>();
+    AIVERSE_TEST_CHECK(store && store->modules.size()==1);
+    return Entity::fromPacked(uint64_t(store->modules[0].values.at("entity")));
+}
+static w::Cell region(Simulation& sim) {
+    const auto* state=sim.world().resourceConst<g::NativeStore>();
+    AIVERSE_TEST_CHECK(state);
+    const auto& v=state->modules[0].values;
+    return {int32_t(v.at("cell_x")),int32_t(v.at("cell_y")),int32_t(v.at("cell_z"))};
+}
+static void command(Simulation& sim,int64_t action,uint8_t player=1) {
+    Command cmd;
+    cmd.player=player;
+    cmd.type=fixture::kCommand;
+    cmd.param=action;
+    sim.submit(std::move(cmd));
+    sim.step();
+}
+static void verifyLiveGameCore() {
+    auto first=make(true);
+    auto peer=make(true);
+    auto& world=first->world();
+    const Entity e=target(*first);
+    AIVERSE_TEST_CHECK(world.alive(e) && world.has<g::Unit>(e));
+    AIVERSE_TEST_CHECK(world.has<fixture::RegionWork>(e));
+    AIVERSE_TEST_CHECK(first->checksum()==peer->checksum());
+    const auto origin=region(*first);
+    const auto* initial=world.resourceConst<w::RegionEntityLedger>();
+    AIVERSE_TEST_CHECK(initial && initial->activeIn(origin)==std::vector<uint64_t>{1001});
+
+    // Real GameCore: native command schedules a transition; shared system
+    // processes it in Simulation::step and native module skips parked work.
+    command(*first,1);command(*peer,1);
+    AIVERSE_TEST_CHECK(first->checksum()==peer->checksum());
+    AIVERSE_TEST_CHECK(world.has<w::RegionDormant>(e));
+    AIVERSE_TEST_CHECK(!world.has<fixture::RegionWork>(e));
+    AIVERSE_TEST_CHECK(world.has<g::Unit>(e)); // core gameplay entity stays allocated
+    const auto* cold=world.resourceConst<w::RegionColdStore>();
+    AIVERSE_TEST_CHECK(cold && cold->size()==1);
+    AIVERSE_TEST_CHECK(world.resourceConst<w::RegionActivationQueue>()->pending.empty());
+
+    // Invalid player cannot change a region. Native command ownership is enforced.
+    const auto before=first->checksum();
+    command(*first,2,2);
+    AIVERSE_TEST_CHECK(world.has<w::RegionDormant>(e));
+    AIVERSE_TEST_CHECK(world.resourceConst<w::RegionActivationQueue>()->pending.empty());
+    AIVERSE_TEST_CHECK(first->checksum()!=before); // tick/sequence changed, not ownership
+
+    const auto parked=first->serialize();
+    auto reloaded=make(true);
+    std::string error;
+    AIVERSE_TEST_CHECK(reloaded->deserialize(parked,&error));
+    AIVERSE_TEST_CHECK(reloaded->checksum()==first->checksum());
+    AIVERSE_TEST_CHECK(reloaded->world().has<w::RegionDormant>(target(*reloaded)));
+
+    command(*first,2);
+    command(*reloaded,2);
+    AIVERSE_TEST_CHECK(first->checksum()==reloaded->checksum());
+    AIVERSE_TEST_CHECK(!world.has<w::RegionDormant>(e));
+    AIVERSE_TEST_CHECK(world.has<fixture::RegionWork>(e));
+    AIVERSE_TEST_CHECK(world.get<fixture::RegionWork>(e).assignment=="city-duty");
+    AIVERSE_TEST_CHECK(world.get<fixture::RegionWork>(e).completed>=6);
+
+    first->world().enableCowSnapshots();
+    SimSnapshot snap;
+    first->saveState(snap);
+    const auto hash=first->checksum();
+    command(*first,1);
+    AIVERSE_TEST_CHECK(first->checksum()!=hash);
+    first->loadState(snap);
+    AIVERSE_TEST_CHECK(first->checksum()==hash);
+    AIVERSE_TEST_CHECK(first->world().has<fixture::RegionWork>(e));
+    AIVERSE_TEST_CHECK(!first->world().has<w::RegionDormant>(e));
+
+    // Games without the native module never get an extra W1 resource.
+    auto regular=make(false);
+    AIVERSE_TEST_CHECK(!regular->world().resourceConst<w::RegionEntityLedger>());
+    AIVERSE_TEST_CHECK(!regular->world().resourceConst<w::RegionActivationQueue>());
+    AIVERSE_TEST_CHECK(!regular->world().resourceConst<w::RegionColdStore>());
+    AIVERSE_TEST_CHECK(!regular->serialize().empty());
+}
+
+static void idleRegionSchedulerDoesNotCopyColdState() {
+    auto game=make(true);
+    auto& ecs=game->world();
+    const auto* before=ecs.resourceConst<w::RegionColdStore>();
+    AIVERSE_TEST_CHECK(before);
+    ecs.enableCowSnapshots();
+    SimSnapshot snap;
+    game->saveState(snap);
+    w::RegionDormancyController policy;
+    AIVERSE_TEST_CHECK(policy.registerComponent<fixture::RegionWork>("fixture.region_work",1));
+    AIVERSE_TEST_CHECK(w::RegionLifecycleRuntime::step(*game,policy,1)==0);
+    AIVERSE_TEST_CHECK(ecs.resourceConst<w::RegionColdStore>()==before);
+    // A second registration must be rejected before overwriting the owned
+    // ledger or queue, including when the registry has already been sealed.
+    bool rejected=false;
+    try {
+        w::RegionLifecycleRuntime::install(*game,std::move(policy),1);
+    } catch(const std::logic_error&) { rejected=true; }
+    AIVERSE_TEST_CHECK(rejected);
+    AIVERSE_TEST_CHECK(ecs.resourceConst<w::RegionColdStore>()==before);
+}
+
+static void blockedRequestDoesNotLoseActors() {
+    auto game=make(true);
+    auto& ecs=game->world();
+    auto* ledger=ecs.resource<w::RegionEntityLedger>();
+    auto* cold=ecs.resource<w::RegionColdStore>();
+    const Entity e=target(*game);
+    const auto cell=region(*game);
+    AIVERSE_TEST_CHECK(ledger && cold);
+    // A ledger owner without a live ECS binding is a load/reification fault.
+    // The scheduler must keep the request, not silently park the other actor.
+    AIVERSE_TEST_CHECK(ledger->spawn(9999,cell));
+    AIVERSE_TEST_CHECK(w::RegionLifecycleRuntime::request(*game,cell,false));
+    const auto before=game->checksum();
+    w::RegionDormancyController policy;
+    AIVERSE_TEST_CHECK(policy.registerComponent<fixture::RegionWork>("fixture.region_work",1));
+    AIVERSE_TEST_CHECK(w::RegionLifecycleRuntime::step(*game,policy,1)==0);
+    AIVERSE_TEST_CHECK(game->checksum()==before);
+    AIVERSE_TEST_CHECK(ecs.has<fixture::RegionWork>(e));
+    AIVERSE_TEST_CHECK(!ecs.has<w::RegionDormant>(e));
+    const auto* queue=ecs.resourceConst<w::RegionActivationQueue>();
+    AIVERSE_TEST_CHECK(queue && queue->pending.size()==1 && queue->applied==0);
+    // A new validated command can replace the failed request without clearing
+    // the ledger identity of any already-living entity.
+    AIVERSE_TEST_CHECK(w::RegionLifecycleRuntime::request(*game,cell,true));
+    AIVERSE_TEST_CHECK(w::RegionLifecycleRuntime::step(*game,policy,1)==0);
+    // An unmaterialized identity blocks both hot and cold transitions.
+    AIVERSE_TEST_CHECK(ecs.has<fixture::RegionWork>(e));
+}
+
+static void externalLinksDelayWholeGroup() {
+    auto game=make(true);
+    auto& ecs=game->world();
+    const Entity first=target(*game);
+    const Entity second=ecs.create();
+    const Entity outsider=ecs.create();
+    const Transform transform=ecs.get<Transform>(first);
+    ecs.add<Transform>(second,transform);
+    AIVERSE_TEST_CHECK(w::RegionEcsBridge::bindNew(ecs,*ecs.resource<w::RegionEntityLedger>(),
+                                                   second,1002,region(*game)));
+    ecs.add<fixture::RegionWork>(second,fixture::RegionWork{7,"passenger"});
+    ecs.add<fixture::Links>(first,fixture::Links{{second}});
+    ecs.add<fixture::Links>(outsider,fixture::Links{{first}});
+    command(*game,1);
+    AIVERSE_TEST_CHECK(ecs.resourceConst<w::RegionColdStore>()->size()==0);
+    AIVERSE_TEST_CHECK(ecs.resourceConst<w::RegionActivationQueue>()->pending.size()==1);
+    auto peer=make(true);
+    std::string error;
+    AIVERSE_TEST_CHECK(peer->deserialize(game->serialize(),&error));
+    for(Simulation* sim:{game.get(),peer.get()}) {
+        auto& world=sim->world();
+        world.remove<fixture::Links>(outsider);
+        world.get<fixture::Links>(first).targets.push_back(outsider);
+        sim->step();
+        AIVERSE_TEST_CHECK(world.resourceConst<w::RegionColdStore>()->size()==0);
+        world.get<fixture::Links>(first).targets.pop_back();
+        sim->step();
+        AIVERSE_TEST_CHECK(world.resourceConst<w::RegionColdStore>()->size()==2);
+        AIVERSE_TEST_CHECK(world.resourceConst<w::RegionActivationQueue>()->pending.empty());
+    }
+    AIVERSE_TEST_CHECK(peer->checksum()==game->checksum());
+    auto fresh=make(true);
+    AIVERSE_TEST_CHECK(fresh->deserialize(game->serialize(),&error));
+    command(*fresh,2);
+    command(*game,2);
+    AIVERSE_TEST_CHECK(fresh->checksum()==game->checksum());
+    AIVERSE_TEST_CHECK(fresh->world().get<fixture::Links>(first).targets.front()==second);
+    AIVERSE_TEST_CHECK(fresh->world().get<fixture::RegionWork>(second).assignment=="passenger");
+}
+
+static void mixedRegionSaveAndWake() {
+    auto game=make(true);
+    auto& ecs=game->world();
+    const Entity object=target(*game);
+    const Entity car=ecs.create();
+    const Entity passenger=ecs.create();
+    const Entity outsider=ecs.create();
+    const std::array members{object,car,passenger};
+    auto current=region(*game);
+    const Transform transform=ecs.get<Transform>(object);
+    for(Entity e:{car,passenger})ecs.add<Transform>(e,transform);
+    auto* ledger=ecs.resource<w::RegionEntityLedger>();
+    AIVERSE_TEST_CHECK(w::RegionEcsBridge::bindNew(ecs,*ledger,car,1002,current));
+    AIVERSE_TEST_CHECK(w::RegionEcsBridge::bindNew(ecs,*ledger,passenger,1003,current));
+    ecs.resource<g::NativeStore>()->modules.at(0).values["passenger"]=int64_t(passenger.packed());
+    vehicles::VehicleDrive drive;
+    drive.driver=passenger;
+    drive.seats.occupants={{1,7}};
+    ecs.add<vehicles::VehicleDrive>(car,drive);
+    vehicles::VehicleOccupant rider;
+    rider.vehicle=car;
+    ecs.add<vehicles::VehicleOccupant>(passenger,rider);
+    ecs.add<actor::LocomotionBody>(passenger,actor::LocomotionBody{});
+    ecs.add<lib::mechanics::BreakableInstance>(object,lib::mechanics::BreakableInstance{31,2,19,false});
+    ecs.add<fixture::Links>(outsider,fixture::Links{{object}});
+    AIVERSE_TEST_CHECK(w::RegionLifecycleRuntime::request(*game,current,false));
+    game->step();
+    AIVERSE_TEST_CHECK(ecs.resourceConst<w::RegionColdStore>()->size()==0);
+    ecs.remove<fixture::Links>(outsider);
+    for(int i=0;i<100;++i){
+        auto& world=game->world();
+        const w::Cell next{current.x+1,current.y,current.z};
+        AIVERSE_TEST_CHECK(w::RegionEcsBridge::transferGroup(world,*world.resource<w::RegionEntityLedger>(),
+                                                             members,current,next));
+        for(Entity e:members)world.get<Transform>(e).pos.x+=Fixed::fromInt(32);
+        if(i==0)AIVERSE_TEST_CHECK(w::RegionLifecycleRuntime::cancel(*game,current));
+        current=next;
+        AIVERSE_TEST_CHECK(w::RegionLifecycleRuntime::request(*game,current,false));
+        game->step();
+        AIVERSE_TEST_CHECK(world.resourceConst<w::RegionColdStore>()->size()==3);
+        AIVERSE_TEST_CHECK(!world.has<vehicles::VehicleDrive>(car) &&
+                           !world.has<actor::LocomotionBody>(passenger) &&
+                           !world.has<lib::mechanics::BreakableInstance>(object));
+        if(i%20==0){
+            auto restored=make(true);
+            std::string error;
+            AIVERSE_TEST_CHECK(restored->deserialize(game->serialize(),&error));
+            AIVERSE_TEST_CHECK(restored->checksum()==game->checksum());
+            game=std::move(restored);
+        }
+        AIVERSE_TEST_CHECK(w::RegionLifecycleRuntime::request(*game,current,true));
+        game->step();
+        auto& hot=game->world();
+        AIVERSE_TEST_CHECK(hot.resourceConst<w::RegionColdStore>()->size()==0);
+        AIVERSE_TEST_CHECK(hot.get<vehicles::VehicleDrive>(car).driver==passenger);
+        AIVERSE_TEST_CHECK(hot.get<vehicles::VehicleDrive>(car).seats.occupants.at(1)==7);
+        AIVERSE_TEST_CHECK(hot.get<vehicles::VehicleOccupant>(passenger).vehicle==car);
+        AIVERSE_TEST_CHECK(hot.has<actor::LocomotionBody>(passenger));
+        AIVERSE_TEST_CHECK(hot.get<lib::mechanics::BreakableInstance>(object).health==31);
+        AIVERSE_TEST_CHECK(hot.resourceConst<w::RegionEntityLedger>()->activeIn(current)==
+                           std::vector<w::RegionEntityId>({1001,1002,1003}));
+    }
+}
+
+int main() {
+    mixedRegionSaveAndWake();
+    externalLinksDelayWholeGroup();
+    idleRegionSchedulerDoesNotCopyColdState();
+    blockedRequestDoesNotLoseActors();
+    verifyLiveGameCore();
+    std::cout<<"PASS real GameCore region lifecycle integration, commands, save and rollback\n";
+}

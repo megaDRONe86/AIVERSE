@@ -44,6 +44,7 @@ struct OvFilter {
 constexpr uint16_t kOvKeyShift = 1000, kOvKeyCtrl = 1001, kOvKeyAlt = 1002, kOvKeySuper = 1003;
 // Pseudo event kind: a ping from the client / editor context (OverlayContext::pings).
 constexpr uint16_t kOvEventPing = 1000;
+constexpr uint16_t kViewEventOrder = 1001; // local client command, never emitted by simulation
 
 struct OvCondition {
     enum Kind : uint8_t { All, Any, Not, Always, Never, Placing, Selected, Hovered, Entity, Key, State, Var, Zoom, Cursor, Mode };
@@ -106,6 +107,8 @@ struct OvEvent {
     uint8_t by = 0, on = 0;          // relation masks: event player / owner of the entity hit (0 = any)
     OvFilter types;                  // type filter of the event entity (types / tags only)
     int max = 32;                    // live popups of this overlay
+    int8_t critical = -1;            // -1 any, 0 ordinary hit, 1 critical hit
+    int32_t bountyResource = -1;     // actual credited resource; skip zero/unpaid
 };
 
 struct OverlayDef {

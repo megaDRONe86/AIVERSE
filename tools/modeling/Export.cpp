@@ -66,8 +66,18 @@ struct Writer {
     }
 };
 } // namespace
-std::string exportGlb(const Model &m) {
+std::string exportGlb(const Model &m) { return exportGlb(m,Json{}); }
+
+std::string exportGlb(const Model &m, const Json& assetExtras) {
+    // Export serializes CPU assets, not live graph slots or tombstones.
+    // Require an explicit authored bake instead of exporting a session
+    // generation by its recycled numerical index.
+    for(const auto& image:m.images)
+        require(!render::runtimeGraphImage(image),"GLB export: runtime graph image requires offline bake");
+    for(const auto& material:m.materials)
+        require(!material.proceduralGraphPins,"GLB export: runtime material binding requires offline bake");
     Writer w;
+    if (!assetExtras.isNull()) w.root.member("asset").set("extras",assetExtras);
     auto scene = Json::object(), roots = Json::array();
     for (size_t i = 0; i < m.nodes.size(); ++i) {
         auto &n = m.nodes[i];
@@ -102,7 +112,8 @@ std::string exportGlb(const Model &m) {
     if (!m.images.empty()) {
         auto images=Json::array(),textures=Json::array(),samplers=Json::array();
         for (const auto& im:m.images) {
-            require(im.width>0 && im.height>0 && im.rgba.size()==size_t(im.width)*size_t(im.height)*4,
+            require(im.width>0 && im.height>0 && size_t(im.width)<=im.rgba.size()/4/size_t(im.height) &&
+                    im.rgba.size()==size_t(im.width)*size_t(im.height)*4,
                     "GLB export: texture CPU pixels unavailable");
             branding::Image pixels;pixels.width=im.width;pixels.height=im.height;pixels.rgba=im.rgba;
             const auto png=branding::encodePng(pixels);
@@ -145,8 +156,10 @@ std::string exportGlb(const Model &m) {
         j.set("emissiveFactor", floats({mt.emissive.x, mt.emissive.y, mt.emissive.z}));
         j.set("doubleSided", Json::fromBool(mt.doubleSided));
         if(mt.thinTransmission>0){auto extras=Json::object();extras.set("aiverseThinTransmission",Json::number(double(mt.thinTransmission),8));j.set("extras",extras);}
-        if (mt.alpha == AlphaMode::Blend)
+        if (alphaBlended(mt.alpha))
             j.set("alphaMode", Json::string("BLEND"));
+        if(mt.alpha==AlphaMode::Additive || mt.alpha==AlphaMode::AdditiveUnweighted)
+            j.member("extras").set("aiverseBlend",Json::string(mt.alpha==AlphaMode::Additive ? "additive" : "additive-unweighted"));
         w.root.member("materials").push(j);
     }
     for (auto &mesh : m.meshes) {

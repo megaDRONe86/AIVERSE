@@ -4,6 +4,7 @@
 #include "VkShaderCompiler.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -244,13 +245,14 @@ bool VulkanDevice::init(const VulkanWindow& window, std::string& error) {
     gpuTiming_ = envOn("AIVERSE_VK_GPU_TIMING");
     if (const char* d = std::getenv("AIVERSE_VK_DEPS"); d && std::strcmp(d, "narrow") == 0) narrowDeps_ = true;
     if (const char* d = std::getenv("AIVERSE_VK_DEPTH_STORE"); d && d[0] == '0') depthStore_ = false;
-    if (gpuTiming_) {
+    {
         uint32_t qn = 0;
         vkGetPhysicalDeviceQueueFamilyProperties(gpu_, &qn, nullptr);
         std::vector<VkQueueFamilyProperties> qs(qn);
         vkGetPhysicalDeviceQueueFamilyProperties(gpu_, &qn, qs.data());
         const uint32_t bits = queueFamily_ < qn ? qs[queueFamily_].timestampValidBits : 0;
-        if (!bits || gpuProps_.limits.timestampPeriod <= 0.f) gpuTiming_ = false;
+        if (!bits || bits>64 || !std::isfinite(gpuProps_.limits.timestampPeriod) || gpuProps_.limits.timestampPeriod <= 0.f) gpuTiming_ = false;
+        else scopeTimestampBits_=bits;
         timestampNs_ = gpuProps_.limits.timestampPeriod;
         timestampMask_ = bits >= 64 ? ~0ull : ((1ull << bits) - 1ull);
     }
@@ -331,7 +333,7 @@ bool VulkanDevice::waitIdle() {
     // The GPU is idle, so pending texture readbacks can be delivered on
     // the owner thread, before their staging allocations are released.
     for(auto& slot:slots_)completeTextureCaptures(slot,true);
-    collectGarbage();
+    deliverComputeReadbacks();collectGarbage();
     return true;
 }
 
@@ -388,6 +390,7 @@ void VulkanDevice::destroyDeviceObjects() {
         vkDestroyBuffer(device_, s.uniforms, nullptr); memory_.release(s.uniformAlloc);
         vkDestroyFence(device_, s.fence, nullptr);
         if (s.timing) vkDestroyQueryPool(device_, s.timing, nullptr);
+        if (s.scopeTiming) vkDestroyQueryPool(device_,s.scopeTiming,nullptr);
         vkDestroySemaphore(device_, s.acquired, nullptr);
         vkDestroyCommandPool(device_, s.pool, nullptr);
     }
@@ -632,9 +635,11 @@ void VulkanDevice::abandonRetirementTokenAfterIdle(uint64_t token) {
 }
 
 void VulkanDevice::prepareSlot() {
+    if(!healthy_)return;
     FrameSlot& s = slots_[size_t(slot_)];
     const VkResult waited=vkWaitForFences(device_,1,&s.fence,VK_TRUE,UINT64_MAX);
-    if(waited!=VK_SUCCESS){healthy_=false;return;}
+    if(waited!=VK_SUCCESS){healthy_=false;collectScopeTiming(s,false);return;}
+    collectScopeTiming(s,true);
     completed_=std::max(completed_,s.serial);
     collectTiming(s);
     completeTextureCaptures(s,true);
@@ -803,6 +808,7 @@ bool VulkanDevice::waitForSubmittedGpuWork() {
         return false;
     }
     if (serial_ > 0) completed_ = std::max(completed_,serial_-1);
+    deliverComputeReadbacks();
     collectGarbage(); // uses real GPU-idle confirmation, not CPU frame age
     return true;
 }
@@ -878,16 +884,26 @@ bool VulkanDevice::readTexturePixelAsync(TextureHandle texture,
     return true;
 }
 
-void VulkanDevice::beginFrame(int w, int h) {
-    fbW_ = w; fbH_ = h;
+void VulkanDevice::beginFrame(int w, int h) { (void)beginFrameInternal(w,h,false); }
+bool VulkanDevice::beginOffscreenFrame() {
+    if(!supportsOffscreenFrames()||recording_||inPass_)return false;
+    return beginFrameInternal(fbW_,fbH_,true);
+}
+bool VulkanDevice::beginFrameInternal(int w,int h,bool offscreen) {
+    if(!device_||!healthy_||recording_)return false;
+    offscreenFrame_=offscreen;
+    if(!offscreen){fbW_=w;fbH_=h;}
     deliverTextureReads();
     deliverPixelReads(); // previous frame-slot fence proved completion
     FrameSlot& s = slots_[size_t(slot_)];
     auto bi = vkStruct<VkCommandBufferBeginInfo>(VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO);
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(s.main, &bi);
+    if(vkBeginCommandBuffer(s.main,&bi)!=VK_SUCCESS){healthy_=false;offscreenFrame_=false;return false;}
     recording_ = true;
-    if (s.timing) {
+    s.scopeRecords.clear();s.scopeSubmitted=false;
+    if(s.scopeTiming)vkCmdResetQueryPool(s.main,s.scopeTiming,0,ScopeTimingFrame::queryCount);
+    s.timingCount=0;s.timingLabels.clear();
+    if (!offscreen && s.timing) {
         vkCmdResetQueryPool(s.main, s.timing, 0, 128);
         s.timingCount = 0;
         s.timingLabels.clear();
@@ -895,9 +911,9 @@ void VulkanDevice::beginFrame(int w, int h) {
     }
     uniformOffsets_.fill(0);
     descriptorsDirty_ = true;
-    ensureBackBuffer(std::max(1, w), std::max(1, h));
+    if(!offscreen)ensureBackBuffer(std::max(1,w),std::max(1,h));
     swapAcquired_ = false;
-    if (surface_ && w > 0 && h > 0) {
+    if (!offscreen && surface_ && w > 0 && h > 0) {
         if (w != swapForW_ || h != swapForH_) swapDirty_ = true;   // resized: the driver may not report it (X11)
         if (swapDirty_ || !swapchain_) { swapForW_ = w; swapForH_ = h; createSwapchain(); }
         for (int attempt = 0; swapchain_ && attempt < 2; ++attempt) {
@@ -906,6 +922,7 @@ void VulkanDevice::beginFrame(int w, int h) {
             if (r != VK_ERROR_OUT_OF_DATE_KHR || !createSwapchain()) break;
         }
     }
+    return true;
 }
 
 bool VulkanDevice::ensureRotatePipeline() {
@@ -1028,7 +1045,7 @@ void VulkanDevice::present() {
 
 void VulkanDevice::timestamp(const std::string& label, VkPipelineStageFlagBits stage) {
     FrameSlot& s = slots_[size_t(slot_)];
-    if (!s.timing || !recording_ || s.timingCount >= 128) return;
+    if (!s.timing || !recording_ || offscreenFrame_ || s.timingCount >= 128) return;
     vkCmdWriteTimestamp(s.main, stage, s.timing, s.timingCount++);
     s.timingLabels.push_back(label);
 }
@@ -1060,16 +1077,75 @@ void VulkanDevice::collectTiming(FrameSlot& s) {
     timingFrameMs_ = 0.0;
 }
 
+bool VulkanDevice::beginGpuScope(uint64_t tag){
+    if(!device_||!healthy_||!recording_||inPass_||activeComputeId_||!scopeTimestampBits_)return false;
+    auto& s=slots_[size_t(slot_)];
+    if(!tag||s.scopeRecords.active()||s.scopeRecords.count()>=ScopeTimingFrame::maxScopes)return false;
+    if(!s.scopeTiming){
+        auto qi=vkStruct<VkQueryPoolCreateInfo>(VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO);
+        qi.queryType=VK_QUERY_TYPE_TIMESTAMP;qi.queryCount=ScopeTimingFrame::queryCount;
+        const auto result=vkCreateQueryPool(device_,&qi,nullptr,&s.scopeTiming);
+        if(result!=VK_SUCCESS){s.scopeTiming=VK_NULL_HANDLE;if(result==VK_ERROR_DEVICE_LOST)healthy_=false;return false;}
+        vkCmdResetQueryPool(s.main,s.scopeTiming,0,ScopeTimingFrame::queryCount);
+    }
+    uint32_t query=0;if(!s.scopeRecords.begin(tag,query))return false;
+    // GPU timeline boundaries, not exclusive execution or CPU busy time.
+    vkCmdWriteTimestamp(s.main,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,s.scopeTiming,query);
+    return true;
+}
+void VulkanDevice::endGpuScope(){
+    if(!recording_)return;
+    auto& s=slots_[size_t(slot_)];
+    if(!s.scopeRecords.active())return;
+    if(!healthy_||inPass_||activeComputeId_){s.scopeRecords.abandonActive();return;}
+    uint32_t query=0;if(s.scopeRecords.end(query))
+        vkCmdWriteTimestamp(s.main,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,s.scopeTiming,query);
+}
+void VulkanDevice::collectScopeTiming(FrameSlot& s,bool completed){
+    if(!s.scopeSubmitted)return;
+    for(uint32_t i=0;i<s.scopeRecords.count();++i){
+        const auto& record=s.scopeRecords.record(i);
+        double ms=0;
+        if(completed&&healthy_&&record.ended){
+            uint64_t ticks[2]{};
+            // No WAIT_BIT: the caller has already proved the frame fence.
+            const auto result=vkGetQueryPoolResults(device_,s.scopeTiming,i*2,2,sizeof(ticks),ticks,sizeof(uint64_t),VK_QUERY_RESULT_64_BIT);
+            if(result==VK_SUCCESS)ms=scopeMilliseconds(ticks[0],ticks[1],scopeTimestampBits_,timestampNs_);
+            else if(result==VK_ERROR_DEVICE_LOST)healthy_=false;
+        }
+        if(completedScopes_.size()>=128)completedScopes_.pop_front();
+        completedScopes_.push_back({record.tag,ms,ms>0});
+    }
+    s.scopeSubmitted=false;s.scopeRecords.clear();
+}
+void VulkanDevice::pollScopeTimings(){
+    for(auto& s:slots_)if(s.scopeSubmitted){
+        if(!healthy_){collectScopeTiming(s,false);continue;}
+        const auto result=vkGetFenceStatus(device_,s.fence);
+        if(result==VK_SUCCESS)collectScopeTiming(s,true);
+        else if(result!=VK_NOT_READY){healthy_=false;collectScopeTiming(s,false);}
+    }
+}
+std::vector<Device::GpuTiming> VulkanDevice::takeGpuScopeTimings(){
+    if(device_)pollScopeTimings();
+    std::vector<GpuTiming> result(completedScopes_.begin(),completedScopes_.end());
+    completedScopes_.clear();return result;
+}
+
 void VulkanDevice::endFrame() {
     if (!recording_) return;
     if (inPass_) endPass();
     FrameSlot& s = slots_[size_t(slot_)];
+    // Unbalanced scopes are invalid, never silently extended to present.
+    s.scopeRecords.abandonActive();
     if (swapAcquired_) present();
     VkBuffer readback = VK_NULL_HANDLE;
     Allocation readAlloc;
     const int cw = back_.width, ch = back_.height;
-    if (capture_) {
+    if (!offscreenFrame_ && capture_ && cw>0 && ch>0 && back_.image) {
         createBufferObject(size_t(cw) * size_t(ch) * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, readback, readAlloc);
+    }
+    if (capture_ && readback && readAlloc.mapped) {
         barrierImage(s.main, back_.image, false, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         VkBufferImageCopy c{};
         c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
@@ -1094,7 +1170,15 @@ void VulkanDevice::endFrame() {
     si.commandBufferCount = count;
     si.pCommandBuffers = cbs;
     vkResetFences(device_, 1, &s.fence);
-    if (vkQueueSubmit(queue_, 1, &si, s.fence) == VK_ERROR_DEVICE_LOST) healthy_ = false;
+    const VkResult submitResult=vkQueueSubmit(queue_, 1, &si, s.fence);
+    s.scopeSubmitted=s.scopeRecords.count()!=0;
+    if(submitResult!=VK_SUCCESS){
+        healthy_=false;swapAcquired_=false;collectScopeTiming(s,false);
+        if(readback)vkDestroyBuffer(device_,readback,nullptr);
+        memory_.release(readAlloc);
+        if(capture_){auto fn=std::move(capture_);capture_=nullptr;fn(0,0,{});}
+        return; // Fence was reset but no submission can signal it.
+    }
     s.serial = serial_;
     if (swapAcquired_) {
         auto pi = vkStruct<VkPresentInfoKHR>(VK_STRUCTURE_TYPE_PRESENT_INFO_KHR);
@@ -1104,18 +1188,19 @@ void VulkanDevice::endFrame() {
         if (r == VK_ERROR_OUT_OF_DATE_KHR || (r == VK_SUBOPTIMAL_KHR && swapchainChanged())) swapDirty_ = true;
         swapAcquired_ = false;
     }
-    if (capture_) {
-        vkWaitForFences(device_, 1, &s.fence, VK_TRUE, UINT64_MAX);
-        std::vector<uint8_t> px(size_t(cw) * size_t(ch) * 4);
+    if (!offscreenFrame_ && capture_) {
+        const bool captureOk=submitResult==VK_SUCCESS&&vkWaitForFences(device_, 1, &s.fence, VK_TRUE, UINT64_MAX)==VK_SUCCESS&&readAlloc.mapped;
+        std::vector<uint8_t> px(captureOk?size_t(cw)*size_t(ch)*4:0);
         const size_t row = size_t(cw) * 4;
         const auto* src = static_cast<const uint8_t*>(readAlloc.mapped);
-        for (int y = 0; y < ch; ++y) std::memcpy(px.data() + size_t(y) * row, src + size_t(ch - 1 - y) * row, row);   // top-down
-        vkDestroyBuffer(device_, readback, nullptr);
+        if(captureOk)for (int y = 0; y < ch; ++y) std::memcpy(px.data() + size_t(y) * row, src + size_t(ch - 1 - y) * row, row);   // top-down
+        if(readback)vkDestroyBuffer(device_, readback, nullptr);
         memory_.release(readAlloc);
         auto fn = std::move(capture_);
         capture_ = nullptr;
-        fn(cw, ch, std::move(px));
+        fn(captureOk?cw:0, captureOk?ch:0, std::move(px));
     }
+    offscreenFrame_=false;
     ++serial_;
     slot_ = (slot_ + 1) % kFramesInFlight;
     prepareSlot();

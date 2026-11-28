@@ -1,6 +1,12 @@
 // Editor: lifecycle, docking layout, menus, documents, play-test and viewport rendering.
 // Window contents live in apps/editor/windows/*.cpp; the agent link in EditorAgent.cpp.
 #include "Editor.h"
+#include "core/OverlayPreviewGrid.h"
+#include "core/OverlayPreviewTerritory.h"
+#include "engine/world/TerraWeaveCavernsEditRuntime.h"
+#include "engine/world/TerraWeaveCavernsArchive.h"
+#include "engine/render/TerraWeaveCavernsShardGpuHost.h"
+#include "engine/render/TerraWeaveCavernsPreviewPacer.h"
 #include "engine/render/ModelSurfacePicking.h"
 #include "apps/editor/AuthoringComponents.h"
 #include "apps/editor/AuthoringWater.h"
@@ -78,6 +84,270 @@ void Editor::refreshPrismaVolumes() {
     std::vector<std::string> issues;
     prismaVolumes_ = render::parsePrismaVolumes(game, map, &issues);
     for (const auto& issue : issues) ws_.log("prisma", issue, true);
+}
+
+// Stage23 editor-owned CPU preparation. This is NOT a GPU/Box3D/NavMesh
+// publication owner; no dirty requests are ACKed without a host barrier.
+class Editor::CavernsEditHost {
+public:
+    using Volume=terraweave::caverns::CaveVolumeSnapshot;
+    using Bounds=terraweave::caverns::CaveDirtyBounds;
+    using Stamp=terraweave::caverns::CaveSphereStamp;
+    std::unique_ptr<terraweave::caverns::CaveEditRuntimeBridge> bridge;
+    std::unique_ptr<terraweave::caverns::CaveShardGpuHost> visual;
+    uint64_t visualRevision=0,visualAttemptedEpoch=0;
+    terraweave::caverns::CavePreviewPacer visualPacer{30};
+    using ShardKey=terraweave::caverns::CaveShardKey;
+    using ShardGroups=std::map<ShardKey,
+        std::vector<terraweave::caverns::CaveBatchChunk>,
+        terraweave::caverns::CaveShardLess>;
+    ShardGroups visualGroups;
+    std::unique_ptr<terraweave::caverns::CaveMixedLodShardBatch> visualPlan;
+    std::vector<ShardKey> visualStaged;
+    std::string projectDir;
+    Json previousJson;
+    std::vector<Stamp> previousStamps;
+    std::vector<terraweave::caverns::Entrance> previousEntrances;
+    uint64_t epoch=0;
+    bool initialized=false;
+
+    // Explicit graphics-owner cleanup. Do not destroy GPU scenes if idle fails.
+    bool stopPreview(gfx::Device& device) {
+        if(!visual)return true;
+        if(!visual->shutdownAfterGpuIdle(device))return false;
+        visual.reset();visualRevision=0;visualAttemptedEpoch=0;
+        visualGroups.clear();visualPlan.reset();visualStaged.clear();visualPacer.reset(0,0);
+        return true;
+    }
+    void cancelPartialPreview() {
+        if(visual)for(auto key:visualStaged)(void)visual->cancel(key);
+        visualGroups.clear();visualPlan.reset();visualStaged.clear();
+        visualPacer.reset(0,0);
+    }
+    // Editor-only visual staging: ONE bounded GeometryScene upload per
+    // renderer frame. Do not ACK gameplay physics/nav dirty requests.
+    void stageVisualPreview(Editor& editor) {
+        if(!editor.cavernsVisualPreviewEnabled || !bridge ||
+           projectDir!=editor.ws().project.dir)return;
+        if(visualAttemptedEpoch==epoch)return;
+        if(visualPacer.epoch()!=epoch)cancelPartialPreview();
+        if(visualGroups.empty()) {
+            const auto candidates=bridge->visualPreviewCandidates();
+            if(candidates.empty())return;
+            std::vector<terraweave::caverns::CaveBatchChunk> chunks;
+            chunks.reserve(candidates.size());
+            const uint64_t source=candidates.front().candidate.sourceRevision;
+            for(const auto& item:candidates){
+                const auto& candidate=item.candidate;
+                if(!source || source!=candidate.sourceRevision ||
+                   candidate.sourceRevision!=item.dirty.sourceRevision ||
+                   candidate.mesh.key!=item.dirty.key || !candidate.renderRevision)
+                    throw std::invalid_argument("Caverns visual source revision mismatch");
+                terraweave::caverns::CaveBatchChunk chunk;
+                chunk.mesh=candidate.mesh;
+                chunk.generatorVersion=1;
+                chunk.revision=candidate.renderRevision;
+                chunk.sourceRevision=candidate.sourceRevision;
+                chunk.resolution=candidate.resolution;
+                chunk.spacingCm=candidate.spacingCm;
+                chunks.push_back(std::move(chunk));
+            }
+            if(visualRevision==UINT64_MAX)
+                throw std::overflow_error("Caverns visual preview revision");
+            visualGroups=terraweave::caverns::groupCaveEditsByShard(chunks);
+            if(!visual) {
+                visual=std::make_unique<terraweave::caverns::CaveShardGpuHost>();
+                visual->setUploadLimits({
+                    32ull*1024*1024,1,64
+                });
+            }
+            auto plan=terraweave::caverns::planCaveMixedLodShardBatch(
+                visual->catalog(),visualGroups,visualRevision+1);
+            if(!plan.ready()){
+                const auto repairs=plan.visual.rebuild;
+                cancelPartialPreview();
+                if(!repairs.empty())(void)bridge->requestLodRepairs(repairs);
+                editor.cavernsBuildStats.diagnostic=
+                    "Caverns LOD contours: rebuilding shared SDF lattice";
+                return;
+            }
+            visualPlan=std::make_unique<terraweave::caverns::CaveMixedLodShardBatch>(
+                std::move(plan));
+            visualStaged.clear();
+            visualPacer.reset(epoch,visualPlan->snapshots.size());
+        }
+        // Scene pre-render owner boundary. No Device idle stall:
+        // free completed non-STRATA GeometryScene owners by GPU fence only.
+        if(visual)(void)visual->collectCompletedWithoutIdle(editor.device());
+        const uint64_t frame=editor.device().frameSerial();
+        if(!visualPacer.mayStage(epoch,frame))return;
+        if(!visual||!visualPlan)return;
+        const auto& snapshot=visualPlan->snapshots.at(visualPacer.completed());
+        terraweave::caverns::CaveBatchSpec spec;
+        spec.maxChunks=64;spec.enableStrata=false;
+        try {
+            if(!visual->stagePlannedShard(editor.device(),snapshot,
+                                          visualPlan->visual,spec)) {
+                visualPacer.failed(frame);
+                editor.cavernsBuildStats.diagnostic=
+                    "Caverns GPU preview deferred (upload bytes, fence pressure, or stale shard)";
+                return;
+            }
+            visualStaged.push_back(snapshot.shard);
+            visualPacer.staged(frame);
+            editor.cavernsBuildStats.diagnostic.clear();
+        } catch(const std::exception& e) {
+            visualPacer.failed(frame);
+            editor.cavernsBuildStats.diagnostic=e.what();
+            return;
+        }
+        if(visualPacer.ready(epoch)) {
+            if(!visual->activateVisualOnly(visualStaged)) {
+                cancelPartialPreview();
+                throw std::runtime_error("Caverns visual preview group activation failed");
+            }
+            visualRevision++;
+            visualAttemptedEpoch=epoch;
+            visualGroups.clear();visualPlan.reset();visualStaged.clear();
+        }
+    }
+    void drawVisualPreview(render::Renderer3D& renderer) {
+        if(visual)visual->draw(renderer);
+    }
+
+    void update(Editor& editor) {
+        const auto& project=editor.ws().project.dir;
+        if(project.empty()) {
+            if(visual && !stopPreview(editor.device()))
+                throw std::runtime_error("Caverns GPU preview needs idle");
+            bridge.reset();projectDir.clear();initialized=false;
+            editor.cavernsBuildStats={};
+            return;
+        }
+        if(project!=projectDir) {
+            if(visual && !stopPreview(editor.device()))
+                throw std::runtime_error("Caverns project change GPU preview needs idle");
+            // The bridge owns CPU futures, which are joined during teardown.
+            bridge.reset();
+            projectDir=project;initialized=false;
+            previousJson=Json{};
+            previousStamps.clear();previousEntrances.clear();epoch=0;
+            editor.cavernsBuildStats={};
+        }
+        const Json& json=editor.doc().data.extra["terraweaveCaverns"];
+        if(!initialized || json!=previousJson) {
+            cancelPartialPreview(); // never activate old-epoch GPU candidates
+            Volume newVolume=terraweave::caverns::caveSnapshotFromJson(json);
+            const auto newStamps=newVolume.stamps;
+            const auto newEntrances=newVolume.entrances;
+            // Generator settings modify the entire world, not just stamps.
+            // This bounded local preview cannot safely enumerate the entire
+            // resident world; refuse rather than silently show stale chunks.
+            if(initialized && json["settings"]!=previousJson["settings"])
+                throw std::runtime_error(
+                    "Caverns generator settings changed: full-world reload required");
+            // MapDoc Undo/Redo can restore a lower persisted revision. The
+            // runtime epoch remains strictly monotonic across that history.
+            if(epoch==UINT64_MAX)throw std::overflow_error("Caverns author epoch");
+            epoch=std::max(epoch,newVolume.sourceRevision)+1;
+            newVolume.sourceRevision=epoch;
+            auto frozen=std::make_shared<const Volume>(std::move(newVolume));
+
+            bool any=false;
+            Bounds bounds{};
+            const auto include=[&](const Stamp& stamp) {
+                const Bounds b=terraweave::caverns::dirtyBoundsForStamp(stamp,100);
+                if(!any){bounds=b;any=true;return;}
+                bounds.minX=std::min(bounds.minX,b.minX);
+                bounds.minY=std::min(bounds.minY,b.minY);
+                bounds.minZ=std::min(bounds.minZ,b.minZ);
+                bounds.maxX=std::max(bounds.maxX,b.maxX);
+                bounds.maxY=std::max(bounds.maxY,b.maxY);
+                bounds.maxZ=std::max(bounds.maxZ,b.maxZ);
+            };
+            for(const auto& stamp:previousStamps)include(stamp);
+            for(const auto& stamp:newStamps)include(stamp);
+            const auto includeEntrance=[&](const terraweave::caverns::Entrance& e){
+                // Vertical entrance shaft has its own influence bounds.
+                // Include a 100 cm meshing/normal-gradient sampling halo.
+                const int64_t r=int64_t(e.radiusCm)+100;
+                const Bounds b{e.xCm-r,e.caveYcm-r,e.zCm-r,
+                               e.xCm+r+1,e.surfaceYcm+r+1,e.zCm+r+1};
+                if(!any){bounds=b;any=true;return;}
+                bounds.minX=std::min(bounds.minX,b.minX);
+                bounds.minY=std::min(bounds.minY,b.minY);
+                bounds.minZ=std::min(bounds.minZ,b.minZ);
+                bounds.maxX=std::max(bounds.maxX,b.maxX);
+                bounds.maxY=std::max(bounds.maxY,b.maxY);
+                bounds.maxZ=std::max(bounds.maxZ,b.maxZ);
+            };
+            for(const auto& entrance:previousEntrances)includeEntrance(entrance);
+            for(const auto& entrance:newEntrances)includeEntrance(entrance);
+            if(any){
+                if(!bridge)
+                    bridge=std::make_unique<terraweave::caverns::CaveEditRuntimeBridge>(
+                        16,100,1024,2);
+                bridge->invalidate(bounds,std::move(frozen));
+            }
+            // Editor Play shares the real GameClient. Forward the authored
+            // SDF on MapDoc/Undo change without restarting the Game tab.
+            // GameClient treats this as visual-only, NOT a physics/nav ACK.
+            if(json.isObject()&&editor.clientHost_.active())
+                (void)editor.clientHost_.updateCavernsVisual(json);
+            previousJson=json;
+            previousStamps=newStamps;
+            previousEntrances=newEntrances;
+            initialized=true;
+        }
+        if(bridge){
+            bridge->tick(2);
+            editor.cavernsBuildStats.pending=bridge->dirtyCount();
+            editor.cavernsBuildStats.prepared=bridge->preparedCount();
+            editor.cavernsBuildStats.inFlight=bridge->inFlight();
+        }else{
+            editor.cavernsBuildStats.pending=0;
+            editor.cavernsBuildStats.prepared=0;
+            editor.cavernsBuildStats.inFlight=0;
+        }
+        if(!editor.cavernsVisualPreviewEnabled && !visualStaged.empty())
+            cancelPartialPreview();
+        if(visual){
+            const auto stats=visual->stats();
+            editor.cavernsBuildStats.gpuActive=stats.activeShards;
+            editor.cavernsBuildStats.gpuStaged=stats.pendingShards;
+            editor.cavernsBuildStats.gpuRetired=stats.retiredScenes;
+            editor.cavernsBuildStats.gpuRetainedStrata=stats.retainedStrata;
+            const auto uploads=visual->uploadStats();
+            editor.cavernsBuildStats.gpuFrameBytes=uploads.sourceBytes;
+            editor.cavernsBuildStats.gpuRejectedBytes=uploads.refusedBytes;
+            editor.cavernsBuildStats.gpuRejectedPressure=uploads.refusedPressure;
+        }else{
+            editor.cavernsBuildStats.gpuActive=0;
+            editor.cavernsBuildStats.gpuStaged=0;
+            editor.cavernsBuildStats.gpuRetired=0;
+            editor.cavernsBuildStats.gpuRetainedStrata=0;
+            editor.cavernsBuildStats.gpuFrameBytes=0;
+            editor.cavernsBuildStats.gpuRejectedBytes=0;
+            editor.cavernsBuildStats.gpuRejectedPressure=0;
+        }
+        editor.cavernsBuildStats.gpuRemaining=visualPacer.remaining();
+        editor.cavernsBuildStats.gpuPreviewRevision=visualRevision;
+        editor.cavernsBuildStats.gpuRetryAfterFrame=visualPacer.retryAfterFrame();
+        editor.cavernsBuildStats.gpuUploadFailures=visualPacer.failures();
+        editor.cavernsBuildStats.authorEpoch=epoch;
+        editor.cavernsBuildStats.visualCommitConnected=false;
+    }
+};
+
+void Editor::updateCavernsAuthoring() {
+    if(!cavernsEditHost_)cavernsEditHost_=std::make_unique<CavernsEditHost>();
+    try {
+        cavernsEditHost_->update(*this);
+        // GPU staging diagnostic is cleared on a new successful upload,
+        // not every frame while a failed or deferred GPU owner remains.
+    }catch(const std::exception& error){
+        cavernsBuildStats.diagnostic=error.what();
+    }
 }
 
 Editor::Editor(Options o) : opt_(std::move(o)) {}
@@ -233,6 +503,8 @@ void Editor::init(gfx::Device& dev) {
     fxTextures_.setGpuResourceRetirement(&gpuResourceRetirement_);
     gameFx_.setGpuResourceRetirement(&gpuResourceRetirement_);
     gameFx_.setQuality(fx::defaultQualityFor(dev, false));
+    modelEffectView_.setGpuDeviceLease(gpuDeviceLease());
+    modelEffectView_.setReader([this](const std::string& path,std::string& out) { return projectReader(ws_.project.dir)(path,out); });
     gameFx_.setFileReader([this](const std::string& path, std::string& out) { return projectReader(ws_.project.dir)(path, out); });
     gameFx_.setTextureLoader([this](const std::string& name, fx::FxTexture& out) {
         render::TextureRef r = fxTextures_.resolve(name, false, ws_.project.dir.empty() ? "" : ws_.project.dir + "/");
@@ -265,17 +537,28 @@ void Editor::retirePreviewModel(std::unique_ptr<render::Model>& model) noexcept 
 }
 
 void Editor::shutdown() {
-    if (!dev_) return;
-    // Invalidate any captureNextFrame callbacks still owned by the RHI.
-    captureLifetime_->store(false,std::memory_order_release);
-    captureArmed_ = false;
-    shots_.clear();
+    if(view_.modelMutationBlocked() || !clientHost_.canShutdown())
+        throw std::logic_error("Editor shutdown: live Model read, graph transaction or quarantined hosted client");
+    if (!dev_) { graphGpuProfile_.clear(); return; }
     // Editor windows own offscreen Model/portrait/viewport allocations and
     // can still have prior-frame submissions in flight. Prove full device
     // completion BEFORE allowing destructors to destroy native GPU objects.
     if(!dev_->waitForResourceIdle())
         throw std::runtime_error(
             "Editor shutdown: GPU completion barrier failed");
+    // Resolve hosted teardown before dismantling the editor's other owners.
+    // The full-device idle proof above covers archived and active clients.
+    clientHost_.stop();
+    if(dev_->gpuHealthy())clientHost_.drainAfterGpuIdle();
+    else clientHost_.abandonOnDeviceLoss();
+    graphGpuProfile_.clear();
+    // Invalidate capture callbacks only after hosted preflight/drain.
+    captureLifetime_->store(false,std::memory_order_release);
+    captureArmed_=false;
+    shots_.clear();
+    pendingGraphMaterialApply_.reset();graphMaterialApplyProject_.clear();
+    graphMaterialApplyRequest_.clear();graphMaterialApplyState_="idle";graphMaterialApplyReason_.clear();
+    textureGraphGpuPreview_.shutdownAfterIdle(*dev_);
     if(spectraGpuTelemetry_==spectraPreviewGpu_.get())
         spectraGpuTelemetry_=nullptr;
     spectraPreviewGpu_.reset();
@@ -283,19 +566,16 @@ void Editor::shutdown() {
     spectraPreviewFrameOpen_=false;
     spectraPreviewRequest_.pending=false;
     spectraGpuTelemetry_=nullptr;
-    clientHost_.stop();
-    // A hosted GameClient may have submitted resources in an earlier GUI
-    // frame. Its GPU handles must survive until a true graphics completion
-    // signal; do not release them simply because the Game tab was closed.
-    if (dev_->gpuHealthy() && dev_->waitForSubmittedGpuWork())
-        clientHost_.drainAfterGpuIdle();
-    else if (!dev_->gpuHealthy())
-        clientHost_.abandonOnDeviceLoss();
+    // Hosted clients were drained at the initial GPU-idle boundary.
     gameFxBridge_.detach();
     // Nature preview retires grass Models through previewModelRetirement_
     // and stops its particles while gameFx_ is still alive.
     physisNaturePreview_.release(*dev_, gameFx_);
+    if(cavernsEditHost_ && !cavernsEditHost_->stopPreview(*dev_))
+        throw std::runtime_error("Caverns GPU preview retirement refused");
+    cavernsEditHost_.reset();
     sim_.reset();
+    modelEffectView_.shutdown(*dev_);
     gameFx_.shutdown();
     fxTextures_.shutdown();
     for(auto& window:windows_)window->shutdownAfterGpuIdle(*this);
@@ -384,6 +664,7 @@ void Editor::openGame(const std::string& idOrDir) {
 
 void Editor::reloadFx() {
     fxWarnings.clear();
+    if (dev_) modelEffectView_.shutdown(*dev_);
     gameFx_.reloadAll();
     if (dev_) { fxTextures_.shutdown(); fxTextures_.init(*dev_); }   // re-imported textures (fx_import_unity) show up
     gameFx_.clearErrors();
@@ -427,7 +708,7 @@ void Editor::reloadRules() {
 // Unlike reloadRules(), do not reparse rules, restart FX or reset editor demand
 // history. The caller defers this transaction until after play mode.
 void Editor::reloadVisualAssets() {
-    if (!dev_ || playing() || clientPlaying()) return;
+    if (!dev_ || playing() || clientPlaying() || view_.modelMutationBlocked()) return;
     editSceneCacheValid_ = false;
     editSceneCache_.clear();
     view_.shutdown(*dev_);
@@ -448,7 +729,7 @@ void Editor::reloadVisualAssets() {
 
 size_t Editor::reloadVisualModelSources(
         const std::vector<std::string>& paths) {
-    if(!dev_ || playing() || clientPlaying() || paths.empty())return 0;
+    if(!dev_ || playing() || clientPlaying() || paths.empty() || view_.modelMutationBlocked())return 0;
     // The caller runs at the editor frame boundary, after the previous
     // render submission. TypeLook/animation sources are detached by GameView
     // before the independent resource owner destroys GPU allocations.
@@ -527,7 +808,8 @@ void Editor::pollVisualAssets(double dt) {
         [this](const std::string& message){ws_.log("view",message);});
     // Changes are retained throughout editor/client play. GPU mutations
     // happen only here, before the first rendering pass of a new frame.
-    if(!visualAssets_.pending() || playing() || clientPlaying())return;
+    // A blocked owner mutation is retryable, not an acknowledged edit.
+    if(!visualAssets_.pending() || playing() || clientPlaying() || view_.modelMutationBlocked())return;
     const auto impact=visualAssets_.impact();
     // A previous candidate may be waiting for native Metal/Vulkan shader
     // jobs already owned by Renderer3D. Do not rebuild scratch Models and
@@ -707,6 +989,7 @@ void Editor::fitScene() {
     // 2D games: projection and angle of game.json "camera" (zoom stays the editor's)
     render::CameraOverhead cs = render::overheadCameraFrom(ws_.project.manifest);
     sceneCam.ortho = cs.ortho;
+    sceneCam.designAspect = cs.designAspect;
     if (cs.present) { sceneCam.pitch = std::min(cs.pitch, 1.5707f); sceneCam.yaw = cs.yaw; sceneCam.fovY = cs.fovY; }
 }
 
@@ -806,65 +1089,18 @@ float Editor::surfaceHeightAt(float x,float z) const {
     // Rebuild with the document and the pick cache (models, transforms):
     // rasterize every terrain-tile triangle top-down into a 0.5 m grid once.
     const uint64_t key=doc().revision*1000003ull^visualPickCacheGeneration_^(uint64_t(visualPickModelCount_)<<40);
-    constexpr float kStep=.5f;
-    if(key!=surfaceHeightCacheKey_){
-        surfaceHeightCacheKey_=key;
-        surfaceGridW_=std::clamp(int(std::ceil(float(d.w)/kStep))+1,1,8192);
-        surfaceGridH_=std::clamp(int(std::ceil(float(d.h)/kStep))+1,1,8192);
-        surfaceGrid_.assign(size_t(surfaceGridW_)*size_t(surfaceGridH_),-std::numeric_limits<float>::infinity());
+    if(!surfaceHeights_ || key!=surfaceHeightCacheKey_){
+        TerrainTileSurface next(d.w,d.h);
         for(size_t i=0;i<visualPickModelCount_;++i){
             const auto& packet=visualPickModels_[i];
-            if(packet.documentIndex>=d.entities.size())continue;
-            const auto& entity=d.entities[packet.documentIndex];
-            if(entity.type.rfind("TerraTerrain",0)!=0&&!entity.extra["components"].has("TerraTerrain"))continue;
+            if(packet.documentIndex>=d.entities.size() || !isTerrainTile(d.entities[packet.documentIndex]))continue;
             const auto lease=owner.acquireModelRead(packet.model);
-            if(!lease)continue;
-            const auto& m=*lease.get();
-            if(m.bindWorld.size()!=m.nodes.size())continue;
-            for(size_t n=0;n<m.nodes.size();++n){
-                const auto& node=m.nodes[n];
-                if(node.mesh<0||size_t(node.mesh)>=m.meshes.size())continue;
-                const mat4 xf=packet.world*(packet.nodes.size()==m.nodes.size()?packet.nodes[n]:m.bindWorld[n]);
-                for(const auto& prim:m.meshes[size_t(node.mesh)].primitives){
-                    if(prim.firstIndex>m.indices.size()||prim.indexCount>m.indices.size()-prim.firstIndex)continue;
-                    for(size_t t=0;t+2<prim.indexCount;t+=3){
-                        float3 v[3];bool ok=true;
-                        for(int k=0;k<3;++k){const uint32_t idx=m.indices[prim.firstIndex+t+size_t(k)];if(idx>=m.vertices.size()){ok=false;break;}v[k]=xf.transformPoint(m.vertices[idx].pos);}
-                        if(!ok)continue;
-                        const float area=(v[1].x-v[0].x)*(v[2].z-v[0].z)-(v[1].z-v[0].z)*(v[2].x-v[0].x);
-                        if(std::fabs(area)<1e-8f)continue;
-                        const int x0=std::max(0,int(std::floor(std::min({v[0].x,v[1].x,v[2].x})/kStep)));
-                        const int x1=std::min(surfaceGridW_-1,int(std::ceil(std::max({v[0].x,v[1].x,v[2].x})/kStep)));
-                        const int z0=std::max(0,int(std::floor(std::min({v[0].z,v[1].z,v[2].z})/kStep)));
-                        const int z1=std::min(surfaceGridH_-1,int(std::ceil(std::max({v[0].z,v[1].z,v[2].z})/kStep)));
-                        for(int gz=z0;gz<=z1;++gz)for(int gx=x0;gx<=x1;++gx){
-                            const float px=float(gx)*kStep,pz=float(gz)*kStep;
-                            const float w0=((v[1].x-px)*(v[2].z-pz)-(v[1].z-pz)*(v[2].x-px))/area;
-                            const float w1=((v[2].x-px)*(v[0].z-pz)-(v[2].z-pz)*(v[0].x-px))/area;
-                            const float w2=1.f-w0-w1;
-                            if(w0<-1e-4f||w1<-1e-4f||w2<-1e-4f)continue;
-                            float& cell=surfaceGrid_[size_t(gz)*size_t(surfaceGridW_)+size_t(gx)];
-                            cell=std::max(cell,w0*v[0].y+w1*v[1].y+w2*v[2].y);
-                        }
-                    }
-                }
-            }
+            if(lease)next.add(*lease.get(),packet.world,packet.nodes);
         }
+        surfaceHeights_=std::move(next);
+        surfaceHeightCacheKey_=key;
     }
-    if(surfaceGrid_.empty())return legacy;
-    // Bilinear over covered samples; uncovered -> the legacy surface.
-    const float fx=x/kStep,fz=z/kStep;
-    const int gx=int(std::floor(fx)),gz=int(std::floor(fz));
-    float sum=0,weight=0;
-    for(int dz=0;dz<2;++dz)for(int dx=0;dx<2;++dx){
-        const int cx=gx+dx,cz=gz+dz;
-        if(cx<0||cz<0||cx>=surfaceGridW_||cz>=surfaceGridH_)continue;
-        const float h=surfaceGrid_[size_t(cz)*size_t(surfaceGridW_)+size_t(cx)];
-        if(!std::isfinite(h))continue;
-        const float w=(dx?fx-float(gx):1.f-(fx-float(gx)))*(dz?fz-float(gz):1.f-(fz-float(gz)));
-        sum+=h*w;weight+=w;
-    }
-    return weight>1e-6f?sum/weight:legacy;
+    return surfaceHeights_->sample(x,z,legacy);
 }
 
 int Editor::pickRoad(const Viewport& vp, const Camera& cam, float sx, float sy) const {
@@ -891,34 +1127,9 @@ void Editor::syncGrid() {
     if (grid_.w != d.w || grid_.h != d.h) grid_.init(d.w, d.h);
     grid_.corner = d.corners;
     for (int i = 0; i < d.w * d.h; ++i) {
-        grid_.flags[size_t(i)] = game::cellFlagsFromChar(d.cells[size_t(i)]);
-        // diggable rock (rules "diggable"): solid cells drawn as rock blocks, like the client does
-        const int dk = rules().findDiggable(d.cells[size_t(i)]);
-        grid_.dig[size_t(i)] = dk >= 0 ? uint8_t(dk + 1) : 0;
-        grid_.digHp[size_t(i)] = dk >= 0 ? rules().diggables[size_t(dk)].hardness : Fixed{};
-        if (dk >= 0) grid_.flags[size_t(i)] = 0;
-        grid_.height[size_t(i)] = d.heights[size_t(i)];
-        grid_.level[size_t(i)] = d.levels[size_t(i)];
-        grid_.region[size_t(i)] = d.regions[size_t(i)] == '.' ? int16_t(-1) : int16_t(d.regions[size_t(i)]);
-        int8_t fr = d.fieldRes[size_t(i)];
-        grid_.fieldRes[size_t(i)] = fr >= 0 ? int16_t(std::max(0, rules().findResource(d.fieldResources[size_t(fr)]))) : int16_t(-1);
-        grid_.fieldAmt[size_t(i)] = Fixed::fromInt(d.fieldAmt[size_t(i)]);
+        copyPreviewCell(d, rules(), size_t(i), grid_, size_t(i));
     }
-    // starting territory (rules territory.startRadius around owned structures), so the scene shows the claimed floor
-    std::fill(grid_.territory.begin(), grid_.territory.end(), uint8_t(0));
-    if (const int r = rules().territory.startRadius; rules().territory.enabled && r > 0 && !d.planet())
-        for (const auto& e : d.entities) {
-            const int ti = rules().findType(e.type);
-            if (e.owner <= 0 || e.owner > 8 || ti < 0 || !rules().types[size_t(ti)].structure) continue;
-            const game::UnitType& t = rules().types[size_t(ti)];
-            int x0, y0; game::GameCore::footprintAt(t, {Fixed::fromRatio(int64_t(std::lround(e.x * 1000)), 1000), Fixed{}, Fixed::fromRatio(int64_t(std::lround(e.z * 1000)), 1000)}, x0, y0);   // editor only: float -> fixed
-            for (int y = y0 - r; y < y0 + t.footprintH + r; ++y)
-                for (int x = x0 - r; x < x0 + t.footprintW + r; ++x) {
-                    if (!grid_.inside(x, y)) continue;
-                    const size_t i = size_t(grid_.index(x, y));
-                    if ((grid_.flags[i] & game::kCellGround) && !grid_.territory[i]) grid_.territory[i] = uint8_t(e.owner);
-                }
-        }
+    fillPreviewTerritory(d, rules(), grid_);
     view_.setTiles(d.extra["tiles"]);
     {   // planets: the world block (MapDoc bodies); sculpt / paint rebuild only what changed
         const Json world = d.planet() ? doc().worldJson() : Json();
@@ -1114,6 +1325,30 @@ void Editor::buildEditScene(game::GameScene& out) const {
 }
 
 void Editor::drawEditOverlays3D() {
+    // Caverns SDF brush: three great circles show the world-space brush
+    // volume on walls, ceilings and floors; visualization has no ECS state.
+    if(cavernsBrushPreview.visible &&
+       cavernsBrushPreview.radiusMetres>0.0f) {
+        const auto c=cavernsBrushPreview.position;
+        const float r=cavernsBrushPreview.radiusMetres;
+        const uint32_t ink=cavernsBrushPreview.fill
+            ? rgba(255,160,90,225) : rgba(95,220,255,225);
+        constexpr float tau=6.28318530717958647692f;
+        constexpr int segments=48;
+        for(int axis=0;axis<3;++axis) {
+            for(int i=0;i<segments;++i) {
+                const float a=tau*float(i)/float(segments);
+                const float b=tau*float(i+1)/float(segments);
+                const auto at=[&](float angle)->render::float3 {
+                    const float u=std::cos(angle)*r,v=std::sin(angle)*r;
+                    if(axis==0)return {c.x,c.y+u,c.z+v};
+                    if(axis==1)return {c.x+u,c.y,c.z+v};
+                    return {c.x+u,c.y+v,c.z};
+                };
+                r3d_.line(at(a),at(b),ink);
+            }
+        }
+    }
     const auto& d = doc().data;
     const float W = float(d.w), H = float(d.h);
     uint32_t border = rgba(255, 255, 255, 120);
@@ -1669,7 +1904,9 @@ void Editor::tickSpectraGpuPreview(const Camera& cam,int w,int h,bool game) {
         dt=1.f/60.f; // one simulation frame, no new bursts while frozen
         --spectraPreviewStepRequests_;
     }
+    graph_gpu_profile::Scope fxGpuScope(*dev_,graphGpuProfile_,"spectrafx-preview-step",game?2ULL:1ULL);
     const bool accepted=spectraPreviewGpu_->step(dt);
+    if(accepted)fxGpuScope.finish();else fxGpuScope.abort();
     if(!accepted) {
         spectraPreviewLastError_="Metal preview step: "+spectraPreviewGpu_->reason();
         ws_.log("spectrafx",spectraPreviewLastError_,true);
@@ -1728,7 +1965,7 @@ void Editor::tickSpectraGpuPreview(const Camera& cam,int w,int h,bool game) {
 }
 void Editor::drawSpectraGpuPreview() {
     if(!spectraPreviewFrameOpen_ || !spectraPreviewGpu_)return;
-    spectraPreviewGpu_->draw({r3d_.lighting.fogColor,r3d_.lighting.fogDensity});
+    spectraPreviewGpu_->draw({r3d_.lighting.fogColor,r3d_.lighting.fogDensity},&r3d_);
 }
 
 void Editor::renderScene(Viewport& vp, const Camera& cam, bool editOverlays) {
@@ -1817,6 +2054,13 @@ void Editor::renderScene(Viewport& vp, const Camera& cam, bool editOverlays) {
         for(auto& material:out.materials)material.baseColor.w*=draw.tint.w;
         if(draw.nodeMaterial)out.nodeMaterials=*draw.nodeMaterial;else out.nodeMaterials.clear();
     });
+    // GPU preparation only at the Scene pre-render boundary, never in pass.
+    if(cavernsEditHost_ && cavernsEditHost_->projectDir==ws_.project.dir &&
+       editOverlays && !planets && !ws_.map.data.worldSpace &&
+       cavernsVisualPreviewEnabled) {
+        try{cavernsEditHost_->stageVisualPreview(*this);}
+        catch(const std::exception& e){cavernsBuildStats.diagnostic=e.what();}
+    }
     r3d_.beginScene(renderCam,renderW,renderH);
     // Scene selection outline is a depth-tested posteffect, not an
     // inverted-hull ModelDraw vertex extrusion. Never enable in Game.
@@ -1831,6 +2075,11 @@ void Editor::renderScene(Viewport& vp, const Camera& cam, bool editOverlays) {
         view_.draw(r3d_, scene_, time_, nullptr, grid_);
         view_.setSelectionOutline(false);
     }
+    // Only the committed cave visual shard owners render; no gameplay claim.
+    if(cavernsEditHost_ && cavernsEditHost_->projectDir==ws_.project.dir &&
+       editOverlays && !planets && !ws_.map.data.worldSpace &&
+       cavernsVisualPreviewEnabled)
+        cavernsEditHost_->drawVisualPreview(r3d_);
     nereidPreview_.draw(r3d_);
     visualPickCacheGeneration_=view_.modelResources().generation();
     const auto afterView = std::chrono::steady_clock::now();
@@ -1924,13 +2173,15 @@ void Editor::renderScene(Viewport& vp, const Camera& cam, bool editOverlays) {
         const char* value=std::getenv("AIVERSE_PRISMA_VIEWPORT_GPU_TIMING");
         return value && std::strcmp(value,"1")==0;
     }();
-    const bool sceneGpuScope=measurePrismaViews && dev_->beginGpuScope(1ULL);
+    graph_gpu_profile::Scope graphSceneScope(*dev_,graphGpuProfile_,"scene-viewport-render",1ULL,measurePrismaViews);
+    const bool sceneGpuScope=!graphSceneScope.active() && measurePrismaViews && dev_->beginGpuScope(1ULL);
+    modelEffectView_.submit(*dev_,r3d_,gameFx_);
     r3d_.render(pass, postEnabledForScene ? &prisma_ : nullptr);
     if (postActiveForScene) prismaSceneRendered_ = true;
     const auto afterRender = std::chrono::steady_clock::now();
     r3d_.setSceneSelectionOutline(false);
     if (!ws_.map.data.worldSpace && !r3d_.studioDebugMode()) {
-        gameFx_.render({r3d_.lighting.fogColor, r3d_.lighting.fogDensity});
+        gameFx_.renderScene(r3d_,{r3d_.lighting.fogColor,r3d_.lighting.fogDensity});
         // Scene-view particle reactive coverage; per-scene callback is
         // consumed synchronously by resolvePrisma and never persists.
         if (gameFx_.hasReactiveGeometry())
@@ -1944,6 +2195,7 @@ void Editor::renderScene(Viewport& vp, const Camera& cam, bool editOverlays) {
     prisma_.clearCameraVolumes();
     dev_->endPass();
     if (sceneGpuScope) dev_->endGpuScope();
+    graphSceneScope.finish();
     if(spectraPreviewFrameOpen_ && spectraPreviewGpu_) {
         spectraPreviewGpu_->endPresentationFrame();
         spectraPreviewFrameOpen_=false;
@@ -2030,7 +2282,10 @@ void Editor::renderGame(Viewport& vp, const Camera& cam, uint64_t prismaViewId) 
     r3d_.beginScene(renderCam,renderW,renderH);
     r3d_.setSceneSelectionOutline(sceneView);
     setOverlayContext(vp, cam, true);
+    const bool previousOutline = view_.selectionOutline();
+    if (!sceneView) view_.setSelectionOutline(ws_.project.manifest.getBool("selectionOutline", previousOutline));
     view_.draw(r3d_, sc, time_, human_ ? &gs.vision[size_t(human_)] : nullptr, gs.grid);
+    view_.setSelectionOutline(previousOutline);
     if (const auto& oc = view_.overlays().context(); overlayPreviewType >= 0 && oc.placeType >= 0)
         view_.drawGhost(r3d_, uint16_t(oc.placeType), oc.placeAt, oc.placeOk, gs.grid, time_);
     nereidPreview_.draw(r3d_);
@@ -2045,11 +2300,13 @@ void Editor::renderGame(Viewport& vp, const Camera& cam, uint64_t prismaViewId) 
         const char* value=std::getenv("AIVERSE_PRISMA_VIEWPORT_GPU_TIMING");
         return value && std::strcmp(value,"1")==0;
     }();
-    const bool gameGpuScope=measureGameGpu && dev_->beginGpuScope(prismaViewId);
+    graph_gpu_profile::Scope graphGameScope(*dev_,graphGpuProfile_,"play-viewport-render",prismaViewId,measureGameGpu);
+    const bool gameGpuScope=!graphGameScope.active() && measureGameGpu && dev_->beginGpuScope(prismaViewId);
+    modelEffectView_.submit(*dev_,r3d_,gameFx_);
     r3d_.render(pass, &prisma_);
     if (postActiveForGame && prismaViewId == 1ULL) prismaSceneRendered_ = true;
     if (postActiveForGame && prismaViewId == 2ULL) prismaGameRendered_ = true;
-    gameFx_.render({r3d_.lighting.fogColor, r3d_.lighting.fogDensity});
+    gameFx_.renderScene(r3d_,{r3d_.lighting.fogColor,r3d_.lighting.fogDensity});
     if (gameFx_.hasReactiveGeometry())
         r3d_.addMotionReactiveDraw([this](gfx::Device& gpu,
                 gfx::TextureHandle sceneDepth, int width, int height) {
@@ -2061,6 +2318,7 @@ void Editor::renderGame(Viewport& vp, const Camera& cam, uint64_t prismaViewId) 
     prisma_.clearCameraVolumes();
     dev_->endPass();
     if (gameGpuScope) dev_->endGpuScope();
+    graphGameScope.finish();
     if(spectraPreviewFrameOpen_ && spectraPreviewGpu_) {
         spectraPreviewGpu_->endPresentationFrame();
         spectraPreviewFrameOpen_=false;
@@ -2092,7 +2350,7 @@ void Editor::setOverlayContext(const Viewport& vp, const Camera& cam, bool play)
         const auto& t = rules().types[size_t(place)];
         const float px = oc.hasCursor ? x : cam.target.x, pz = oc.hasCursor ? z : cam.target.z;
         oc.placeType = place;
-        oc.placeAt = {(t.footprintW % 2) ? std::floor(px) + 0.5f : std::round(px), 0, (t.footprintH % 2) ? std::floor(pz) + 0.5f : std::round(pz)};
+        oc.placeAt = {snapPlacementCenter(px, t.footprintW), 0, snapPlacementCenter(pz, t.footprintH)};
         const game::MapGrid& g = play && sim_ ? simModule()->state(*sim_).grid : grid_;
         oc.placeOk = g.areaBuildable(int(std::floor(oc.placeAt.x - t.footprintW * 0.5f + 0.01f)), int(std::floor(oc.placeAt.z - t.footprintH * 0.5f + 0.01f)),
                                      t.footprintW, t.footprintH);
@@ -2164,13 +2422,19 @@ void Editor::startPlay(int humanSlot) {
         sim_.reset();
         return;
     }
+    if(graphPlayEpoch_!=~uint64_t{0})++graphPlayEpoch_; // saturated epoch disables further telemetry
+    graphPlayHistory_.clear();
+    graphWatch_.clear();
+    view_.clearSharedAnimationProfile();
     human_ = humanSlot;
     gameFx_.clear();
     fxPreview_ = {};
     fxFrozen_ = false;
     gameFxBridge_.setHeightFn([this](float x, float z) { return sim_ ? view_.heightAt(simModule()->state(*sim_).grid, x, z) : 0.0f; });
     gameFxBridge_.setPlayerColorFn([](int p) { return game::GameView::playerColor(p); });
+    gameFxBridge_.setProjectilePointFn([this](Entity e, fx::float3& point) { return view_.projectileDrawPoint(e, point); });
     gameFxBridge_.setAttackOriginFn([this](Entity e, fx::float3& pos, fx::float3& dir) { return view_.muzzleOf(e, pos, dir); });   // shots leave the model's muzzle
+    gameFxBridge_.setNodeFn([this](Entity e,const std::string& node,render::mat4& frame){return view_.effectNodeOf(e,node,frame);});
     gameFxBridge_.attach(*sim_, uint8_t(human_));
     fxTime_ = -1;
     bots_.clear();
@@ -2193,6 +2457,9 @@ void Editor::startPlay(int humanSlot) {
 }
 
 void Editor::stopPlay() {
+    graphPlayHistory_.clear();
+    graphWatch_.clear();
+    view_.clearSharedAnimationProfile();
     gameFxBridge_.detach();
     gameFx_.clear();
     fxPreview_ = {};
@@ -2326,10 +2593,16 @@ void Editor::frame(gfx::Device& dev, double dt) {
     viewportRetirement_.setBudgetBytes(retirementBudgetBytes);
     // Only completed scoped GPU queries are returned. This is a distinct
     // queue from whole-frame timing/benchmark APIs; never consume those.
-    for (const auto& timing : dev.takeGpuScopeTimings())
+    syncGraphOwnerProjectLifetime();
+    graphGpuProfile_.checkProject(ws_.project.dir);
+    for (const auto& timing : dev.takeGpuScopeTimings()) {
         if (timing.valid && std::isfinite(timing.milliseconds) &&
             timing.milliseconds>0 && (timing.tag==1ULL || timing.tag==2ULL))
             prisma_.acceptViewGpuTiming(timing.tag,timing.milliseconds);
+        else if(const auto view=graphGpuProfile_.complete(timing,dev.frameSerial()))
+            prisma_.acceptViewGpuTiming(view,timing.milliseconds);
+    }
+    graphGpuProfile_.expire(dev.frameSerial());
     viewportRetirement_.collect(dev);
     gpuResourceRetirement_.collect(dev);
     clientHost_.collectGpuRetirements();
@@ -2361,7 +2634,11 @@ void Editor::frame(gfx::Device& dev, double dt) {
         if (gpuRetirementLastFlushSucceeded_) {
             viewportRetirement_.drainAfterGpuIdle(dev);
             gpuResourceRetirement_.drainAfterGpuIdle(dev);
-            clientHost_.drainAfterGpuIdle();
+            try { clientHost_.drainAfterGpuIdle(); }
+            catch(const std::exception& e) {
+                gpuRetirementLastFlushSucceeded_=false;
+                ws_.log("view",std::string("Hosted client retirement deferred: ")+e.what(),true);
+            }
             prisma_.releaseRetiredSizesAfterGpuIdle();
             r3d_.drainObjectMotionAfterGpuIdle();
         }
@@ -2394,6 +2671,14 @@ void Editor::frame(gfx::Device& dev, double dt) {
         r3d_.pollPendingModelPipelineJobs();
     pollAgentLink();
     applyChanges();
+    syncGraphOwnerProjectLifetime();
+    graphGpuProfile_.checkProject(ws_.project.dir);
+    if(view_.automaticGraphImageCollectionEnabled()&&!pendingGraphMaterialApply_&&!clientPlaying()){
+        const auto graphState=textureGraphGpuPreview_.status();
+        if(!graphState.getBool("busy")&&!graphState.getBool("gpuTextureSetReady")&&view_.collectAutomaticGraphImages())
+            textureGraphGpuPreview_.invalidateOutputReuseReceipt();
+    }
+    textureGraphGpuPreview_.tick(dev,ws_.project.dir,&graphGpuProfile_);
     // Poll changed presentation assets before any new frame submissions.
     // This runs even when every editor property/model window is closed.
     pollVisualAssets(dt);
@@ -2410,6 +2695,7 @@ void Editor::frame(gfx::Device& dev, double dt) {
     // Sweep only after a substantial no-use interval, before new viewport
     // submission. Never unload while the editor's play simulation is active.
     reclaimEditorAssets();
+    applyQueuedGraphMaterial();
     if (!playing() && gridRevision_ != doc().revision && time_ >= gridRebuildAt_) { syncGrid(); gridRebuildAt_ = time_ + 0.05; }
     if (sceneFlying_) {
         float k = float(std::min(1.0, dt * 4.0));
@@ -2429,6 +2715,7 @@ void Editor::frame(gfx::Device& dev, double dt) {
     syncSelection();
     updateWorld();
     for (auto& w : windows_) w->update(*this, dt);
+    updateCavernsAuthoring(); // observe MapDoc/Undo changes and prepare CPU cave edits
     const auto afterUpdate = std::chrono::steady_clock::now();
 
     theme_.applyPending();
@@ -2491,6 +2778,8 @@ void Editor::frame(gfx::Device& dev, double dt) {
         drawActivityToasts();
         if (focusFirst_ > 0) --focusFirst_;
     }
+    // Published viewport owners have completed CPU preparation and worker joins.
+    captureGraphWatch();
     const auto afterWindows = std::chrono::steady_clock::now();
     // At a hidden/closed tab transition, drop only camera-private histories.
     // Shared size-keyed scene render targets remain usable by other tabs.

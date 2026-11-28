@@ -5,6 +5,7 @@
 #include "engine/actor/Project.h"
 #include "engine/render/CameraBehavior.h"
 #include "RoyaleHud.h"
+#include "HostedActorClient.h"
 #include "engine/ui/RaceHud.h"
 #include "engine/roads/RoadView.h"
 #include "engine/net/Udp.h"
@@ -42,7 +43,7 @@
 #include <filesystem>
 #include <iterator>
 #include <chrono>
-#include <algorithm>
+#include <optional>
 #include <map>
 #include <memory>
 #include <cstdlib>
@@ -319,7 +320,8 @@ struct App {
         const auto cameraBlock=[&](const char* key){
             Json block=render::resolveCameraPreset(rules["camera"][key]);
             if(!block.isObject())block=Json::object();
-            for(const auto& [k,v]:render::resolveCameraPreset(map["camera"][key]).members())block.set(k,v);
+            const Json mapCameraBlock=render::resolveCameraPreset(map["camera"][key]);
+            for(const auto& [k,v]:mapCameraBlock.members())block.set(k,v);
             return block;};
         look.settings=render::cameraLookFrom(cameraBlock("firstPerson"));
         chase=render::cameraChaseFrom(cameraBlock("chase"));
@@ -814,7 +816,7 @@ struct App {
         if(platform::pointerLocked()||e.type==E::KeyUp||e.type==E::MouseUp)
             inputAdapter.onEvent(e);
     }
-    void frame(gfx::Device& device,double dt) {
+    void frame(gfx::Device& device,double dt, std::optional<unsigned> fixedSteps = {}) {
         const auto frameStarted=terraweave::HorizonFrameTimingBridge::Clock::now();
         // Shader variants invalidated by quality/instance changes belong
         // to the host Device and retire only after real GPU completion.
@@ -892,7 +894,9 @@ struct App {
             fireHeld=fireQueued=jumpQueued=aimHeld=false;
         }
         auto held=[&](const char* name){const auto* state=actions.state(name);return state&&state->active;};
-        accumulated+=std::min(dt,0.25);int budget=8;
+        if (fixedSteps) accumulated=double(*fixedSteps)/config.tickRate;
+        else accumulated+=std::min(dt,0.25);
+        int budget=8;
         while(accumulated>=1.0/config.tickRate&&budget--){
             const auto* move=actions.state("Move");
             input.forward=move?int32_t(std::clamp(move->value.y,-1.0f,1.0f)*1000):0;
@@ -1190,7 +1194,7 @@ struct App {
         for(const auto& c:client->snapshot().royale.crates)box(c,{1.2f,1.2f,1.2f},{0.95f,0.6f,0.1f,1});
         genericSceneView.submitPackets(renderer,worldPackets);
         gfx::PassDesc pass;pass.clearColor[0]=0.2f;pass.clearColor[1]=0.28f;pass.clearColor[2]=0.36f;renderer.render(pass);
-        if(fxOriginReady) fxScene.render(renderer.lighting,renderer.viewProj(),cam);
+        if(fxOriginReady) fxScene.render(renderer.lighting,renderer.viewProj(),cam,&renderer);
         ImGui::SetNextWindowPos({16,16});ImGui::SetNextWindowBgAlpha(0.65f);
         ImGui::Begin("##fps",nullptr,ImGuiWindowFlags_NoDecoration|ImGuiWindowFlags_AlwaysAutoResize|ImGuiWindowFlags_NoInputs);
         auto text=lang.tr("actor.status",i18n::Args().num("health",actor.health).num("ammo",actor.ammo).num("reserve",actor.reserve).num("tick",client->snapshot().tick));
@@ -1290,23 +1294,100 @@ struct App {
         gpuLifetime.reset();
     }
 };
+void configureProject(App& app,const std::string& project,const actor::Project& data) {
+    app.projectRoot=project;
+    app.contentReader=platform::makeContentReader(project);
+    app.rules=data.rules;
+    app.map=data.map;
+    app.config=actor::readConfig(app.rules);
+}
+void openLocalAuthority(App& app) {
+    app.server=std::make_unique<net::authority::Server>(app.rules,app.map,1,app.contentReader);
+    auto pair=net::makeLoopbackPair();
+    app.server->attach(1,std::move(pair.first));
+    app.client=std::make_unique<net::authority::Client>(app.rules,app.map,std::move(pair.second),app.contentReader);
+}
+struct ActorViewScope {
+    platform::HostedView* previous=platform::hostedView();
+    ImGuiContext* context=ImGui::GetCurrentContext();
+    explicit ActorViewScope(platform::HostedView& view){platform::setHostedView(&view);}
+    ~ActorViewScope(){platform::setHostedView(previous);ImGui::SetCurrentContext(context);}
+};
+class StudioActorClient final : public client::HostedActorClient {
+public:
+    StudioActorClient(gfx::Device& device,const std::string& project,const std::string& assets,size_t mapIndex)
+        :device_(device) {
+        view_.contentRoot=project;
+        view_.engineAssets=assets;
+        ActorViewScope scope(view_);
+        const auto data=actor::readProject([&](const auto& file,auto& text){
+            return platform::readContentFile(project+"/"+file,text);
+        },mapIndex);
+        configureProject(app_,project,data);
+        openLocalAuthority(app_);
+    }
+    ~StudioActorClient() override {
+        if(initialized_) {
+            ActorViewScope scope(view_);
+            device_.waitForResourceIdle();
+            app_.shutdown(device_);
+        }
+    }
+    Simulation& simulation() override {return app_.server->simulation();}
+    const render::GeometryScene* staticGeometry() const override {
+        return initialized_ ? &app_.staticGeometry : nullptr;
+    }
+    bool paused() const override {return paused_;}
+    void pause(bool value) override {
+        if(value && !paused_) {
+            platform::Event lost{};
+            lost.type=platform::EventType::FocusLost;
+            event(lost);
+        }
+        paused_=value;
+        stepPending_=false;
+        app_.accumulated=0;
+    }
+    void step() override {if(paused_)stepPending_=true;}
+    void frame(int w,int h,float pw,float ph,double dt) override {
+        view_.fbWidth=w;view_.fbHeight=h;
+        view_.width=pw;view_.height=ph;view_.scale=float(w)/pw;
+        ActorViewScope scope(view_);
+        if(!initialized_) {app_.init(device_);initialized_=true;}
+        const auto steps=paused_?std::optional<unsigned>(stepPending_?1:0):std::nullopt;
+        const auto before=simulation().tick();
+        app_.frame(device_,dt,steps);
+        if(simulation().tick()!=before) stepPending_=false;
+    }
+    void event(const platform::Event& event) override {
+        if(initialized_) {ActorViewScope scope(view_);app_.event(event);}
+    }
+private:
+    gfx::Device& device_;
+    platform::HostedView view_;
+    App app_;
+    bool initialized_=false,paused_=false,stepPending_=false;
+};
+}
+std::unique_ptr<client::HostedActorClient> client::HostedActorClient::open(gfx::Device& device,
+        const std::string& project,const std::string& assets,size_t mapIndex) {
+    return std::make_unique<StudioActorClient>(device,project,assets,mapIndex);
 }
 // Actor projects (game.json "module": "actor") in the one game client (apps/client/main.cpp dispatches here).
 int actorClientMain(int argc,char** argv) {
     try {
         App app;auto engineRoot=platform::resolveEngineDir(AIVERSE_SOURCE_DIR,argv[0]);
+        size_t mapIndex=0;
         std::string sessionTokenFile;std::string project=aiverse::platform::templatesDir(engineRoot)+"/fps_training",connect;
-        for(int i=1;i<argc;++i){std::string arg=argv[i];if(arg=="--project"&&i+1<argc)project=argv[++i];else if(arg=="--connect"&&i+1<argc)connect=argv[++i];else if(arg=="--session-token-file"&&i+1<argc)sessionTokenFile=argv[++i];else if(arg=="--listen")app.listen=true;else throw std::runtime_error("usage: AiverseGame --project DIR [--connect udp://host:27100 | --listen] [--session-token-file FILE]");}
+        for(int i=1;i<argc;++i){std::string arg=argv[i];if(arg=="--project"&&i+1<argc)project=argv[++i];else if(arg=="--connect"&&i+1<argc)connect=argv[++i];else if(arg=="--map-index"&&i+1<argc){const std::string index=argv[++i];if(index.empty()||index.find_first_not_of("0123456789")!=std::string::npos)throw std::runtime_error("Invalid map index");mapIndex=std::stoull(index);}else if(arg=="--session-token-file"&&i+1<argc)sessionTokenFile=argv[++i];else if(arg=="--listen")app.listen=true;else throw std::runtime_error("usage: AiverseGame --project DIR [--map-index N] [--connect udp://host:27100 | --listen] [--session-token-file FILE]");}
         project=std::filesystem::absolute(project).string();
         std::filesystem::current_path(engineRoot);
         if(!sessionTokenFile.empty()&&(app.listen||connect.empty()))throw std::runtime_error("session token requires --connect");
         if(app.listen&&!connect.empty())throw std::runtime_error("choose --listen or --connect");
-        auto data=actor::readProject([&](const auto& file,auto& text){return platform::readContentFile(project+"/"+file,text);});
-        app.projectRoot=project;app.contentReader=platform::makeContentReader(project);app.rules=data.rules;app.map=data.map;app.config=actor::readConfig(app.rules);
+        auto data=actor::readProject([&](const auto& file,auto& text){return platform::readContentFile(project+"/"+file,text);},mapIndex);
+        configureProject(app,project,data);
         if(connect.empty()) {
-            app.server=std::make_unique<net::authority::Server>(app.rules,app.map,1,app.contentReader);
-            auto pair=net::makeLoopbackPair();app.server->attach(1,std::move(pair.first));
-            app.client=std::make_unique<net::authority::Client>(app.rules,app.map,std::move(pair.second),app.contentReader);
+            openLocalAuthority(app);
 #ifndef __EMSCRIPTEN__
             if(app.listen&&(!app.udp.open(27100)||!app.ws.open(27101)))throw std::runtime_error("cannot open listen server");
 #endif

@@ -4,6 +4,10 @@
 #include "AlphaCoverageMips.h"
 #include <filesystem>
 #include "Model.h"
+#include "ExrTexture.h"
+#include "DdsTexture.h"
+#include "HdrTexture.h"
+#include "MaterialTechniqueData.h"
 #include "../data/Json.h"
 #include "ModelClips.h"
 #include "ModelMerge.h"
@@ -71,6 +75,11 @@ int Model::findClip(const std::string& name) const {
         if (numbered) return int(i);
     }
     return -1;
+}
+int Model::findImage(const std::string& name) const {
+    for (size_t i = 0; i < images.size(); ++i) if (images[i].name == name) return int(i);
+    const auto alias = imageAliases.find(name);
+    return alias == imageAliases.end() ? -1 : alias->second;
 }
 int Model::findMaterial(const std::string& name) const {
     for (size_t i = 0; i < materials.size(); ++i) if (materials[i].name == name) return int(i);
@@ -222,7 +231,7 @@ const Format kFormats[] = {
     {".fbx", loadFbx},
 #endif
 #if !defined(AIVERSE_NO_LEGACY_MODELS)
-    {".vox", loadVox}, {".vxl", loadVxl}, {".ply", loadPly}, {".stl", loadStl}, {".3ds", load3ds}, {".dae", loadDae},
+    {".bsp", loadBsp}, {".vox", loadVox}, {".vxl", loadVxl}, {".ply", loadPly}, {".stl", loadStl}, {".3ds", load3ds}, {".dae", loadDae},
     {".mdx", loadMdx}, {".mdl", loadMdl}, {".3do", load3do}, {".w3d", loadW3d},
 #endif
 };
@@ -248,6 +257,13 @@ void applyModelBatchingSidecar(Model& model, const std::string& path, const File
     if (first == std::string::npos || bytes[first] != '{') return;
     const Json config = Json::parse(bytes);
     if (!config.isObject()) throw std::runtime_error(path + ".batching.json: expected JSON object");
+    if (config.has("materialTechniques")) {
+        try {
+            model.materialTechniques = parseMaterialTechniques(config["materialTechniques"], model.materials);
+        } catch (const std::invalid_argument& error) {
+            throw std::runtime_error(path + ".batching.json: " + error.what());
+        }
+    }
     model.batching.mergeRigid = config.getBool("mergeRigid", false);
     // Opt-in far LOD: two crossed cards with a baked silhouette of the
     // finest mesh, appended as the last level of the existing chain.
@@ -255,6 +271,10 @@ void applyModelBatchingSidecar(Model& model, const std::string& path, const File
         const Json& imp = config["impostor"];
         if (!imp.isObject()) throw std::runtime_error(path + ".batching.json: impostor must be an object");
         StaticImpostorSettings settings;
+        if (imp.has("fit")) {
+            if (!imp["fit"].isString()) throw std::invalid_argument("impostor.fit must be a string");
+            settings.fit = parseImpostorFit(imp["fit"].str());
+        }
         settings.maxPixels = float(imp["maxPixels"].toDouble(20.0));
         settings.tile = int(imp["tile"].toDouble(256.0));
         std::string why;
@@ -347,7 +367,7 @@ std::unique_ptr<Model> loadModel(const std::string& path, const FileReader& read
         if (ext == ".obj") throw std::runtime_error(path + ": OBJ import is disabled in this build (AIVERSE_OBJ=OFF); convert to .glb");
 #endif
 #if defined(AIVERSE_NO_LEGACY_MODELS)
-        if (ext == ".vox" || ext == ".vxl" || ext == ".ply" || ext == ".stl" || ext == ".3ds" ||
+        if (ext == ".bsp" || ext == ".vox" || ext == ".vxl" || ext == ".ply" || ext == ".stl" || ext == ".3ds" ||
             ext == ".dae" || ext == ".mdx" || ext == ".mdl" || ext == ".3do" || ext == ".w3d")
             throw std::runtime_error(path + ": legacy model import is disabled in this build (AIVERSE_LEGACY_MODELS=OFF); convert to .glb");
 #endif
@@ -372,18 +392,20 @@ std::unique_ptr<Model> loadModel(const std::string& path, const FileReader& read
 bool readModelImage(const std::string& path, const FileReader& reader, Image& out) {
     if (loadingTextures) return loadingTextures->read(path, reader, out);
     std::string bytes;
-    return reader(path, bytes) && decodeImage(bytes, out);
+    return reader(path, bytes) && decodeMaterialImage(bytes, out);
 }
 
 bool ModelTextureCache::read(const std::string& path, const FileReader& reader, Image& out) {
     const auto key = std::filesystem::path(path).lexically_normal().generic_string();
+    if(key.rfind("#texture-graph/",0)==0||runtimeGraphImage(out))return false;
     std::lock_guard lock(mutex_);
     auto it = decoded_.find(key);
     if (it == decoded_.end()) {
         std::string bytes; Image image;
-        if (!reader(key, bytes) || !decodeImage(bytes, image)) return false;
+        if (!reader(key, bytes) || !decodeMaterialImage(bytes, image)) return false;
         image.sharedRgba = std::make_shared<const std::vector<uint8_t>>(std::move(image.rgba));
         size_t size = image.sharedRgba->size();
+        if(image.sharedRadiance16f)size+=image.sharedRadiance16f->size()*sizeof(uint16_t);
         if (image.compressed) for (const auto& level : image.compressed->levels) size += level.size();
         while (!decoded_.empty() && bytes_ + size > kCpuBudget) {
             auto oldest = std::min_element(decoded_.begin(), decoded_.end(), [](const auto& a, const auto& b) { return a.second.used < b.second.used; });
@@ -398,6 +420,55 @@ bool ModelTextureCache::read(const std::string& path, const FileReader& reader, 
     return true;
 }
 
+bool decodeTextureGraphRaster(const std::string& bytes,size_t maxPixels,Image& out){
+    if(bytes.size()<8||bytes.size()>16u*1024u*1024u)return false;
+    const bool png=bytes.compare(0,8,"\x89PNG\r\n\x1a\n",8)==0;
+    const bool jpeg=uint8_t(bytes[0])==0xff&&uint8_t(bytes[1])==0xd8;
+    if(!png&&!jpeg)return false;
+    const auto* data=reinterpret_cast<const stbi_uc*>(bytes.data());
+    int w=0,h=0,n=0;
+    if(!stbi_info_from_memory(data,int(bytes.size()),&w,&h,&n)||w<=0||h<=0||w>4096||h>4096||size_t(w)*h>maxPixels)return false;
+    const int expectedW=w,expectedH=h;
+    auto* pixels=stbi_load_from_memory(data,int(bytes.size()),&w,&h,&n,4);
+    if(!pixels)return false;
+    std::unique_ptr<stbi_uc,decltype(&stbi_image_free)> guard(pixels,&stbi_image_free);
+    if(w!=expectedW||h!=expectedH)return false;
+    out.width=w;out.height=h;out.rgba.assign(pixels,pixels+size_t(w)*h*4);
+    return true;
+}
+bool decodeMaterialImage(const std::string& bytes, Image& out) {
+    const bool exr=bytes.size()>=4&&bytes.compare(0,4,"\x76\x2f\x31\x01",4)==0;
+    const bool hdr=bytes.rfind("#?RADIANCE",0)==0||bytes.rfind("#?RGBE",0)==0;
+    if(!exr&&!hdr){
+        // Strict 2D DX10 material path retains authored BC mip chains.
+        const bool dds=bytes.size()>=148&&bytes.compare(0,4,"DDS ")==0&&bytes.compare(84,4,"DX10")==0;
+        const bool ktx=isKtx2(bytes);
+        if((dds||ktx)&&bytes.size()<=32u*1024u*1024u){
+            auto ci=std::make_shared<CompressedImage>();std::string error;
+            if(!(dds?parseDdsTexture(bytes,*ci,error):parseKtx2(bytes,*ci,error)))return false;
+            const bool hdrBlocks=ci->format==BlockFormat::BC6H_UFloat||ci->format==BlockFormat::BC6H_SFloat;
+            if(hdrBlocks){
+                if(ci->depth!=1||ci->threeDimensional||ci->oneDimensional||ci->arrayLayers!=1||ci->faces!=1||ci->width>4096||ci->height>4096)return false;
+                out.width=ci->width;out.height=ci->height;out.rgba.clear();out.sharedRgba.reset();out.sharedRadiance16f.reset();
+                out.compressed=std::move(ci);out.importedLinearRadiance=true;out.preserveAlphaCoverage=false;return true;
+            }
+            if(ci->depth==1&&!ci->threeDimensional&&!ci->oneDimensional&&ci->arrayLayers==1&&ci->faces==1&&
+               (ci->format==BlockFormat::BC1||ci->format==BlockFormat::BC3||ci->format==BlockFormat::BC4||ci->format==BlockFormat::BC5||ci->format==BlockFormat::BC7)){
+                if(ci->width>4096||ci->height>4096||!decodeBlocks(*ci,0,out.rgba))return false;
+                out.width=ci->width;out.height=ci->height;out.compressed=std::move(ci);return true;
+            }
+        }
+        return decodeImage(bytes,out);
+    }
+    if(bytes.size()>32u*1024u*1024u)return false;
+    RadianceImage radiance;std::string error;
+    if(!(exr?parseOpenExr(bytes,radiance,error,32u*1024u*1024u):parseRadianceHdr(bytes,radiance,error,32u*1024u*1024u)))return false;
+    out.width=radiance.width;out.height=radiance.height;
+    out.rgba.clear();out.sharedRgba.reset();out.compressed.reset();
+    out.sharedRadiance16f=std::make_shared<const std::vector<uint16_t>>(std::move(radiance.rgba16f));
+    out.importedLinearRadiance=true;out.preserveAlphaCoverage=false;
+    return true;
+}
 bool decodeImage(const std::string& bytes, Image& out) {
     if (isKtx2(bytes)) {
         auto ci = std::make_shared<CompressedImage>();
@@ -505,6 +576,8 @@ gfx::PixelFormat gpuFormat(const CompressedImage& c) {
         case BlockFormat::BC1: return c.vkFormat == 131 || c.vkFormat == 132 ? gfx::PixelFormat::RGBA8 : gfx::PixelFormat::BC1;
         case BlockFormat::BC3: return gfx::PixelFormat::BC3;
         case BlockFormat::BC4: return gfx::PixelFormat::BC4;
+        case BlockFormat::BC6H_UFloat: return gfx::PixelFormat::BC6H_UFloat;
+        case BlockFormat::BC6H_SFloat: return gfx::PixelFormat::BC6H_SFloat;
         case BlockFormat::EAC_R11: return gfx::PixelFormat::EAC_R11;
         case BlockFormat::BC7: return gfx::PixelFormat::BC7;
         case BlockFormat::ASTC_4x4: return gfx::PixelFormat::ASTC_4x4;
@@ -515,11 +588,21 @@ gfx::PixelFormat gpuFormat(const CompressedImage& c) {
 
 void uploadImage(gfx::Device& dev, Image& img) {
     if (img.tex.valid()) return;
+    if(img.importedLinearRadiance&&!img.compressed){
+        if(!img.sharedRadiance16f||img.width<=0||img.height<=0||
+           img.sharedRadiance16f->size()!=size_t(img.width)*size_t(img.height)*4u||
+           !dev.supports(gfx::PixelFormat::RGBA16F)||img.virtualFallbackMaxDimension>0)return;
+        gfx::TextureDesc td;td.width=img.width;td.height=img.height;
+        td.format=gfx::PixelFormat::RGBA16F;td.data=img.sharedRadiance16f->data();
+        td.filter=img.nearest?gfx::Filter::Nearest:gfx::Filter::Linear;td.repeat=img.repeat;
+        td.label=img.name.c_str();img.tex=dev.createTexture(td);return;
+    }
     // Virtualized base-colour images can retain a small fallback *instead*
     // of uploading their full-resolution source. This must be configured
     // before upload; never replace shared/cached GPU texture handles.
     // Exact alpha cutouts and image reuse are checked by the opt-in
     // ModelVirtualTextureFallback.h asset policy.
+    if(img.importedLinearRadiance&&img.virtualFallbackMaxDimension>0)return;
     if (img.virtualFallbackMaxDimension > 0) {
         const auto& pixels = img.sharedRgba ? *img.sharedRgba : img.rgba;
         const size_t w0 = img.width > 0 ? size_t(img.width) : 0;
@@ -593,7 +676,8 @@ void uploadImage(gfx::Device& dev, Image& img) {
     if (img.compressed && !img.compressed->levels.empty()) {
         // keep KTX2 blocks compressed in VRAM when the GPU samples them (shaders decode sRGB themselves)
         const CompressedImage& c = *img.compressed;
-        const gfx::PixelFormat pf = gpuFormat(c);
+        const bool bc5=c.format==BlockFormat::BC5&&(img.name.ends_with("_normal_bc5.dds")||img.textureKey.ends_with("_normal_bc5.dds"));
+        const gfx::PixelFormat pf = bc5?gfx::PixelFormat::BC5:gpuFormat(c);
         if (pf != gfx::PixelFormat::RGBA8 && dev.supports(pf)) {
             std::vector<const void*> data;
             std::vector<size_t> sizes;
@@ -616,7 +700,28 @@ void uploadImage(gfx::Device& dev, Image& img) {
             td.label = img.name.c_str();
             img.tex = dev.createTexture(td);
             img.gpuCompressed = img.tex.valid();
+            img.gpuNormalXY=img.gpuCompressed&&bc5;
             if (img.tex.valid()) return;
+        }
+    }
+    if(img.importedLinearRadiance)return; // BC6H has no LDR fallback
+    img.gpuNormalXY=false;
+    // Unsupported BC formats (including BC5 normal Z reconstruction)
+    // retain authored mip levels on the decoded RGBA8 fallback.
+    if(img.compressed&&img.compressed->levels.size()>1&&!img.nearest){
+        const auto& c=*img.compressed;
+        std::vector<std::vector<uint8_t>> decoded(c.levels.size());
+        std::vector<const void*> data;std::vector<size_t> sizes;
+        size_t total=0;bool complete=true;
+        for(size_t i=0;i<decoded.size();++i){
+            const size_t bytes=size_t(levelWidth(c,int(i)))*levelHeight(c,int(i))*4u;
+            if(bytes>96u*1024u*1024u-total||!decodeBlocks(c,int(i),decoded[i])||decoded[i].size()!=bytes){complete=false;break;}
+            total+=bytes;data.push_back(decoded[i].data());sizes.push_back(bytes);
+        }
+        if(complete){
+            gfx::TextureDesc td;td.width=c.width;td.height=c.height;td.format=gfx::PixelFormat::RGBA8;
+            td.filter=gfx::Filter::Linear;td.repeat=img.repeat;td.levelCount=int(data.size());td.levelData=data.data();td.levelSize=sizes.data();td.label=img.name.c_str();
+            img.tex=dev.createTexture(td);if(img.tex.valid()){img.gpuCompressed=false;return;}
         }
     }
     const auto& pixels = img.sharedRgba ? *img.sharedRgba : img.rgba;
@@ -692,24 +797,27 @@ std::string ModelTextureCache::gpuKey(const Image& image) const {
     const uint64_t epoch=revision==sourceRevisions_.end()?0:revision->second;
     return image.textureKey+(image.repeat?"#repeat":"#clamp")+
            (image.nearest?"#nearest":"#linear")+
+           ((image.name.ends_with("_normal_bc5.dds")||image.textureKey.ends_with("_normal_bc5.dds"))?"#normalXY":"")+
            (image.alphaCoverageThreshold?"#alphaCoverage"+std::to_string(image.alphaCoverageThreshold):"")+
            "#revision"+std::to_string(epoch);
 }
 
 bool ModelTextureCache::borrowResident(Image& image) const {
-    if(image.textureKey.empty())return false;
+    if(runtimeGraphImage(image)||image.textureKey.empty())return false;
     const auto key=gpuKey(image);
     const auto it=gpu_.find(key);
     if(it==gpu_.end() || !it->second.tex.valid())return false;
     image.tex=it->second.tex;
     image.textureLease=it->second.textureLease;
     image.borrowedTexture=true;
-    image.gpuCompressed=it->second.gpuCompressed;
+    image.gpuCompressed=it->second.gpuCompressed;image.gpuNormalXY=it->second.gpuNormalXY;
     image.alphaCoverageMipmaps=it->second.alphaCoverageMipmaps;
     return true;
 }
 
 void ModelTextureCache::upload(gfx::Device& dev, Image& image) {
+    if(runtimeGraphImage(image))
+        throw std::invalid_argument("runtime graph image cannot enter shared file texture cache");
     const auto key=gpuKey(image);
     auto it = gpu_.find(key);
     if (it == gpu_.end()) {
@@ -739,10 +847,11 @@ void ModelTextureCache::upload(gfx::Device& dev, Image& image) {
             }
             it->second.rgba.clear();
             it->second.sharedRgba.reset();
+            it->second.sharedRadiance16f.reset();
             it->second.compressed.reset();
         }
     }
-    image.textureLease = it->second.textureLease; image.tex = it->second.tex; image.gpuCompressed = it->second.gpuCompressed; image.borrowedTexture = true; image.alphaCoverageMipmaps=it->second.alphaCoverageMipmaps;
+    image.textureLease = it->second.textureLease; image.tex = it->second.tex; image.gpuCompressed = it->second.gpuCompressed; image.gpuNormalXY=it->second.gpuNormalXY; image.borrowedTexture = true; image.alphaCoverageMipmaps=it->second.alphaCoverageMipmaps;
 }
 ModelTextureCache::PreparedGpuPromotion
 ModelTextureCache::prepareGpuPromotion(
@@ -752,7 +861,7 @@ ModelTextureCache::prepareGpuPromotion(
     // Both existing scratch Model images and future material-override slots
     // participate in ONE preallocated set of GPU-cache owner nodes.
     const auto include=[&](const Image& image,Model* target,size_t index) {
-        if(image.textureCache.get()!=this || image.borrowedTexture ||
+        if(runtimeGraphImage(image)||image.textureCache.get()!=this || image.borrowedTexture ||
            !image.tex.valid() || image.textureKey.empty())
             return;
         const auto key=gpuKey(image);
@@ -771,6 +880,7 @@ ModelTextureCache::prepareGpuPromotion(
                 prepared.textureLease=std::make_shared<int>(0);
                 prepared.rgba.clear();
                 prepared.sharedRgba.reset();
+                prepared.sharedRadiance16f.reset();
                 prepared.compressed.reset();
                 it->second=std::move(prepared);
             }
@@ -807,8 +917,9 @@ std::vector<Image> ModelTextureCache::PreparedGpuPromotion::commit() {
     // Validate all indices BEFORE mutating shared GPU residency.
     for(const auto& binding:bindings_)
         if(!binding.model ||
-           binding.index>=binding.model->images.size())
-            throw std::logic_error("speculative material image was not committed");
+           binding.index>=binding.model->images.size()||
+           runtimeGraphImage(binding.model->images[binding.index]))
+            throw std::logic_error("speculative file image was not committed or changed ownership");
     // Merging preallocated std::map nodes does not create a new GPU object.
     // Image* pointers into moved map nodes remain stable.
     cache_->gpu_.merge(pending_);
@@ -825,7 +936,7 @@ std::vector<Image> ModelTextureCache::PreparedGpuPromotion::commit() {
         image.tex=owner.tex;
         image.textureLease=owner.textureLease;
         image.borrowedTexture=true;
-        image.gpuCompressed=owner.gpuCompressed;
+        image.gpuCompressed=owner.gpuCompressed;image.gpuNormalXY=owner.gpuNormalXY;
     }
     committed_=true;
     return std::move(redundant_);
@@ -1034,6 +1145,14 @@ bool uploadModel(gfx::Device& dev, Model& m, bool keepCpu,
         if(material.alpha!=AlphaMode::Opaque&&material.baseTex>=0&&size_t(material.baseTex)<pickAlpha.size())pickAlpha[size_t(material.baseTex)]=true;
     size_t imageIndex=0;
     for (auto& img : m.images) {
+        if(img.proceduralGraphRetired){++imageIndex;continue;}
+        // Resident procedural outputs are exclusively owned. Never reupload
+        // or substitute a shared file texture under the same generation.
+        if(runtimeGraphImage(img)){
+            if(!img.tex.valid()||img.textureCache||img.borrowedTexture||img.textureLease||
+               !img.textureKey.empty())return false;
+            ++imageIndex;continue;
+        }
         const auto previousTexture = img.tex;
         // Reduced VT fallbacks are per-Image resources and must not borrow
         // the full-resolution shared texture cache entry. Speculative model
@@ -1062,6 +1181,7 @@ bool uploadModel(gfx::Device& dev, Model& m, bool keepCpu,
             std::vector<uint8_t>{}.swap(img.rgba);
             img.compressed.reset();
             img.sharedRgba.reset();
+            img.sharedRadiance16f.reset();
         }
         ++imageIndex;
     }
@@ -1145,9 +1265,12 @@ bool uploadStandaloneImage(gfx::Device& dev, Image& image) {
 }
 
 int addImage(gfx::Device& dev, Model& m, Image img) {
-    for (size_t i = 0; i < m.images.size(); ++i)
-        if (!img.name.empty() && m.images[i].name == img.name)
+    if(runtimeGraphImage(img))return -1; // use graph publication transaction
+    for(size_t i=0;i<m.images.size();++i)
+        if(!img.name.empty()&&m.images[i].name==img.name){
+            if(runtimeGraphImage(m.images[i]))return -1;
             return int(i);
+        }
     // Preallocate Model storage before allocating a GPU texture; a vector
     // growth failure after createTexture could otherwise drop a live handle.
     m.images.reserve(m.images.size()+1);
@@ -1156,6 +1279,7 @@ int addImage(gfx::Device& dev, Model& m, Image img) {
     // Empty-vector swap frees CPU pixels without a potentially throwing
     // shrink_to_fit after the new GPU resource has been allocated.
     std::vector<uint8_t>{}.swap(img.rgba);
+    img.sharedRadiance16f.reset();
     m.images.push_back(std::move(img));
     m.markMaterialChanged(); // new texture may be selected by model materials
     return int(m.images.size() - 1);
